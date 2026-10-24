@@ -1306,6 +1306,7 @@ function SaleEntry({onSaved,mode='sale'}){
   const[trIdx,setTrIdx]=useState(0);
   const[ledgerParty,setLedgerParty]=useState(null);
   const{toast,TC}=useToast();
+  const mobile=useIsMobile();
   const stepInputId='sale-step-input';
 
   useEffect(()=>{
@@ -1449,10 +1450,10 @@ function SaleEntry({onSaved,mode='sale'}){
     {addPartyName!==null&&<QuickAddPartyModal defaultName={addPartyName} onClose={()=>setAddPartyName(null)} onAdded={p=>{setPartyId(p.id);setPq('');setAddPartyName(null);}}/>}
     {ledgerParty&&<PartyLedger party={ledgerParty} onClose={()=>setLedgerParty(null)}/>}
     {/* Date + Credit */}
-    <div style={{display:'flex',gap:10,marginBottom:10}}>
-      <div style={{flex:'0 0 155px'}}><Inp id="sale-date-input" label="Date" value={date} onChange={setDate} type="date" required
+    <div style={{display:'flex',gap:10,marginBottom:10,flexWrap:'wrap'}}>
+      <div style={{flex:mobile?'1 1 140px':'0 0 155px'}}><Inp id="sale-date-input" label="Date" value={date} onChange={setDate} type="date" required
         onKeyDown={e=>{if(e.key==='Enter'){e.preventDefault();document.getElementById('sale-credit-input')?.focus();}}}/></div>
-      <div style={{flex:'0 0 125px'}}><Inp id="sale-credit-input" label="Credit Days" value={credit} onChange={v=>setCredit(Number(v)||30)} type="number" hint={sel?'Default: '+sel.credit+'d':''}
+      <div style={{flex:mobile?'1 1 120px':'0 0 125px'}}><Inp id="sale-credit-input" label="Credit Days" value={credit} onChange={v=>setCredit(Number(v)||30)} type="number" hint={sel?'Default: '+sel.credit+'d':''}
         onKeyDown={e=>{if(e.key==='Enter'){e.preventDefault();document.getElementById(sel?'item-search-input':'party-search-input')?.focus();}}}/></div>
     </div>
 
@@ -1569,35 +1570,28 @@ function SaleEntry({onSaved,mode='sale'}){
       </div>
 
       {/* Lines */}
-      <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}>
-        <thead><tr style={{background:'#F6F8FA'}}>
-          {['#','Item','Qty','Rate ₹','Amount',''].map((h,i)=><th key={i} style={{padding:'7px 12px',textAlign:i>1&&i<5?'right':'left',fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,borderBottom:`1px solid ${C.bdr}`}}>{h}</th>)}
-        </tr></thead>
-        <tbody>
-          {!lines.length&&!freightLine.length&&<tr><td colSpan={6} style={{padding:'20px',textAlign:'center',color:C.muted,fontSize:12}}>{sel?'Type item or click chip above':'Select a party first'}</td></tr>}
-          {[...lines,...freightLine].map((l,i)=><tr key={l.id} style={{borderBottom:`1px solid ${C.bdr}`,background:l.id==='__freight'?C.amberSoft:'transparent'}}>
-            <td style={{padding:'7px 12px',color:C.muted,fontSize:11}}>{i+1}</td>
-            <td style={{padding:'7px 12px'}}>
-              <div style={{fontWeight:600,color:l.id==='__freight'?C.amber:C.txt}}>{l.customerName||l.itemName}</div>
-              {l.customerName&&l.customerName!==l.itemName&&<div style={{fontSize:10,color:C.muted}}>{l.itemName}</div>}
-              {l.warranty&&l.warranty!=='no warranty'&&<div style={{fontSize:10,color:C.purple,fontWeight:600}}>🛡 {l.warranty}</div>}
-            </td>
-            <td style={{padding:'7px 12px',textAlign:'right'}}>
-              {l.id!=='__freight'?<input value={l.qty} onChange={e=>editLine(i,'qty',e.target.value)} type="number" style={{width:60,padding:'3px 7px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:12,textAlign:'right',outline:'none',fontFamily:'inherit'}}/>:<span style={{color:C.amber,fontSize:12}}>1</span>}
-            </td>
-            <td style={{padding:'7px 12px',textAlign:'right'}}>
-              {l.id!=='__freight'?<input value={l.rate} onChange={e=>editLine(i,'rate',e.target.value)} type="number" style={{width:75,padding:'3px 7px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:12,textAlign:'right',outline:'none',fontFamily:'inherit'}}/>:<span style={{color:C.amber,fontSize:12}}>{fmt(l.rate)}</span>}
-            </td>
-            <td style={{padding:'7px 12px',textAlign:'right',fontWeight:700,color:l.id==='__freight'?C.amber:C.blue,fontVariantNumeric:'tabular-nums'}}>{fmt(l.qty*l.rate)}</td>
-            <td style={{padding:'7px 12px',textAlign:'center'}}>{l.id!=='__freight'&&<button onClick={()=>setLines(p=>p.filter((_,j)=>j!==i))} style={{background:'none',border:'none',cursor:'pointer',color:C.muted,fontSize:15}}>×</button>}</td>
-          </tr>)}
-        </tbody>
-        {(lines.length>0||freightLine.length>0)&&<tfoot><tr style={{background:'#F6F8FA'}}>
-          <td colSpan={4} style={{padding:'9px 12px',fontWeight:700,textAlign:'right',color:C.txt}}>TOTAL</td>
-          <td style={{padding:'9px 12px',textAlign:'right',fontSize:16,fontWeight:800,color:C.blue,fontVariantNumeric:'tabular-nums'}}>{fmt(total)}</td>
-          <td/>
-        </tr></tfoot>}
-      </table>
+      <CardTable mobile={mobile} rows={[...lines,...freightLine]} keyFn={(l,i)=>l.id||i}
+        emptyLabel={sel?'Type item or click chip above':'Select a party first'}
+        footer={(lines.length>0||freightLine.length>0)?
+          <div style={{display:'flex',justifyContent:'space-between',padding:'9px 12px',background:'#F6F8FA'}}>
+            <span style={{fontWeight:700,color:C.txt}}>TOTAL</span>
+            <span style={{fontSize:16,fontWeight:800,color:C.blue,fontVariantNumeric:'tabular-nums'}}>{fmt(total)}</span>
+          </div>:null}
+        columns={[
+          {key:'idx',label:'#',hideOnMobile:true,render:(l,i)=><span style={{color:C.muted,fontSize:11}}>{i+1}</span>},
+          {key:'item',label:'Item',render:l=><div>
+            <div style={{fontWeight:600,color:l.id==='__freight'?C.amber:C.txt}}>{l.customerName||l.itemName}</div>
+            {l.customerName&&l.customerName!==l.itemName&&<div style={{fontSize:10,color:C.muted}}>{l.itemName}</div>}
+            {l.warranty&&l.warranty!=='no warranty'&&<div style={{fontSize:10,color:C.purple,fontWeight:600}}>🛡 {l.warranty}</div>}
+          </div>},
+          {key:'qty',label:'Qty',align:'right',render:(l,i)=>
+            l.id!=='__freight'?<input value={l.qty} onChange={e=>editLine(i,'qty',e.target.value)} type="number" style={{width:60,padding:'3px 7px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:12,textAlign:'right',outline:'none',fontFamily:'inherit'}}/>:<span style={{color:C.amber,fontSize:12}}>1</span>},
+          {key:'rate',label:'Rate ₹',align:'right',render:(l,i)=>
+            l.id!=='__freight'?<input value={l.rate} onChange={e=>editLine(i,'rate',e.target.value)} type="number" style={{width:75,padding:'3px 7px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:12,textAlign:'right',outline:'none',fontFamily:'inherit'}}/>:<span style={{color:C.amber,fontSize:12}}>{fmt(l.rate)}</span>},
+          {key:'amount',label:'Amount',align:'right',render:l=><span style={{fontWeight:700,color:l.id==='__freight'?C.amber:C.blue,fontVariantNumeric:'tabular-nums'}}>{fmt(l.qty*l.rate)}</span>},
+          {key:'actions',label:'',cardLabel:'',render:(l,i)=>l.id!=='__freight'?
+            <Btn onClick={()=>setLines(p=>p.filter((_,j)=>j!==i))} variant="ghost" size="sm">Remove</Btn>:null},
+        ]}/>
     </div>
 
     {/* Transport + Freight */}
@@ -1657,7 +1651,7 @@ function SaleEntry({onSaved,mode='sale'}){
     </div>
 
     {/* Save */}
-    <div style={{display:'flex',justifyContent:'flex-end',gap:8}}>
+    <div style={{display:'flex',flexDirection:mobile?'column-reverse':'row',justifyContent:'flex-end',gap:8}}>
       <Btn onClick={resetForm} variant="secondary" size="sm">Clear</Btn>
       <Btn onClick={doSave} disabled={saving||!partyId||!lines.length} size="md" icon={mode==='order'?'📲':'💾'}>{saving?'Saving…':(mode==='order'?'Send to Dispatch · ':'Save · ')+fmt(total)}</Btn>
     </div>
@@ -3018,6 +3012,7 @@ function AccountsModule() {
   const forceUpdate = () => _setFvAcc(v => v+1);
   const PAGE = 30;
   const {toast,TC} = useToast();
+  const mobile = useIsMobile();
 
   const allCats = useMemo(()=>getAllCats(),[state.customCategories.length]);
   const catMeta = useMemo(()=>allCats.find(c=>c.id===categoryId)||allCats[0],[allCats,categoryId]);
@@ -3277,13 +3272,12 @@ function AccountsModule() {
     <SectionHead title="Cash & Accounts" sub={`Net: ${fmt(totalBal)}`}/>
 
     {/* Account balance cards */}
-    <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:12,marginBottom:18}}>
+    <div style={{display:'grid',gridTemplateColumns:mobile?'repeat(2,1fr)':'repeat(4,1fr)',gap:12,marginBottom:18}}>
       {balances.map(a=>(
         <div key={a.id} onClick={()=>setLedger(a.id)}
           style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,padding:'14px 16px',
             borderTop:`3px solid ${a.color}`,cursor:'pointer'}}
-          onMouseEnter={e=>e.currentTarget.style.boxShadow='0 4px 16px rgba(0,0,0,.1)'}
-          onMouseLeave={e=>e.currentTarget.style.boxShadow='none'}>
+          {...(mobile?{}:{onMouseEnter:e=>e.currentTarget.style.boxShadow='0 4px 16px rgba(0,0,0,.1)',onMouseLeave:e=>e.currentTarget.style.boxShadow='none'})}>
           <div style={{fontSize:10,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,marginBottom:4}}>{a.short}</div>
           <div style={{fontSize:20,fontWeight:800,color:a.bal>=0?a.color:C.red,fontVariantNumeric:'tabular-nums'}}>{fmt(a.bal)}</div>
           <div style={{fontSize:10,color:C.muted,marginTop:2}}>OB {fmt(a.ob)}</div>
@@ -3297,7 +3291,10 @@ function AccountsModule() {
       {newCat&&<NewCategoryModal onClose={()=>setNewCat(false)} onCreated={cat=>{setNewCat(false);chooseCategory(cat.id);}}/>}
 
       {/* Field row — order: Date | Category | Party/Payee (or To Account) | Amount | Account | Notes | Save */}
-      <div style={{padding:'16px 16px 16px',display:'grid',gridTemplateColumns:'120px 1.3fr 1.6fr 120px 1fr 1fr auto',gridTemplateRows:'auto auto',gap:10,position:'relative'}}>
+      <div style={{padding:'16px 16px 16px',
+        display:mobile?'flex':'grid',flexDirection:mobile?'column':undefined,
+        gridTemplateColumns:mobile?undefined:'120px 1.3fr 1.6fr 120px 1fr 1fr auto',
+        gridTemplateRows:mobile?undefined:'auto auto',gap:mobile?14:10,position:'relative'}}>
 
         {/* 1. DATE */}
         <div style={{gridRow:1,alignSelf:'end'}}>
@@ -3466,13 +3463,13 @@ function AccountsModule() {
         </div>
 
         {/* 7. SAVE */}
-        <div style={{gridRow:1,alignSelf:'end',paddingTop:18}}>
+        <div style={{gridRow:1,alignSelf:'end',paddingTop:mobile?0:18}}>
           <button onClick={doSave} disabled={!canSave}
             style={{padding:'9px 18px',borderRadius:8,border:'none',fontFamily:'inherit',fontWeight:700,fontSize:14,
               background:!canSave?'#E5E7EB':dir==='out'?C.red:dir==='contra'?C.purple:C.green,
               color:!canSave?C.muted:'#fff',
               cursor:!canSave?'not-allowed':'pointer',
-              whiteSpace:'nowrap',minWidth:80}}>
+              whiteSpace:'nowrap',width:mobile?'100%':undefined,minWidth:80}}>
             Save ↵
           </button>
           {amount>0&&<div style={{fontSize:10,fontWeight:600,marginTop:4,textAlign:'center',
@@ -3519,15 +3516,19 @@ function AccountsModule() {
           const discAmt=isCustomerParty?(parseFloat(discount[discKey]||0)||0):0;
           const repAmt=isCustomerParty?(parseFloat(repair[repKey]||0)||0):0;
           const netOutstanding=Math.max(0,b.remaining-discAmt-repAmt);
-          return <div key={b.key} style={{display:'grid',gridTemplateColumns:'auto 1fr auto auto',gap:12,alignItems:'center',
+          return <div key={b.key} style={{
+            display:mobile?'flex':'grid',flexDirection:mobile?'column':undefined,
+            gridTemplateColumns:mobile?undefined:'auto 1fr auto auto',gap:mobile?8:12,alignItems:mobile?undefined:'center',
             padding:'10px 12px',borderRadius:8,marginBottom:6,
             border:`1.5px solid ${sel?C.blue:C.bdr}`,
             background:sel?C.blueSoft:C.surf,
             transition:'all .12s'}}>
-            {/* Checkbox + date */}
+            {/* Checkbox + date — display:contents on desktop so checkbox and bill-info
+                stay as two separate grid items (unchanged layout); a real flex row on mobile */}
+            <div style={mobile?{display:'flex',alignItems:'center',gap:10}:{display:'contents'}}>
             <input type="checkbox" checked={sel} onChange={e=>{
               setSelInvIds(ids=>e.target.checked?[...ids,b.key]:ids.filter(k=>k!==b.key));
-            }} style={{cursor:'pointer',width:16,height:16}}/>
+            }} style={{cursor:'pointer',width:16,height:16,flexShrink:0}}/>
 
             {/* Bill info */}
             <div>
@@ -3539,6 +3540,7 @@ function AccountsModule() {
                 {b.isNew&&<span style={{fontSize:10,fontWeight:700,color:C.blue}}>NEW</span>}
               </div>
               <div style={{fontSize:11,color:C.sub,marginTop:1}}>{b.items||'—'}</div>
+            </div>
             </div>
 
             {/* Per-invoice discount + repair expenditure — customer invoices only;
@@ -3573,7 +3575,7 @@ function AccountsModule() {
               :<div/>}
 
             {/* Net outstanding */}
-            <div style={{textAlign:'right',minWidth:80}}>
+            <div style={{textAlign:mobile?'left':'right',minWidth:80}}>
               {b.remaining!==b.orig&&<div style={{fontSize:10,color:C.sub,textDecoration:'line-through'}}>{fmt(b.orig)}</div>}
               {(discAmt>0||repAmt>0)&&<div style={{fontSize:10,color:C.amber,textDecoration:'line-through'}}>{fmt(b.remaining)}</div>}
               <div style={{fontWeight:800,color:netOutstanding>0?C.red:C.green,fontSize:14,fontVariantNumeric:'tabular-nums'}}>{fmt(netOutstanding)}</div>
@@ -3658,34 +3660,27 @@ function AccountsModule() {
         <span style={{color:catTotals.net>=0?C.txt:C.red,fontWeight:700}}>Net {catTotals.net<0?'−':''}{fmt(Math.abs(catTotals.net))}</span>
         <button onClick={()=>setCatLedger(catFilter)} style={{marginLeft:'auto',padding:'3px 10px',borderRadius:6,border:`1px solid ${C.blue}`,background:C.surf,color:C.blue,fontWeight:700,fontSize:11,cursor:'pointer',fontFamily:'inherit'}}>View Full Ledger</button>
       </div>}
-      <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}>
-        <thead><tr style={{background:'#F6F8FA'}}>
-          {['Date','Type','Account','Description','Amount',''].map((h,i)=>(
-            <th key={i} style={{padding:'8px 12px',textAlign:i===4?'right':'left',fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,borderBottom:`1px solid ${C.bdr}`,whiteSpace:'nowrap'}}>{h}</th>
-          ))}
-        </tr></thead>
-        <tbody>
-          {pageData.length===0&&<tr><td colSpan={6} style={{padding:'30px',textAlign:'center',color:C.muted}}>No transactions yet</td></tr>}
-          {pageData.map((t,i)=>{
-            const isOut=(t.type==='payment')===(t.amount>=0);
+      <CardTable mobile={mobile} rows={pageData} keyFn={(t,i)=>t.id||i} emptyLabel="No transactions yet"
+        columns={[
+          {key:'date',label:'Date',render:t=><span style={{color:C.sub,whiteSpace:'nowrap'}}>{fmtD(t.date)}</span>},
+          {key:'type',label:'Type',render:t=><span style={{fontSize:11,fontWeight:700,padding:'2px 8px',borderRadius:20,background:(TYPE_COLOR[t.type]||C.blue)+'18',color:TYPE_COLOR[t.type]||C.blue}}>{TYPE_LABEL[t.type]||t.type}</span>},
+          {key:'account',label:'Account',render:t=><span><span style={{fontSize:12,fontWeight:600,color:ACC_MAP[t.account]?.color||C.sub}}>{ACC_MAP[t.account]?.short}</span>{t.toAccount&&<span style={{fontSize:11,color:C.muted}}> → {ACC_MAP[t.toAccount]?.short}</span>}</span>},
+          {key:'desc',label:'Description',render:t=>{
             const desc=t.type==='transfer'?`${ACC_MAP[t.account]?.short} → ${ACC_MAP[t.toAccount]?.short}`
               :t.type==='party_payment'?(t.partyName||t.payee||'—')
               :t.payee||t.partyName||(t.category?getCatLabel(t.category):'—');
-            return <tr key={i} style={{borderBottom:`1px solid ${C.bdr}`}}
-              onMouseEnter={e=>e.currentTarget.style.background='#F9FAFB'} onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
-              <td style={{padding:'9px 12px',color:C.sub,whiteSpace:'nowrap'}}>{fmtD(t.date)}</td>
-              <td style={{padding:'9px 12px'}}><span style={{fontSize:11,fontWeight:700,padding:'2px 8px',borderRadius:20,background:(TYPE_COLOR[t.type]||C.blue)+'18',color:TYPE_COLOR[t.type]||C.blue}}>{TYPE_LABEL[t.type]||t.type}</span></td>
-              <td style={{padding:'9px 12px'}}><span style={{fontSize:12,fontWeight:600,color:ACC_MAP[t.account]?.color||C.sub}}>{ACC_MAP[t.account]?.short}</span>{t.toAccount&&<span style={{fontSize:11,color:C.muted}}> → {ACC_MAP[t.toAccount]?.short}</span>}</td>
-              <td style={{padding:'9px 12px'}}><div style={{fontWeight:500,color:C.txt}}>{desc}</div>{t.notes&&<div style={{fontSize:11,color:C.muted}}>{t.notes}</div>}{t.category&&<div style={{fontSize:10,color:C.muted}}>{getCatLabel(t.category)}</div>}</td>
-              <td style={{padding:'9px 12px',textAlign:'right',fontWeight:700,fontVariantNumeric:'tabular-nums',color:isOut?C.red:C.green}}>{isOut?'−':'+'}{fmt(Math.abs(t.amount))}</td>
-              <td style={{padding:'9px 12px',textAlign:'center',whiteSpace:'nowrap'}}>
-                <button onClick={()=>setEditTxn(t)} style={{background:'none',border:'none',cursor:'pointer',color:C.muted,fontSize:13,padding:'0 6px'}} title="Edit">✎</button>
-                <button onClick={()=>deleteTxn(t.id)} style={{background:'none',border:'none',cursor:'pointer',color:C.muted,fontSize:15,padding:'0 6px'}} title="Delete">×</button>
-              </td>
-            </tr>;
-          })}
-        </tbody>
-      </table>
+            return <div><div style={{fontWeight:500,color:C.txt}}>{desc}</div>{t.notes&&<div style={{fontSize:11,color:C.muted}}>{t.notes}</div>}{t.category&&<div style={{fontSize:10,color:C.muted}}>{getCatLabel(t.category)}</div>}</div>;
+          }},
+          {key:'amount',label:'Amount',align:'right',render:t=>{
+            const isOut=(t.type==='payment')===(t.amount>=0);
+            return <span style={{fontWeight:700,fontVariantNumeric:'tabular-nums',color:isOut?C.red:C.green}}>{isOut?'−':'+'}{fmt(Math.abs(t.amount))}</span>;
+          }},
+          {key:'actions',label:'',cardLabel:'Actions',render:t=>
+            <div style={{display:'flex',gap:6,justifyContent:'flex-end'}}>
+              <Btn onClick={()=>setEditTxn(t)} variant="ghost" size="sm">Edit</Btn>
+              <Btn onClick={()=>deleteTxn(t.id)} variant="ghost" size="sm">Delete</Btn>
+            </div>},
+        ]}/>
       {totalPages>1&&<div style={{padding:'10px 16px',borderTop:`1px solid ${C.bdr}`,display:'flex',justifyContent:'center',gap:8}}>
         <Btn onClick={()=>setPage(p=>Math.max(0,p-1))} disabled={page===0} variant="secondary" size="sm">← Prev</Btn>
         <span style={{fontSize:12,color:C.sub,alignSelf:'center'}}>Page {page+1} of {totalPages}</span>
@@ -3699,6 +3694,7 @@ function AccountLedger({accId,onClose}) {
   const acc=ACC_MAP[accId];
   const [search,setSearch]=useState('');
   const [page,setPage]=useState(0);
+  const mobile=useIsMobile();
   const PAGE=20;
   const histEntries=useMemo(()=>ACCOUNT_HISTORY[accId]||[],[accId]);
   const newTxns=useMemo(()=>state.txns.filter(t=>t.account===accId||t.toAccount===accId),[accId,state.txns.length]);
@@ -3734,12 +3730,12 @@ function AccountLedger({accId,onClose}) {
   const pageRows=filtered.slice(page*PAGE,(page+1)*PAGE);
   const totalPages=Math.ceil(filtered.length/PAGE);
   return <Modal title={acc.label} onClose={onClose} width={640}>
-    <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}}>
+    <div style={{display:'flex',flexDirection:mobile?'column':'row',gap:mobile?14:0,justifyContent:'space-between',alignItems:mobile?'flex-start':'center',marginBottom:16}}>
       <div>
         <div style={{fontSize:11,color:C.sub,textTransform:'uppercase',letterSpacing:.5}}>Current Balance</div>
         <div style={{fontSize:28,fontWeight:800,color:getAccBal(accId)>=0?acc.color:C.red,fontVariantNumeric:'tabular-nums'}}>{fmt(getAccBal(accId))}</div>
       </div>
-      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8,textAlign:'right'}}>
+      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8,textAlign:mobile?'left':'right',width:mobile?'100%':undefined}}>
         <div><div style={{fontSize:10,color:C.sub}}>Opening (pre-app)</div><div style={{fontWeight:700,color:C.txt}}>{fmt(trueOpening)}</div></div>
         <div><div style={{fontSize:10,color:C.sub}}>Entries</div><div style={{fontWeight:700,color:C.txt}}>{allRows.length}</div></div>
         <div><div style={{fontSize:10,color:C.sub}}>Total IN</div><div style={{fontWeight:700,color:C.green}}>{fmt(allRows.filter(r=>r.delta>0).reduce((s,r)=>s+r.delta,0))}</div></div>
@@ -3750,27 +3746,14 @@ function AccountLedger({accId,onClose}) {
       <input value={search} onChange={e=>{setSearch(e.target.value);setPage(0);}} placeholder="Search…" style={{width:'100%',border:'none',outline:'none',fontSize:13,color:C.txt,fontFamily:'inherit',background:'transparent'}}/>
     </div>
     <div style={{border:`1px solid ${C.bdr}`,borderRadius:8,overflow:'hidden'}}>
-      <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}>
-        <thead><tr style={{background:'#F6F8FA'}}>
-          {['Date','Description','In ↑','Out ↓','Balance'].map((h,i)=>(
-            <th key={i} style={{padding:'8px 12px',textAlign:i>=2?'right':'left',fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,borderBottom:`1px solid ${C.bdr}`}}>{h}</th>
-          ))}
-        </tr></thead>
-        <tbody>
-          {filtered.length===0&&<tr><td colSpan={5} style={{padding:'30px',textAlign:'center',color:C.muted}}>No transactions</td></tr>}
-          {pageRows.map((t,i)=>{
-            const isIn=t.delta>0;
-            return <tr key={i} style={{borderBottom:`1px solid ${C.bdr}`}}
-              onMouseEnter={e=>e.currentTarget.style.background='#F9FAFB'} onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
-              <td style={{padding:'9px 12px',color:C.sub,whiteSpace:'nowrap'}}>{fmtD(t.date)}</td>
-              <td style={{padding:'9px 12px'}}><div style={{fontWeight:500,color:C.txt}}>{t.desc}{t.isHist&&<span style={{fontSize:10,color:C.muted,marginLeft:6}}>pre-app</span>}</div>{t.notes&&<div style={{fontSize:11,color:C.muted}}>{t.notes}</div>}</td>
-              <td style={{padding:'9px 12px',textAlign:'right',fontWeight:700,color:C.green,fontVariantNumeric:'tabular-nums'}}>{isIn?fmt(t.delta):''}</td>
-              <td style={{padding:'9px 12px',textAlign:'right',fontWeight:700,color:C.red,fontVariantNumeric:'tabular-nums'}}>{!isIn?fmt(Math.abs(t.delta)):''}</td>
-              <td style={{padding:'9px 12px',textAlign:'right',fontWeight:700,color:t.balance>=0?C.txt:C.red,fontVariantNumeric:'tabular-nums'}}>{fmt(t.balance)}</td>
-            </tr>;
-          })}
-        </tbody>
-      </table>
+      <CardTable mobile={mobile} rows={pageRows} keyFn={(t,i)=>i} emptyLabel="No transactions"
+        columns={[
+          {key:'date',label:'Date',render:t=><span style={{color:C.sub,whiteSpace:'nowrap'}}>{fmtD(t.date)}</span>},
+          {key:'desc',label:'Description',render:t=><div><div style={{fontWeight:500,color:C.txt}}>{t.desc}{t.isHist&&<span style={{fontSize:10,color:C.muted,marginLeft:6}}>pre-app</span>}</div>{t.notes&&<div style={{fontSize:11,color:C.muted}}>{t.notes}</div>}</div>},
+          {key:'in',label:'In ↑',align:'right',render:t=><span style={{fontWeight:700,color:C.green,fontVariantNumeric:'tabular-nums'}}>{t.delta>0?fmt(t.delta):'—'}</span>},
+          {key:'out',label:'Out ↓',align:'right',render:t=><span style={{fontWeight:700,color:C.red,fontVariantNumeric:'tabular-nums'}}>{t.delta<=0?fmt(Math.abs(t.delta)):'—'}</span>},
+          {key:'balance',label:'Balance',align:'right',render:t=><span style={{fontWeight:700,color:t.balance>=0?C.txt:C.red,fontVariantNumeric:'tabular-nums'}}>{fmt(t.balance)}</span>},
+        ]}/>
     </div>
     {totalPages>1&&<div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:8,marginTop:12}}>
       <Btn onClick={()=>setPage(p=>Math.max(0,p-1))} disabled={page===0} variant="secondary" size="sm">← Prev</Btn>
@@ -3788,6 +3771,7 @@ function CategoryLedger({catId,onClose}) {
   const [page,setPage]=useState(0);
   const [groupView,setGroupView]=useState(false);
   const [expandedName,setExpandedName]=useState(null);
+  const mobile=useIsMobile();
   const subGroups=useMemo(()=>getCategorySubLedger(catId),[catId,state.txns.length]);
   const PAGE=20;
   const matchesCat=t=>{
@@ -3818,12 +3802,12 @@ function CategoryLedger({catId,onClose}) {
   const totalPages=Math.ceil(rows.length/PAGE);
 
   return <Modal title={label+' — Ledger'} onClose={onClose} width={640}>
-    <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}}>
+    <div style={{display:'flex',flexDirection:mobile?'column':'row',gap:mobile?14:0,justifyContent:'space-between',alignItems:mobile?'flex-start':'center',marginBottom:16}}>
       <div>
         <div style={{fontSize:11,color:C.sub,textTransform:'uppercase',letterSpacing:.5}}>{catMeta.dir==='out'?'Total Spent':'Total Collected'} (historical + this app)</div>
         <div style={{fontSize:28,fontWeight:800,color:running>=0?C.txt:C.red,fontVariantNumeric:'tabular-nums'}}>{fmt(running)}</div>
       </div>
-      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8,textAlign:'right'}}>
+      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8,textAlign:mobile?'left':'right',width:mobile?'100%':undefined}}>
         <div><div style={{fontSize:10,color:C.sub}}>Historical</div><div style={{fontWeight:700,color:C.txt}}>{fmt(historical)}</div></div>
         <div><div style={{fontSize:10,color:C.sub}}>Entries (this app)</div><div style={{fontWeight:700,color:C.txt}}>{txns.length}</div></div>
         <div><div style={{fontSize:10,color:C.sub}}>Total In</div><div style={{fontWeight:700,color:C.green}}>{fmt(totalIn)}</div></div>
@@ -3838,64 +3822,44 @@ function CategoryLedger({catId,onClose}) {
       subGroups.length===0
         ?<div style={{padding:'30px',textAlign:'center',color:C.muted,border:`1px solid ${C.bdr}`,borderRadius:8}}>No named breakdown available for this category yet — entries will group here once they share a payee name.</div>
         :<div style={{border:`1px solid ${C.bdr}`,borderRadius:8,overflow:'hidden'}}>
-          <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}>
-            <thead><tr style={{background:'#F6F8FA'}}>
-              {['Name','Historical','This App','Total'].map((h,i)=><th key={i} style={{padding:'8px 12px',textAlign:i>0?'right':'left',fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,borderBottom:`1px solid ${C.bdr}`}}>{h}</th>)}
-            </tr></thead>
-            <tbody>
-              {subGroups.map(g=><Fragment key={g.name}>
-                <tr style={{borderBottom:`1px solid ${C.bdr}`,cursor:'pointer'}} onClick={()=>setExpandedName(expandedName===g.name?null:g.name)}
-                  onMouseEnter={e=>e.currentTarget.style.background='#F9FAFB'} onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
-                  <td style={{padding:'9px 12px',fontWeight:600,color:C.blue}}>{expandedName===g.name?'▾':'▸'} {g.name}</td>
-                  <td style={{padding:'9px 12px',textAlign:'right',color:g.histTotal<0?C.red:C.sub}}>{g.histTotal<0?'−':''}{fmt(Math.abs(g.histTotal))}</td>
-                  <td style={{padding:'9px 12px',textAlign:'right',color:g.newTotal<0?C.red:C.sub}}>{g.newTotal<0?'−':''}{fmt(Math.abs(g.newTotal))}</td>
-                  <td style={{padding:'9px 12px',textAlign:'right',fontWeight:700,color:g.total<0?C.red:C.txt}}>{g.total<0?'−':''}{fmt(Math.abs(g.total))}</td>
-                </tr>
-                {expandedName===g.name&&<tr><td colSpan={4} style={{padding:0,background:'#F9FAFB'}}>
-                  <div style={{padding:'8px 12px 8px 30px'}}>
-                    {[...g.histEntries.map(e=>({date:e[0],amount:e[1],refund:e[1]<0})),...g.newEntries.map(t=>({date:t.date,amount:Math.abs(t.amount),refund:false}))]
-                      .sort((a,b)=>b.date.localeCompare(a.date)).map((e,j)=>(
-                      <div key={j} style={{display:'flex',justifyContent:'space-between',padding:'3px 0',fontSize:12,borderBottom:j<g.histEntries.length+g.newEntries.length-1?`1px solid ${C.bdr}`:'none'}}>
-                        <span style={{color:C.sub}}>{fmtD(e.date)}{e.refund&&<span style={{color:C.amber,marginLeft:6}}>refund</span>}</span>
-                        <span style={{fontWeight:600,color:e.refund?C.red:C.txt}}>{e.refund?'−':''}{fmt(Math.abs(e.amount))}</span>
-                      </div>
-                    ))}
+          <CardTable mobile={mobile} rows={subGroups} keyFn={g=>g.name} emptyLabel="No named breakdown"
+            onRowClick={g=>setExpandedName(expandedName===g.name?null:g.name)}
+            renderSubRow={g=>expandedName===g.name?
+              <div style={{padding:mobile?'8px 14px':'8px 12px 8px 30px',background:'#F9FAFB'}}>
+                {[...g.histEntries.map(e=>({date:e[0],amount:e[1],refund:e[1]<0})),...g.newEntries.map(t=>({date:t.date,amount:Math.abs(t.amount),refund:false}))]
+                  .sort((a,b)=>b.date.localeCompare(a.date)).map((e,j)=>(
+                  <div key={j} style={{display:'flex',justifyContent:'space-between',padding:'3px 0',fontSize:12,borderBottom:j<g.histEntries.length+g.newEntries.length-1?`1px solid ${C.bdr}`:'none'}}>
+                    <span style={{color:C.sub}}>{fmtD(e.date)}{e.refund&&<span style={{color:C.amber,marginLeft:6}}>refund</span>}</span>
+                    <span style={{fontWeight:600,color:e.refund?C.red:C.txt}}>{e.refund?'−':''}{fmt(Math.abs(e.amount))}</span>
                   </div>
-                </td></tr>}
-              </Fragment>)}
-            </tbody>
-          </table>
+                ))}
+              </div>:null}
+            columns={[
+              {key:'name',label:'Name',render:g=><span style={{fontWeight:600,color:C.blue}}>{expandedName===g.name?'▾':'▸'} {g.name}</span>},
+              {key:'hist',label:'Historical',align:'right',render:g=><span style={{color:g.histTotal<0?C.red:C.sub}}>{g.histTotal<0?'−':''}{fmt(Math.abs(g.histTotal))}</span>},
+              {key:'new',label:'This App',align:'right',render:g=><span style={{color:g.newTotal<0?C.red:C.sub}}>{g.newTotal<0?'−':''}{fmt(Math.abs(g.newTotal))}</span>},
+              {key:'total',label:'Total',align:'right',render:g=><span style={{fontWeight:700,color:g.total<0?C.red:C.txt}}>{g.total<0?'−':''}{fmt(Math.abs(g.total))}</span>},
+            ]}/>
         </div>
     ):<>
     <div style={{background:C.surf,borderRadius:7,border:`1px solid ${C.bdr}`,padding:'7px 11px',marginBottom:12}}>
       <input value={search} onChange={e=>{setSearch(e.target.value);setPage(0);}} placeholder="Search…" style={{width:'100%',border:'none',outline:'none',fontSize:13,color:C.txt,fontFamily:'inherit',background:'transparent'}}/>
     </div>
     <div style={{border:`1px solid ${C.bdr}`,borderRadius:8,overflow:'hidden'}}>
-      <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}>
-        <thead><tr style={{background:'#F6F8FA'}}>
-          {['Date','Description','In ↑','Out ↓',catMeta.dir==='out'?'Spent so far':'Collected so far'].map((h,i)=>(
-            <th key={i} style={{padding:'8px 12px',textAlign:i>=2?'right':'left',fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,borderBottom:`1px solid ${C.bdr}`}}>{h}</th>
-          ))}
-        </tr></thead>
-        <tbody>
-          {rows.length===0&&<tr><td colSpan={5} style={{padding:'30px',textAlign:'center',color:C.muted}}>No entries recorded in this app yet</td></tr>}
-          {pageRows.map((t,i)=>{
+      <CardTable mobile={mobile} rows={pageRows} keyFn={(t,i)=>i} emptyLabel="No entries recorded in this app yet"
+        footer={<div style={{display:'flex',justifyContent:'space-between',padding:'9px 12px',background:'#F6F8FA',fontWeight:700,color:C.txt}}>
+          <span>Historical (pre-app)</span><span style={{fontWeight:800}}>{fmt(historical)}</span>
+        </div>}
+        columns={[
+          {key:'date',label:'Date',render:t=><span style={{color:C.sub,whiteSpace:'nowrap'}}>{fmtD(t.date)}</span>},
+          {key:'desc',label:'Description',render:t=>{
             const desc=t.partyName||t.payee||'—';
-            return <tr key={i} style={{borderBottom:`1px solid ${C.bdr}`}}
-              onMouseEnter={e=>e.currentTarget.style.background='#F9FAFB'} onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
-              <td style={{padding:'9px 12px',color:C.sub,whiteSpace:'nowrap'}}>{fmtD(t.date)}</td>
-              <td style={{padding:'9px 12px'}}><div style={{fontWeight:500,color:C.txt}}>{desc}</div>{t.notes&&<div style={{fontSize:11,color:C.muted}}>{t.notes}</div>}</td>
-              <td style={{padding:'9px 12px',textAlign:'right',fontWeight:700,color:C.green,fontVariantNumeric:'tabular-nums'}}>{!t.isOut?fmt(Math.abs(t.amount)):''}</td>
-              <td style={{padding:'9px 12px',textAlign:'right',fontWeight:700,color:C.red,fontVariantNumeric:'tabular-nums'}}>{t.isOut?fmt(Math.abs(t.amount)):''}</td>
-              <td style={{padding:'9px 12px',textAlign:'right',fontWeight:700,color:t.balance>=0?C.txt:C.red,fontVariantNumeric:'tabular-nums'}}>{fmt(t.balance)}</td>
-            </tr>;
-          })}
-        </tbody>
-        <tfoot><tr style={{background:'#F6F8FA'}}>
-          <td colSpan={4} style={{padding:'9px 12px',fontWeight:700,color:C.txt}}>Historical (pre-app)</td>
-          <td style={{padding:'9px 12px',textAlign:'right',fontWeight:800,color:C.txt}}>{fmt(historical)}</td>
-        </tr></tfoot>
-      </table>
+            return <div><div style={{fontWeight:500,color:C.txt}}>{desc}</div>{t.notes&&<div style={{fontSize:11,color:C.muted}}>{t.notes}</div>}</div>;
+          }},
+          {key:'in',label:'In ↑',align:'right',render:t=><span style={{fontWeight:700,color:C.green,fontVariantNumeric:'tabular-nums'}}>{!t.isOut?fmt(Math.abs(t.amount)):'—'}</span>},
+          {key:'out',label:'Out ↓',align:'right',render:t=><span style={{fontWeight:700,color:C.red,fontVariantNumeric:'tabular-nums'}}>{t.isOut?fmt(Math.abs(t.amount)):'—'}</span>},
+          {key:'balance',label:catMeta.dir==='out'?'Spent so far':'Collected so far',align:'right',render:t=><span style={{fontWeight:700,color:t.balance>=0?C.txt:C.red,fontVariantNumeric:'tabular-nums'}}>{fmt(t.balance)}</span>},
+        ]}/>
     </div>
     {totalPages>1&&<div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:8,marginTop:12}}>
       <Btn onClick={()=>setPage(p=>Math.max(0,p-1))} disabled={page===0} variant="secondary" size="sm">← Prev</Btn>
@@ -4531,6 +4495,7 @@ function ItemMasters(){
   const[editSaleId,setEditSaleId]=useState(null);
   const[editSaleVal,setEditSaleVal]=useState('');
   const{toast,TC}=useToast();
+  const mobile=useIsMobile();
   const PAGE=50;
   const cats=useMemo(()=>[...new Set(state.items.map(i=>i.cat))].sort(),[]);
   const catOptions=useMemo(()=>[...new Set([...cats,'Other'])].sort(),[cats]);
