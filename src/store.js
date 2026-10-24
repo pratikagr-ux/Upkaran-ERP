@@ -1019,6 +1019,19 @@ if (typeof window !== 'undefined') {
   });
 }
 
+// Same live-refresh path as the same-device `storage` listener above, but
+// fed by db.js's Supabase Realtime subscription instead — this is how a
+// change made on a DIFFERENT device reaches this tab's already-rendered
+// components, reusing the exact same STORAGE_KEY_TO_STATE map and notify
+// mechanism (components already subscribed via subscribeLive() need no
+// changes at all to pick up a remote-origin update).
+DB.onRemoteUpdate((storageKey, value) => {
+  const key = STORAGE_KEY_TO_STATE[storageKey];
+  if (!key) return;
+  state[key] = value;
+  liveListeners.forEach(fn => fn());
+});
+
 export function updatePartyPhone(partyId, phone) {
   state.phoneEdits[partyId] = phone;
   state.parties = state.parties.map(p => p.id===partyId ? {...p,phone} : p);

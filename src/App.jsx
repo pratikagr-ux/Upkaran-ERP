@@ -10,6 +10,8 @@ import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import * as XLSX from 'xlsx';
 import { C, fmt, fmtL, fmtD, today, uid, ROUTES, ACCOUNTS, ACC_MAP, TXN_CATEGORIES, HISTORICAL_EXPENSES, TAG_COLORS, APP_VERSION } from './constants.js';
+import { DB } from './db.js';
+import { supabase } from './supabaseClient.js';
 import { state, save, loadAll, updatePartyPhone, getBestRate, gPS, getPrevItems, parseQty, parseResponse, getAccBal, getSupplierBal, getCustomerBal, getPartyBills, getSupplierBills, getBestPurchRate, getAllCustomerMetrics, getAllVendorMetrics, getExpenseReport, setCategoryBiz, getCategorySubLedger, getAllItemRows, getItemMetrics, getAllItemMetrics, getExpectedStockMap, getFifoStockMap, getRecentModeSaleRate, getMonthlyBI, getMonthlyBIByCategory, getSalesProfitByCategory, getPnL, getBalanceSheet, getRepairExpenseTotal, splitPosNegItems, recordCityTransport, getTopTransportersForCity, getAllTransporterNames, subscribeLive, getItemCustomerName, setItemCustomerName, PARTY_INVOICES, PARTY_HISTORY, SUPPLIER_HISTORY, ACCOUNT_OB, ACCOUNT_HISTORY, applyTemplate, DEFAULT_TEMPLATES } from './store.js';
 
 // ── CONVENIENT ALIASES (same pattern as monolith) ─────────────────────────────
@@ -247,6 +249,22 @@ const NAV = [
 ];
 
 
+// ── RESPONSIVE HELPERS ─────────────────────────────────────────────────────────
+// Single source of truth for the mobile breakpoint — every component that
+// needs to branch desktop/mobile calls this instead of rolling its own
+// resize listener. Matches the breakpoint App() already used for the
+// sidebar/bottom-tab-bar swap.
+const MOBILE_BREAKPOINT = 768;
+function useIsMobile(bp = MOBILE_BREAKPOINT){
+  const [mobile,setMobile] = useState(()=>window.innerWidth < bp);
+  useEffect(()=>{
+    const onResize = () => setMobile(window.innerWidth < bp);
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  },[bp]);
+  return mobile;
+}
+
 // ── SHARED UI ──────────────────────────────────────────────────────────────────
 function Badge({v,color='blue'}){
   const m={blue:[C.blueSoft,C.blue],green:[C.greenSoft,C.green],red:[C.redSoft,C.red],
@@ -304,11 +322,13 @@ function Sel({label,value,onChange,options,placeholder,required}){
 }
 
 function Modal({title,onClose,children,width=560}){
+  const mobile = useIsMobile();
   return <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.5)',zIndex:1000,
-    display:'flex',alignItems:'center',justifyContent:'center',padding:16}}
+    display:'flex',alignItems:'center',justifyContent:'center',padding:mobile?0:16}}
     onClick={e=>{if(e.target===e.currentTarget)onClose();}}>
-    <div style={{background:C.surf,borderRadius:12,width:'100%',maxWidth:width,maxHeight:'90vh',
-      overflow:'auto',boxShadow:'0 20px 60px rgba(0,0,0,0.3)'}}>
+    <div style={{background:C.surf,borderRadius:mobile?0:12,width:'100%',maxWidth:mobile?'100%':width,
+      height:mobile?'100%':'auto',maxHeight:mobile?'100%':'90vh',
+      overflow:'auto',boxShadow:mobile?'none':'0 20px 60px rgba(0,0,0,0.3)'}}>
       <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'16px 22px',
         borderBottom:`1px solid ${C.bdr}`,position:'sticky',top:0,background:C.surf,zIndex:1}}>
         <h2 style={{margin:0,fontSize:16,fontWeight:700,color:C.txt}}>{title}</h2>
@@ -321,7 +341,8 @@ function Modal({title,onClose,children,width=560}){
 }
 
 function Grid2({children}){
-  return <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:14}}>{children}</div>;
+  const mobile = useIsMobile();
+  return <div style={{display:'grid',gridTemplateColumns:mobile?'1fr':'1fr 1fr',gap:14}}>{children}</div>;
 }
 
 function SectionHead({title,sub,action}){
@@ -353,6 +374,88 @@ function Chip({v,active,onClick,color}){
     border:`1.5px solid ${active?(color||C.blue):'transparent'}`,
     background:active?((color||C.blue)+'12'):'#F3F4F6',
     color:active?(color||C.blue):C.sub,fontSize:12,fontWeight:600,cursor:'pointer',whiteSpace:'nowrap'}}>{v}</button>;
+}
+
+// Dual-rendering table: a verbatim desktop <table> (pass the exact markup
+// you already have via the `columns`/`rows` contract below), or — below the
+// mobile breakpoint — one bordered card per row with label:value lines.
+// Call with `mobile` from useIsMobile() at the call site (not computed
+// internally) so callers that already need the flag for other layout
+// decisions don't end up with two separate resize listeners.
+//
+// columns: [{ key, label, cardLabel?, align, render(row,i)=>node, hideOnMobile? }]
+// rows: array of row data objects
+// keyFn: (row,i)=>string|number — React key, also passed to onRowClick/renderSubRow
+// onRowClick?: (row)=>void — desktop <tr> onClick AND mobile card onClick
+// renderSubRow?: (row)=>node|null — extra content rendered after the main
+//    cells, inside the same <tr> colSpan block on desktop and inside the same
+//    card on mobile (e.g. DamagedInventory's "Recovered from" breakdown)
+// groupHeader?: (row, prevRow)=>node|null — returns a header element to
+//    splice in before this row (desktop: full-width <tr><td colSpan>, mobile:
+//    a plain heading above the card) when it differs from prevRow, e.g.
+//    category separators in ItemMasters
+// footer?: node — desktop: rendered as a <tfoot> row spanning all columns;
+//    mobile: rendered as its own summary card after the last row
+// emptyLabel?: string — shown when rows.length===0
+function CardTable({columns,rows,keyFn,mobile,onRowClick,renderSubRow,groupHeader,emptyLabel='No records',footer,rowStyle}){
+  const kf = keyFn || ((r,i)=>r.id ?? i);
+  if(!rows || rows.length===0){
+    return <div style={{padding:'30px 10px',textAlign:'center',color:C.sub,fontSize:13}}>{emptyLabel}</div>;
+  }
+  if(!mobile){
+    return <table style={{width:'100%',borderCollapse:'collapse'}}>
+      <thead>
+        <tr style={{borderBottom:`1.5px solid ${C.bdr}`}}>
+          {columns.map(c=><th key={c.key} style={{textAlign:c.align||'left',padding:'8px 10px',
+            fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5}}>{c.label}</th>)}
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map((row,i)=>{
+          const prev = i>0 ? rows[i-1] : null;
+          const gh = groupHeader ? groupHeader(row,prev) : null;
+          const sub = renderSubRow ? renderSubRow(row) : null;
+          const rs = rowStyle ? rowStyle(row) : null;
+          return <Fragment key={kf(row,i)}>
+            {gh && <tr><td colSpan={columns.length} style={{padding:0}}>{gh}</td></tr>}
+            <tr onClick={onRowClick?()=>onRowClick(row):undefined}
+              style={{borderBottom:sub?'none':`1px solid ${C.bdr}`,cursor:onRowClick?'pointer':'default',...rs}}>
+              {columns.map(c=><td key={c.key} style={{textAlign:c.align||'left',padding:'8px 10px',fontSize:13,color:C.txt}}>
+                {c.render?c.render(row,i):row[c.key]}
+              </td>)}
+            </tr>
+            {sub && <tr style={{borderBottom:`1px solid ${C.bdr}`}}><td colSpan={columns.length} style={{padding:0,...(rs?{background:rs.background}:{})}}>{sub}</td></tr>}
+          </Fragment>;
+        })}
+      </tbody>
+      {footer && <tfoot><tr><td colSpan={columns.length} style={{padding:0}}>{footer}</td></tr></tfoot>}
+    </table>;
+  }
+  // Mobile: one card per row.
+  return <div style={{display:'flex',flexDirection:'column',gap:10}}>
+    {rows.map((row,i)=>{
+      const prev = i>0 ? rows[i-1] : null;
+      const gh = groupHeader ? groupHeader(row,prev) : null;
+      const sub = renderSubRow ? renderSubRow(row) : null;
+      const rs = rowStyle ? rowStyle(row) : null;
+      const visibleCols = columns.filter(c=>!c.hideOnMobile);
+      return <Fragment key={kf(row,i)}>
+        {gh && <div>{gh}</div>}
+        <div onClick={onRowClick?()=>onRowClick(row):undefined}
+          style={{border:`1px solid ${C.bdr}`,borderRadius:9,padding:'12px 14px',background:C.surf,
+            cursor:onRowClick?'pointer':'default',display:'flex',flexDirection:'column',gap:7,...rs}}>
+          {visibleCols.map(c=><div key={c.key} style={{display:'flex',justifyContent:'space-between',
+            alignItems:'flex-start',gap:10}}>
+            <span style={{fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',
+              letterSpacing:.5,whiteSpace:'nowrap',flexShrink:0}}>{c.cardLabel||c.label}</span>
+            <span style={{fontSize:13,color:C.txt,textAlign:'right'}}>{c.render?c.render(row,i):row[c.key]}</span>
+          </div>)}
+          {sub && <div style={{marginTop:2}}>{sub}</div>}
+        </div>
+      </Fragment>;
+    })}
+    {footer && <div style={{marginTop:2}}>{footer}</div>}
+  </div>;
 }
 
 function useToast(){
@@ -393,6 +496,7 @@ function useCategoryTypeahead(cats, onPick) {
 
 // ── ICONS + NAV ───────────────────────────────────────────────────────────────
 function OutstandingDetail({party,od,onClose}){
+  const mobile=useIsMobile();
   const newSales=state.sales.filter(s=>s.partyId===party.id).reduce((s,t)=>s+t.total,0);
   const payments=state.payments.filter(p=>p.partyId===party.id).reduce((s,p)=>s+p.amount,0);
   const currentOD=od+newSales-payments;
@@ -525,24 +629,28 @@ function OutstandingDetail({party,od,onClose}){
             <span style={{fontWeight:800,color:C.red,fontVariantNumeric:'tabular-nums'}}>{fmt(b.remaining)}</span>
           </div>
           <div style={{fontSize:11,color:C.sub,marginBottom:6}}>Billed {fmt(b.total)} · {b.items||'—'}</div>
-          <div style={{display:'flex',alignItems:'center',gap:6,flexWrap:'wrap'}}>
-            <span style={{fontSize:11,color:C.sub}}>Write off ₹</span>
-            <input type="number" placeholder="0" value={discounts[b.key]||''}
-              onChange={e=>setDiscounts(d=>({...d,[b.key]:e.target.value}))}
-              style={{width:70,padding:'4px 7px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:12,outline:'none',fontFamily:'inherit',textAlign:'right'}}
-              onFocus={e=>e.target.style.borderColor=C.amber} onBlur={e=>e.target.style.borderColor=C.bdr}/>
-            <span style={{fontSize:11,color:C.sub,marginLeft:10}}>Repair ₹</span>
-            <input type="number" placeholder="0" value={repairs[b.key]||''}
-              onChange={e=>setRepairs(d=>({...d,[b.key]:e.target.value}))}
-              style={{width:70,padding:'4px 7px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:12,outline:'none',fontFamily:'inherit',textAlign:'right'}}
-              onFocus={e=>e.target.style.borderColor=C.purple} onBlur={e=>e.target.style.borderColor=C.bdr}/>
-            {parseFloat(repairs[b.key])>0&&<>
-              <span style={{fontSize:10,color:C.muted}}>↳ Expense ₹</span>
-              <input type="number" placeholder={repairs[b.key]} value={repairExpOv[b.key]||''}
-                onChange={e=>setRepairExpOv(d=>({...d,[b.key]:e.target.value}))}
-                style={{width:60,padding:'3px 6px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:11,outline:'none',fontFamily:'inherit',textAlign:'right',color:C.muted}}
+          <div style={{display:'flex',alignItems:mobile?'flex-start':'center',gap:mobile?8:6,flexWrap:'wrap',flexDirection:mobile?'column':'row'}}>
+            <div style={{display:'flex',alignItems:'center',gap:6}}>
+              <span style={{fontSize:11,color:C.sub}}>Write off ₹</span>
+              <input type="number" placeholder="0" value={discounts[b.key]||''}
+                onChange={e=>setDiscounts(d=>({...d,[b.key]:e.target.value}))}
+                style={{width:70,padding:'4px 7px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:12,outline:'none',fontFamily:'inherit',textAlign:'right'}}
+                onFocus={e=>e.target.style.borderColor=C.amber} onBlur={e=>e.target.style.borderColor=C.bdr}/>
+            </div>
+            <div style={{display:'flex',alignItems:'center',gap:6,flexWrap:'wrap'}}>
+              <span style={{fontSize:11,color:C.sub,marginLeft:mobile?0:10}}>Repair ₹</span>
+              <input type="number" placeholder="0" value={repairs[b.key]||''}
+                onChange={e=>setRepairs(d=>({...d,[b.key]:e.target.value}))}
+                style={{width:70,padding:'4px 7px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:12,outline:'none',fontFamily:'inherit',textAlign:'right'}}
                 onFocus={e=>e.target.style.borderColor=C.purple} onBlur={e=>e.target.style.borderColor=C.bdr}/>
-            </>}
+              {parseFloat(repairs[b.key])>0&&<>
+                <span style={{fontSize:10,color:C.muted}}>↳ Expense ₹</span>
+                <input type="number" placeholder={repairs[b.key]} value={repairExpOv[b.key]||''}
+                  onChange={e=>setRepairExpOv(d=>({...d,[b.key]:e.target.value}))}
+                  style={{width:60,padding:'3px 6px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:11,outline:'none',fontFamily:'inherit',textAlign:'right',color:C.muted}}
+                  onFocus={e=>e.target.style.borderColor=C.purple} onBlur={e=>e.target.style.borderColor=C.bdr}/>
+              </>}
+            </div>
             {(parseFloat(discounts[b.key])>0||parseFloat(repairs[b.key])>0)&&<span style={{fontSize:11,color:C.amber,width:'100%'}}>→ net {fmt(Math.max(0,b.remaining-(parseFloat(discounts[b.key])||0)-(parseFloat(repairs[b.key])||0)))}</span>}
           </div>
         </div>
@@ -585,6 +693,7 @@ function OutstandingDetail({party,od,onClose}){
 
 // ── OUTSTANDING ───────────────────────────────────────────────────────────────
 function Outstanding(){
+  const mobile=useIsMobile();
   const[routeF,setRouteF]=useState('');   // '' | 'CG North' | 'CG South' | 'Odisha' | 'Raipur' | 'Lighter'
   const[ageF,setAgeF]    =useState('');   // '' | '0-30' | '30-60' | '60+'
   const[profile,setProfile]=useState(null);
@@ -785,12 +894,14 @@ function Outstanding(){
     </div>
 
     {/* Active filter banner */}
-    {(routeF||ageF)&&<div style={{display:'flex',alignItems:'center',gap:8,marginBottom:10,padding:'8px 14px',
-      background:C.blueSoft,borderRadius:8,border:`1px solid ${C.blue}20`,fontSize:12}}>
-      <span style={{color:C.blue,fontWeight:600}}>Showing:</span>
-      {routeF&&<span style={{background:C.blue,color:'#fff',padding:'2px 9px',borderRadius:20,fontSize:11,fontWeight:600}}>{routeF}</span>}
-      {ageF&&<span style={{background:C.amber,color:'#fff',padding:'2px 9px',borderRadius:20,fontSize:11,fontWeight:600}}>{ageF}</span>}
-      <button onClick={()=>{setRouteF('');setAgeF('');}} style={{marginLeft:'auto',background:'none',border:'none',cursor:'pointer',fontSize:12,color:C.sub,fontFamily:'inherit'}}>Clear filters ✕</button>
+    {(routeF||ageF)&&<div style={{display:'flex',alignItems:mobile?'flex-start':'center',gap:8,marginBottom:10,padding:'8px 14px',
+      background:C.blueSoft,borderRadius:8,border:`1px solid ${C.blue}20`,fontSize:12,flexDirection:mobile?'column':'row'}}>
+      <div style={{display:'flex',alignItems:'center',gap:8,flexWrap:'wrap'}}>
+        <span style={{color:C.blue,fontWeight:600}}>Showing:</span>
+        {routeF&&<span style={{background:C.blue,color:'#fff',padding:'2px 9px',borderRadius:20,fontSize:11,fontWeight:600}}>{routeF}</span>}
+        {ageF&&<span style={{background:C.amber,color:'#fff',padding:'2px 9px',borderRadius:20,fontSize:11,fontWeight:600}}>{ageF}</span>}
+      </div>
+      <button onClick={()=>{setRouteF('');setAgeF('');}} style={{marginLeft:mobile?0:'auto',alignSelf:mobile?'flex-end':'auto',background:'none',border:'none',cursor:'pointer',fontSize:12,color:C.sub,fontFamily:'inherit'}}>Clear filters ✕</button>
     </div>}
 
     {/* Search */}
@@ -835,100 +946,77 @@ function Outstanding(){
               📲 Share
             </button>
           </div>
-          <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}>
-            <tbody>
-              {c.parties.map((p,i)=>{
+          <CardTable mobile={mobile} rows={c.parties} keyFn={p=>p.id} onRowClick={p=>setDetail({party:p,od:p.ob})}
+            rowStyle={p=>({background:p.isLighter?'#FAF5FF':p.overdueDays>90?C.redSoft:p.overdueDays>30?C.amberSoft:'transparent'})}
+            columns={[
+              {key:'idx',label:'#',render:(p,i)=><span style={{color:C.muted,fontSize:11}}>{i+1}</span>,hideOnMobile:true},
+              {key:'party',label:'Party',render:p=>{
                 const lastFU=state.followups.find(f=>f.partyId===p.id&&f.status==='open');
-                const rowBg=p.isLighter?'#FAF5FF':p.overdueDays>90?C.redSoft:p.overdueDays>30?C.amberSoft:'transparent';
-                return <tr key={p.id} onClick={()=>setDetail({party:p,od:p.ob})}
-                  style={{borderBottom:i<c.parties.length-1?`1px solid ${C.bdr}`:'none',cursor:'pointer',background:rowBg}}
-                  onMouseEnter={e=>e.currentTarget.style.background='#F6F8FA'}
-                  onMouseLeave={e=>e.currentTarget.style.background=rowBg}>
-                  <td style={{padding:'9px 14px',width:24,color:C.muted,fontSize:11}}>{i+1}</td>
-                  <td style={{padding:'9px 14px'}} onClick={e=>{e.stopPropagation();setProfile(p);}}>
-                    <div style={{fontWeight:600,color:C.blue,cursor:'pointer',textDecoration:'underline',textDecorationStyle:'dotted',fontSize:13}}>{p.name}</div>
-                    <div style={{display:'flex',gap:6,marginTop:2,flexWrap:'wrap'}}>
-                      {p.isLighter&&<span style={{fontSize:10,background:'#FAF5FF',color:'#7C3AED',fontWeight:700,padding:'1px 7px',borderRadius:20,border:'1px solid #DDD6FE'}}>Lighter</span>}
-                      {p.notRecoverable&&<span style={{fontSize:10,background:'#F3F4F6',color:C.muted,fontWeight:700,padding:'1px 7px',borderRadius:20,border:`1px solid ${C.bdr}`}}>Not Recoverable</span>}
-                      {lastFU&&<span style={{fontSize:10,color:TAG_COLORS[lastFU.tags[0]]||C.blue,fontWeight:600}}>{lastFU.label}</span>}
-                    </div>
-                  </td>
-                  <td style={{padding:'9px 14px',whiteSpace:'nowrap'}}>
-                    {p.overdueDays>0
-                      ?<span style={{fontWeight:700,fontSize:12,color:p.overdueDays>90?C.red:p.overdueDays>30?C.amber:C.sub}}>{p.overdueDays}d overdue</span>
-                      :<span style={{fontSize:12,color:p.isLighter?C.purple:C.green,fontWeight:600}}>{p.isLighter?'3d credit':'In credit'}</span>}
-                  </td>
-                  <td style={{padding:'9px 14px',textAlign:'right',fontWeight:800,color:p.isLighter?'#7C3AED':C.red,fontVariantNumeric:'tabular-nums',fontSize:14,whiteSpace:'nowrap'}}>
-                    {fmt(partyAmt(p))}
-                  </td>
-                </tr>;
-              })}
-            </tbody>
-          </table>
+                return <div onClick={e=>{e.stopPropagation();setProfile(p);}}>
+                  <div style={{fontWeight:600,color:C.blue,cursor:'pointer',textDecoration:'underline',textDecorationStyle:'dotted',fontSize:13}}>{p.name}</div>
+                  <div style={{display:'flex',gap:6,marginTop:2,flexWrap:'wrap'}}>
+                    {p.isLighter&&<span style={{fontSize:10,background:'#FAF5FF',color:'#7C3AED',fontWeight:700,padding:'1px 7px',borderRadius:20,border:'1px solid #DDD6FE'}}>Lighter</span>}
+                    {p.notRecoverable&&<span style={{fontSize:10,background:'#F3F4F6',color:C.muted,fontWeight:700,padding:'1px 7px',borderRadius:20,border:`1px solid ${C.bdr}`}}>Not Recoverable</span>}
+                    {lastFU&&<span style={{fontSize:10,color:TAG_COLORS[lastFU.tags[0]]||C.blue,fontWeight:600}}>{lastFU.label}</span>}
+                  </div>
+                </div>;
+              }},
+              {key:'overdue',label:'Overdue',render:p=>p.overdueDays>0
+                ?<span style={{fontWeight:700,fontSize:12,color:p.overdueDays>90?C.red:p.overdueDays>30?C.amber:C.sub}}>{p.overdueDays}d overdue</span>
+                :<span style={{fontSize:12,color:p.isLighter?C.purple:C.green,fontWeight:600}}>{p.isLighter?'3d credit':'In credit'}</span>},
+              {key:'amt',label:'Outstanding',align:'right',render:p=>
+                <span style={{fontWeight:800,color:p.isLighter?'#7C3AED':C.red,fontVariantNumeric:'tabular-nums',fontSize:14,whiteSpace:'nowrap'}}>{fmt(partyAmt(p))}</span>},
+            ]}/>
         </div>
       ))}
     </div>
     :<>
     {/* Party table */}
     <div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,overflow:'hidden'}}>
-      <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}>
-        <thead><tr style={{background:'#F6F8FA'}}>
-          {['#','Party','City','Route','Overdue','Outstanding','WA'].map((h,i)=>(
-            <th key={i} style={{padding:'9px 12px',textAlign:h==='Outstanding'?'right':h==='WA'?'center':'left',
-              fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,borderBottom:`1px solid ${C.bdr}`,whiteSpace:'nowrap'}}>{h}</th>
-          ))}
-        </tr></thead>
-        <tbody>
-          {!odList.length&&<tr><td colSpan={7} style={{padding:'40px',textAlign:'center',color:C.muted}}>No parties match the filter</td></tr>}
-          {odList.map((p,i)=>{
+      <CardTable mobile={mobile} rows={odList} keyFn={(p,i)=>p.id||i} emptyLabel="No parties match the filter"
+        onRowClick={p=>setDetail({party:p,od:p.ob})}
+        rowStyle={p=>({background:p.isLighter?'#FAF5FF':p.overdueDays>90?C.redSoft:p.overdueDays>30?C.amberSoft:'transparent'})}
+        columns={[
+          {key:'idx',label:'#',render:(p,i)=><span style={{color:C.muted,fontSize:11}}>{i+1}</span>,hideOnMobile:true},
+          {key:'party',label:'Party',render:p=>{
             const lastFU=state.followups.find(f=>f.partyId===p.id&&f.status==='open');
+            return <div onClick={e=>{e.stopPropagation();setProfile(p);}}>
+              <div style={{fontWeight:600,color:C.blue,cursor:'pointer',textDecoration:'underline',textDecorationStyle:'dotted'}}>{p.name}</div>
+              <div style={{display:'flex',gap:6,marginTop:2,flexWrap:'wrap'}}>
+                {p.isLighter&&<span style={{fontSize:10,background:'#FAF5FF',color:'#7C3AED',fontWeight:700,padding:'1px 7px',borderRadius:20,border:'1px solid #DDD6FE'}}>Lighter</span>}
+                {p.notRecoverable&&<span style={{fontSize:10,background:'#F3F4F6',color:C.muted,fontWeight:700,padding:'1px 7px',borderRadius:20,border:`1px solid ${C.bdr}`}}>Not Recoverable</span>}
+                {lastFU&&<span style={{fontSize:10,color:TAG_COLORS[lastFU.tags[0]]||C.blue,fontWeight:600}}>{lastFU.label}</span>}
+              </div>
+            </div>;
+          }},
+          {key:'city',label:'City',render:p=><span style={{color:C.sub,fontSize:12}}>{p.city||'—'}</span>},
+          {key:'route',label:'Route',render:p=><Badge v={p.isLighter?'Raipur':p.route||'—'} color={p.route==='CG North'?'blue':p.route==='CG South'?'green':p.route==='Odisha'?'amber':'gray'}/>},
+          {key:'overdue',label:'Overdue',render:p=>p.overdueDays>0
+            ?<span style={{fontWeight:700,fontSize:12,color:p.overdueDays>90?C.red:p.overdueDays>30?C.amber:C.sub}}>{p.overdueDays}d overdue</span>
+            :<span style={{fontSize:12,color:p.isLighter?C.purple:C.green,fontWeight:600}}>{p.isLighter?'3d credit':'In credit'}</span>},
+          {key:'amt',label:'Outstanding',align:'right',render:p=><>
+            <span style={{fontWeight:800,color:p.isLighter?'#7C3AED':C.red,fontVariantNumeric:'tabular-nums',fontSize:14}}>{fmt(isAmountBucket(ageF)?bucketAmt(p,ageF):p.od)}</span>
+            {isAmountBucket(ageF)&&p.od!==bucketAmt(p,ageF)&&<div style={{fontSize:10,fontWeight:600,color:C.muted}}>of {fmt(p.od)}</div>}
+          </>},
+          {key:'wa',label:'WA',align:'center',render:p=>{
             const pBills=getPartyBills(p).filter(b=>b.remaining>0.5);
             const pInvDetails=pBills.map(b=>'• '+fmtD(b.date)+' — '+fmt(b.remaining)+' ('+b.daysSince+'d from invoice)').join('\n');
             const waMsg=applyTemplate('payment',{partyName:p.name,amount:fmt(p.od),invoiceDetails:pInvDetails});
-            const rowBg=p.isLighter?'#FAF5FF':p.overdueDays>90?C.redSoft:p.overdueDays>30?C.amberSoft:'transparent';
-            return <tr key={i} onClick={()=>setDetail({party:p,od:p.ob})}
-              style={{borderBottom:`1px solid ${C.bdr}`,cursor:'pointer',background:rowBg}}
-              onMouseEnter={e=>e.currentTarget.style.background='#F6F8FA'}
-              onMouseLeave={e=>e.currentTarget.style.background=rowBg}>
-              <td style={{padding:'10px 12px',color:C.muted,fontSize:11}}>{i+1}</td>
-              <td style={{padding:'10px 12px'}} onClick={e=>{e.stopPropagation();setProfile(p);}}>
-                <div style={{fontWeight:600,color:C.blue,cursor:'pointer',textDecoration:'underline',textDecorationStyle:'dotted'}}>{p.name}</div>
-                <div style={{display:'flex',gap:6,marginTop:2,flexWrap:'wrap'}}>
-                  {p.isLighter&&<span style={{fontSize:10,background:'#FAF5FF',color:'#7C3AED',fontWeight:700,padding:'1px 7px',borderRadius:20,border:'1px solid #DDD6FE'}}>Lighter</span>}
-                  {p.notRecoverable&&<span style={{fontSize:10,background:'#F3F4F6',color:C.muted,fontWeight:700,padding:'1px 7px',borderRadius:20,border:`1px solid ${C.bdr}`}}>Not Recoverable</span>}
-                  {lastFU&&<span style={{fontSize:10,color:TAG_COLORS[lastFU.tags[0]]||C.blue,fontWeight:600}}>{lastFU.label}</span>}
-                </div>
-              </td>
-              <td style={{padding:'10px 12px',color:C.sub,fontSize:12}}>{p.city||'—'}</td>
-              <td style={{padding:'10px 12px'}}>
-                <Badge v={p.isLighter?'Raipur':p.route||'—'} color={p.route==='CG North'?'blue':p.route==='CG South'?'green':p.route==='Odisha'?'amber':'gray'}/>
-              </td>
-              <td style={{padding:'10px 12px'}}>
-                {p.overdueDays>0
-                  ?<span style={{fontWeight:700,fontSize:12,color:p.overdueDays>90?C.red:p.overdueDays>30?C.amber:C.sub}}>{p.overdueDays}d overdue</span>
-                  :<span style={{fontSize:12,color:p.isLighter?C.purple:C.green,fontWeight:600}}>{p.isLighter?'3d credit':'In credit'}</span>}
-              </td>
-              <td style={{padding:'10px 12px',textAlign:'right',fontWeight:800,color:p.isLighter?'#7C3AED':C.red,fontVariantNumeric:'tabular-nums',fontSize:14}}>
-                {fmt(isAmountBucket(ageF)?bucketAmt(p,ageF):p.od)}
-                {isAmountBucket(ageF)&&p.od!==bucketAmt(p,ageF)&&<div style={{fontSize:10,fontWeight:600,color:C.muted}}>of {fmt(p.od)}</div>}
-              </td>
-              <td style={{padding:'10px 12px',textAlign:'center'}} onClick={e=>e.stopPropagation()}>
-                {p.phone
-                  ?<a href={'https://wa.me/91'+p.phone+'?text='+encodeURIComponent(waMsg)} target="_blank" rel="noreferrer" title={'Send to '+p.phone}
-                      style={{display:'inline-flex',alignItems:'center',gap:5,padding:'5px 10px',
-                        borderRadius:6,border:'1.5px solid #25D366',color:'#15803D',
-                        textDecoration:'none',fontSize:12,fontWeight:700,background:'#F0FDF4'}}>
-                      <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
-                        <path d="M17.47 14.38c-.3-.15-1.77-.87-2.04-.97-.27-.1-.47-.15-.67.15-.2.3-.77.97-.94 1.17-.17.2-.35.22-.65.07-.3-.15-1.26-.46-2.4-1.47-.89-.79-1.49-1.76-1.66-2.06-.17-.3-.02-.46.13-.61.13-.13.3-.35.45-.52.15-.17.2-.3.3-.5.1-.2.05-.37-.02-.52-.07-.15-.67-1.62-.92-2.22-.24-.58-.49-.5-.67-.51-.17-.01-.37-.01-.57-.01-.2 0-.52.07-.79.37-.27.3-1.04 1.01-1.04 2.47 0 1.46 1.07 2.87 1.22 3.07.15.2 2.1 3.2 5.08 4.49.71.31 1.26.5 1.69.64.71.22 1.36.19 1.87.11.57-.08 1.77-.72 2.02-1.42.25-.7.25-1.3.17-1.42-.07-.13-.27-.2-.57-.35z"/>
-                        <path d="M12 2C6.48 2 2 6.48 2 12c0 1.85.5 3.58 1.37 5.07L2 22l5.07-1.35C8.5 21.5 10.22 22 12 22c5.52 0 10-4.48 10-10S17.52 2 12 2z" fillRule="evenodd"/>
-                      </svg>WA
-                    </a>
-                  :<span style={{fontSize:11,color:C.muted}}>—</span>}
-              </td>
-            </tr>;
-          })}
-        </tbody>
-      </table>
+            return <div onClick={e=>e.stopPropagation()}>
+              {p.phone
+                ?<a href={'https://wa.me/91'+p.phone+'?text='+encodeURIComponent(waMsg)} target="_blank" rel="noreferrer" title={'Send to '+p.phone}
+                    style={{display:'inline-flex',alignItems:'center',gap:5,padding:'5px 10px',
+                      borderRadius:6,border:'1.5px solid #25D366',color:'#15803D',
+                      textDecoration:'none',fontSize:12,fontWeight:700,background:'#F0FDF4'}}>
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
+                      <path d="M17.47 14.38c-.3-.15-1.77-.87-2.04-.97-.27-.1-.47-.15-.67.15-.2.3-.77.97-.94 1.17-.17.2-.35.22-.65.07-.3-.15-1.26-.46-2.4-1.47-.89-.79-1.49-1.76-1.66-2.06-.17-.3-.02-.46.13-.61.13-.13.3-.35.45-.52.15-.17.2-.3.3-.5.1-.2.05-.37-.02-.52-.07-.15-.67-1.62-.92-2.22-.24-.58-.49-.5-.67-.51-.17-.01-.37-.01-.57-.01-.2 0-.52.07-.79.37-.27.3-1.04 1.01-1.04 2.47 0 1.46 1.07 2.87 1.22 3.07.15.2 2.1 3.2 5.08 4.49.71.31 1.26.5 1.69.64.71.22 1.36.19 1.87.11.57-.08 1.77-.72 2.02-1.42.25-.7.25-1.3.17-1.42-.07-.13-.27-.2-.57-.35z"/>
+                      <path d="M12 2C6.48 2 2 6.48 2 12c0 1.85.5 3.58 1.37 5.07L2 22l5.07-1.35C8.5 21.5 10.22 22 12 22c5.52 0 10-4.48 10-10S17.52 2 12 2z" fillRule="evenodd"/>
+                    </svg>WA
+                  </a>
+                :<span style={{fontSize:11,color:C.muted}}>—</span>}
+            </div>;
+          }},
+        ]}/>
     </div>
     </>}
   </div>;
@@ -981,13 +1069,14 @@ function CityOrderModal({cities,onClose}){
 
 // ── PARTY INFO CARD ───────────────────────────────────────────────────────────
 function PartyInfoCard({party}){
+  const mobile=useIsMobile();
   const st=gPS(party.name);
   const ns=state.sales.filter(s=>s.partyId===party.id).reduce((s,t)=>s+t.total,0);
   const od=getCustomerBal(party.id);
   const tp=(st?.ts||0)+ns;
   const grade=od>100000?'D':od>50000?'C':od<=0?'A':'B';
   const gc={A:C.green,B:C.blue,C:C.amber,D:C.red};
-  return <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:8,marginTop:10,marginBottom:2}}>
+  return <div style={{display:'grid',gridTemplateColumns:mobile?'repeat(2,1fr)':'repeat(4,1fr)',gap:8,marginTop:10,marginBottom:2}}>
     {[['Total Purchase',tp>0?fmtL(tp):'New party',C.blue],
       ['Avg / Month',st?.am?fmtL(st.am):'—',C.purple],
       ['Outstanding',od>0?fmtL(od):od<0?'Credit '+fmtL(-od):'Clear ✓',od>0?C.red:C.green],
@@ -2128,6 +2217,7 @@ function EditReturnModal({sale,onClose,onSaved}){
 
 
 function PartyProfile({party,onClose}){
+  const mobile=useIsMobile();
   const hist=PARTY_HISTORY[party.name]||{};
   const sales=hist.s||[];
   const pmts=hist.p||[];
@@ -2169,7 +2259,7 @@ function PartyProfile({party,onClose}){
           <div style={{fontSize:10,color:'rgba(255,255,255,.4)',marginTop:2}}>{gradeLabel[grade]}</div>
         </div>
       </div>
-      <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:10,marginTop:16}}>
+      <div style={{display:'grid',gridTemplateColumns:mobile?'repeat(2,1fr)':'repeat(4,1fr)',gap:10,marginTop:16}}>
         {[['Total',fmtL(totalSold),C.blue],['Avg/Mo',st?.am?fmtL(st.am):'—',C.purple],['OD',currentOD<0?'−'+fmtL(-currentOD):fmtL(currentOD),currentOD>0?C.red:C.green],['Active',monthsActive+'mo',C.amber]].map(([l,v,col],i)=>(
           <div key={i} style={{background:'rgba(255,255,255,.07)',borderRadius:8,padding:'9px 12px'}}>
             <div style={{fontSize:9,color:'rgba(255,255,255,.4)',textTransform:'uppercase',letterSpacing:.6,marginBottom:3}}>{l}</div>
@@ -2177,11 +2267,11 @@ function PartyProfile({party,onClose}){
           </div>))}
       </div>
     </div>
-    <div style={{display:'flex',borderBottom:`1px solid ${C.bdr}`,marginBottom:18,gap:2}}>
-      {TABS.map(([id,label])=><button key={id} onClick={()=>setTab(id)} style={{padding:'8px 16px',border:'none',background:'transparent',cursor:'pointer',fontFamily:'inherit',fontSize:13,fontWeight:tab===id?700:400,color:tab===id?C.blue:C.sub,borderBottom:tab===id?`2px solid ${C.blue}`:'2px solid transparent',marginBottom:-1}}>{label}</button>)}
+    <div style={{display:'flex',borderBottom:`1px solid ${C.bdr}`,marginBottom:18,gap:mobile?0:2,overflowX:mobile?'auto':'visible'}}>
+      {TABS.map(([id,label])=><button key={id} onClick={()=>setTab(id)} style={{padding:mobile?'8px 10px':'8px 16px',border:'none',background:'transparent',cursor:'pointer',fontFamily:'inherit',fontSize:mobile?12:13,whiteSpace:'nowrap',fontWeight:tab===id?700:400,color:tab===id?C.blue:C.sub,borderBottom:tab===id?`2px solid ${C.blue}`:'2px solid transparent',marginBottom:-1}}>{label}</button>)}
     </div>
     {tab==='overview'&&<div>
-      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:14,marginBottom:18}}>
+      <div style={{display:'grid',gridTemplateColumns:mobile?'1fr':'1fr 1fr',gap:14,marginBottom:18}}>
         <div style={{background:'#F9FAFB',borderRadius:8,padding:14,border:`1px solid ${C.bdr}`}}>
           <div style={{fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,marginBottom:10}}>Business Relationship</div>
           {[['Customer since',firstDate?fmtD(firstDate):'—'],['Active for',monthsActive>0?monthsActive+' months':'—'],['Total invoices',sales.length+' recorded'],['Total payments',pmts.length+' recorded'],['Avg payment gap',avgDaysBetweenPayments>0?Math.round(avgDaysBetweenPayments)+'d':'—']].map(([l,v])=>(
@@ -2224,34 +2314,30 @@ function PartyProfile({party,onClose}){
       })()}
     </div>}
     {tab==='sales'&&<div style={{maxHeight:380,overflowY:'auto'}}>
-      {!sales.length&&!state.sales.filter(s=>s.partyId===party.id).length&&<div style={{padding:'30px',textAlign:'center',color:C.muted}}>No sales history</div>}
-      <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}>
-        <thead><tr style={{background:'#F6F8FA'}}>{['Date','Items','Amount'].map((h,i)=><th key={i} style={{padding:'8px 12px',textAlign:i===2?'right':'left',fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,borderBottom:`1px solid ${C.bdr}`}}>{h}</th>)}</tr></thead>
-        <tbody>
-          {[...state.sales.filter(s=>s.partyId===party.id).map(s=>({d:s.date,t:s.total,items:s.items?.map(x=>([x.customerName||x.itemName,x.qty,x.rate]))||[],isNew:true})),...sales.map(s=>({d:s[0],t:s[1],items:s[2]||[],isNew:false}))].sort((a,b)=>b.d.localeCompare(a.d)).map((s,i)=>(
-            <tr key={i} style={{borderBottom:`1px solid ${C.bdr}`,background:s.isNew?C.blueSoft:'transparent'}}>
-              <td style={{padding:'9px 12px',whiteSpace:'nowrap'}}>{fmtD(s.d)}{s.isNew&&<span style={{fontSize:10,color:C.blue,fontWeight:700,marginLeft:6}}>NEW</span>}</td>
-              <td style={{padding:'9px 12px',fontSize:12,color:C.sub,maxWidth:260}}>{s.items.length?s.items.slice(0,3).map((x,j)=><span key={j} style={{display:'block'}}>{Array.isArray(x)?x[0]+' ×'+x[1]+' @₹'+x[2]:(x.customerName||x.itemName)}</span>):'—'}</td>
-              <td style={{padding:'9px 12px',textAlign:'right',fontWeight:700,color:C.blue,fontVariantNumeric:'tabular-nums'}}>{fmt(s.t)}</td>
-            </tr>))}
-        </tbody>
-        <tfoot><tr style={{background:'#F6F8FA'}}><td colSpan={2} style={{padding:'9px 12px',fontWeight:700,color:C.txt}}>Total</td><td style={{padding:'9px 12px',textAlign:'right',fontWeight:800,color:C.blue}}>{fmt(totalSold)}</td></tr></tfoot>
-      </table>
+      <CardTable mobile={mobile} emptyLabel="No sales history"
+        rows={[...state.sales.filter(s=>s.partyId===party.id).map(s=>({d:s.date,t:s.total,items:s.items?.map(x=>([x.customerName||x.itemName,x.qty,x.rate]))||[],isNew:true})),...sales.map(s=>({d:s[0],t:s[1],items:s[2]||[],isNew:false}))].sort((a,b)=>b.d.localeCompare(a.d))}
+        keyFn={(s,i)=>i} rowStyle={s=>s.isNew?{background:C.blueSoft}:null}
+        footer={<div style={{display:'flex',justifyContent:'space-between',padding:'9px 12px',background:'#F6F8FA',fontWeight:700,color:C.txt}}>
+          <span>Total</span><span style={{fontWeight:800,color:C.blue}}>{fmt(totalSold)}</span>
+        </div>}
+        columns={[
+          {key:'date',label:'Date',render:s=><span style={{whiteSpace:'nowrap'}}>{fmtD(s.d)}{s.isNew&&<span style={{fontSize:10,color:C.blue,fontWeight:700,marginLeft:6}}>NEW</span>}</span>},
+          {key:'items',label:'Items',render:s=><span style={{fontSize:12,color:C.sub}}>{s.items.length?s.items.slice(0,3).map((x,j)=><span key={j} style={{display:'block'}}>{Array.isArray(x)?x[0]+' ×'+x[1]+' @₹'+x[2]:(x.customerName||x.itemName)}</span>):'—'}</span>},
+          {key:'amt',label:'Amount',align:'right',render:s=><span style={{fontWeight:700,color:C.blue,fontVariantNumeric:'tabular-nums'}}>{fmt(s.t)}</span>},
+        ]}/>
     </div>}
     {tab==='payments'&&<div style={{maxHeight:380,overflowY:'auto'}}>
-      {!pmts.length&&<div style={{padding:'30px',textAlign:'center',color:C.muted}}>No payment history</div>}
-      <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}>
-        <thead><tr style={{background:'#F6F8FA'}}>{['Date','Mode','Amount'].map((h,i)=><th key={i} style={{padding:'8px 12px',textAlign:i===2?'right':'left',fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,borderBottom:`1px solid ${C.bdr}`}}>{h}</th>)}</tr></thead>
-        <tbody>
-          {[...state.payments.filter(p=>p.partyId===party.id).map(p=>({d:p.date,a:p.amount,m:'ERP',isNew:true})),...pmts.map(p=>({d:p[0],a:p[1],m:p[2],isNew:false}))].sort((a,b)=>b.d.localeCompare(a.d)).map((p,i)=>(
-            <tr key={i} style={{borderBottom:`1px solid ${C.bdr}`,background:p.isNew?C.greenSoft:'transparent'}}>
-              <td style={{padding:'9px 12px',whiteSpace:'nowrap'}}>{fmtD(p.d)}{p.isNew&&<span style={{fontSize:10,color:C.green,fontWeight:700,marginLeft:6}}>NEW</span>}</td>
-              <td style={{padding:'9px 12px'}}><Badge v={p.m} color={p.m==='Cash'?'amber':p.m==='Bank'?'blue':'green'}/></td>
-              <td style={{padding:'9px 12px',textAlign:'right',fontWeight:700,color:C.green,fontVariantNumeric:'tabular-nums'}}>{fmt(p.a)}</td>
-            </tr>))}
-        </tbody>
-        <tfoot><tr style={{background:'#F6F8FA'}}><td colSpan={2} style={{padding:'9px 12px',fontWeight:700,color:C.txt}}>Total Received</td><td style={{padding:'9px 12px',textAlign:'right',fontWeight:800,color:C.green}}>{fmt(pmts.reduce((s,p)=>s+p[1],0)+state.payments.filter(p=>p.partyId===party.id).reduce((s,p)=>s+p.amount,0))}</td></tr></tfoot>
-      </table>
+      <CardTable mobile={mobile} emptyLabel="No payment history"
+        rows={[...state.payments.filter(p=>p.partyId===party.id).map(p=>({d:p.date,a:p.amount,m:'ERP',isNew:true})),...pmts.map(p=>({d:p[0],a:p[1],m:p[2],isNew:false}))].sort((a,b)=>b.d.localeCompare(a.d))}
+        keyFn={(p,i)=>i} rowStyle={p=>p.isNew?{background:C.greenSoft}:null}
+        footer={<div style={{display:'flex',justifyContent:'space-between',padding:'9px 12px',background:'#F6F8FA',fontWeight:700,color:C.txt}}>
+          <span>Total Received</span><span style={{fontWeight:800,color:C.green}}>{fmt(pmts.reduce((s,p)=>s+p[1],0)+state.payments.filter(p=>p.partyId===party.id).reduce((s,p)=>s+p.amount,0))}</span>
+        </div>}
+        columns={[
+          {key:'date',label:'Date',render:p=><span style={{whiteSpace:'nowrap'}}>{fmtD(p.d)}{p.isNew&&<span style={{fontSize:10,color:C.green,fontWeight:700,marginLeft:6}}>NEW</span>}</span>},
+          {key:'mode',label:'Mode',render:p=><Badge v={p.m} color={p.m==='Cash'?'amber':p.m==='Bank'?'blue':'green'}/>},
+          {key:'amt',label:'Amount',align:'right',render:p=><span style={{fontWeight:700,color:C.green,fontVariantNumeric:'tabular-nums'}}>{fmt(p.a)}</span>},
+        ]}/>
     </div>}
     {tab==='ai'&&<div>
       {!aiText&&!aiLoading&&<div style={{textAlign:'center',padding:'30px 20px'}}>
@@ -2277,6 +2363,7 @@ function PartyProfile({party,onClose}){
 }
 
 function PartyLedger({party,onClose}){
+  const mobile=useIsMobile();
   const isSupplier=party.type==='supplier';
   const isTransporterParty=party.type==='transporter';
   const PAGE=20;
@@ -2565,22 +2652,26 @@ function PartyLedger({party,onClose}){
       </div>
     </div>
 
-    <div style={{display:'flex',alignItems:'flex-end',gap:8,flexWrap:'wrap',marginBottom:16,background:'#F9FAFB',border:`1px solid ${C.bdr}`,borderRadius:8,padding:'10px 12px'}}>
-      <div style={{flex:1,minWidth:110}}>
-        <label style={{fontSize:10,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,display:'block',marginBottom:3}}>From</label>
-        <input type="date" value={exFrom} onChange={e=>setExFrom(e.target.value)} max={exTo||undefined}
-          style={{width:'100%',padding:'6px 8px',borderRadius:6,border:`1.5px solid ${C.bdr}`,fontSize:12,fontFamily:'inherit',boxSizing:'border-box'}}/>
+    <div style={{display:'flex',alignItems:mobile?'stretch':'flex-end',gap:8,flexWrap:'wrap',flexDirection:mobile?'column':'row',marginBottom:16,background:'#F9FAFB',border:`1px solid ${C.bdr}`,borderRadius:8,padding:'10px 12px'}}>
+      <div style={{display:'flex',gap:8,width:mobile?'100%':'auto',flex:mobile?'none':undefined}}>
+        <div style={{flex:1,minWidth:110}}>
+          <label style={{fontSize:10,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,display:'block',marginBottom:3}}>From</label>
+          <input type="date" value={exFrom} onChange={e=>setExFrom(e.target.value)} max={exTo||undefined}
+            style={{width:'100%',padding:'6px 8px',borderRadius:6,border:`1.5px solid ${C.bdr}`,fontSize:12,fontFamily:'inherit',boxSizing:'border-box'}}/>
+        </div>
+        <div style={{flex:1,minWidth:110}}>
+          <label style={{fontSize:10,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,display:'block',marginBottom:3}}>To</label>
+          <input type="date" value={exTo} onChange={e=>setExTo(e.target.value)} min={exFrom||undefined}
+            style={{width:'100%',padding:'6px 8px',borderRadius:6,border:`1.5px solid ${C.bdr}`,fontSize:12,fontFamily:'inherit',boxSizing:'border-box'}}/>
+        </div>
       </div>
-      <div style={{flex:1,minWidth:110}}>
-        <label style={{fontSize:10,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,display:'block',marginBottom:3}}>To</label>
-        <input type="date" value={exTo} onChange={e=>setExTo(e.target.value)} min={exFrom||undefined}
-          style={{width:'100%',padding:'6px 8px',borderRadius:6,border:`1.5px solid ${C.bdr}`,fontSize:12,fontFamily:'inherit',boxSizing:'border-box'}}/>
+      <div style={{display:'flex',gap:8,width:mobile?'100%':'auto'}}>
+        <Btn onClick={exportLedgerExcel} variant="secondary" size="sm" icon="⬇">Excel</Btn>
+        <Btn onClick={exportLedgerPDF} variant="secondary" size="sm" icon="⬇">PDF</Btn>
       </div>
-      <Btn onClick={exportLedgerExcel} variant="secondary" size="sm" icon="⬇">Excel</Btn>
-      <Btn onClick={exportLedgerPDF} variant="secondary" size="sm" icon="⬇">PDF</Btn>
     </div>
 
-    {metrics&&<div style={{display:'grid',gridTemplateColumns:isSupplier?'repeat(3,1fr)':'repeat(4,1fr)',gap:8,marginBottom:16}}>
+    {metrics&&<div style={{display:'grid',gridTemplateColumns:mobile?'repeat(2,1fr)':isSupplier?'repeat(3,1fr)':'repeat(4,1fr)',gap:8,marginBottom:16}}>
       {!isSupplier&&<div style={{background:'#F9FAFB',borderRadius:7,padding:'8px 10px',border:`1px solid ${C.bdr}`}}>
         <div style={{fontSize:9,color:C.sub,textTransform:'uppercase',letterSpacing:.4}}>Profit</div>
         <div style={{fontSize:14,fontWeight:800,color:metrics.profit>=0?C.blue:C.red}}>{fmt(metrics.profit)}</div>
@@ -2617,37 +2708,25 @@ function PartyLedger({party,onClose}){
     </div>}
 
     <div style={{fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,marginBottom:8}}>Recent Activity {rows.length>0&&`(${rows.length})`}</div>
-    <div style={{border:`1px solid ${C.bdr}`,borderRadius:8,overflow:'hidden',marginBottom:8}}>
-      <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}>
-        <thead><tr style={{background:'#F6F8FA'}}>
-          {['Date','Type','Description','Amount','Balance'].map((h,i)=>(
-            <th key={i} style={{padding:'8px 12px',textAlign:i>=3?'right':'left',fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,borderBottom:`1px solid ${C.bdr}`}}>{h}</th>
-          ))}
-        </tr></thead>
-        <tbody>
-          {rows.length===0&&<tr><td colSpan={5} style={{padding:'24px',textAlign:'center',color:C.muted}}>No sales or payments recorded yet</td></tr>}
-          {actPageRows.map((r,i)=>{
-            const meta=typeMeta[r.type];
+    <div style={{border:`1px solid ${C.bdr}`,borderRadius:8,overflow:'hidden',marginBottom:8,background:mobile?'transparent':undefined,padding:mobile?8:0}}>
+      <CardTable mobile={mobile} rows={actPageRows} keyFn={(r,i)=>i} emptyLabel="No sales or payments recorded yet"
+        onRowClick={r=>{
+          if(r.type==='sale'&&r.saleId){const found=state.sales.find(x=>x.id===r.saleId);if(found)setViewSale(found);}
+          else if(r.type==='purchase'&&r.purchaseId){const found=state.purchases.find(x=>x.id===r.purchaseId);if(found)setViewPurchase(found);}
+        }}
+        footer={<div style={{display:'flex',justifyContent:'space-between',padding:'9px 12px',background:'#F6F8FA',fontWeight:700,color:C.txt}}>
+          <span>Opening Balance</span><span style={{fontWeight:800,color:(party.ob||0)>0?C.red:C.green}}>{fmt(party.ob||0)}</span>
+        </div>}
+        columns={[
+          {key:'date',label:'Date',render:r=><span style={{color:C.sub,whiteSpace:'nowrap'}}>{fmtD(r.date)}</span>},
+          {key:'type',label:'Type',render:r=><Badge v={typeMeta[r.type].label} color={typeMeta[r.type].badge}/>},
+          {key:'desc',label:'Description',render:r=>{
             const clickable=(r.type==='sale'&&r.saleId)||(r.type==='purchase'&&r.purchaseId);
-            return <tr key={i} style={{borderBottom:`1px solid ${C.bdr}`,cursor:clickable?'pointer':'default'}}
-              onClick={()=>{
-                if(r.type==='sale'&&r.saleId){const found=state.sales.find(x=>x.id===r.saleId);if(found)setViewSale(found);}
-                else if(r.type==='purchase'&&r.purchaseId){const found=state.purchases.find(x=>x.id===r.purchaseId);if(found)setViewPurchase(found);}
-              }}
-              onMouseEnter={e=>e.currentTarget.style.background='#F9FAFB'} onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
-              <td style={{padding:'9px 12px',color:C.sub,whiteSpace:'nowrap'}}>{fmtD(r.date)}</td>
-              <td style={{padding:'9px 12px'}}><Badge v={meta.label} color={meta.badge}/></td>
-              <td style={{padding:'9px 12px',fontSize:12,color:clickable?C.blue:C.sub,textDecoration:clickable?'underline':'none',textDecorationStyle:'dotted',maxWidth:200,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{r.desc}</td>
-              <td style={{padding:'9px 12px',textAlign:'right',fontWeight:700,color:meta.color,fontVariantNumeric:'tabular-nums'}}>{r.delta>0?'+':r.delta<0?'−':''}{fmt(Math.abs(r.delta))}</td>
-              <td style={{padding:'9px 12px',textAlign:'right',fontWeight:700,color:r.balance>0?C.red:C.green,fontVariantNumeric:'tabular-nums'}}>{fmt(r.balance)}</td>
-            </tr>;
-          })}
-        </tbody>
-        <tfoot><tr style={{background:'#F6F8FA'}}>
-          <td colSpan={4} style={{padding:'9px 12px',fontWeight:700,color:C.txt}}>Opening Balance</td>
-          <td style={{padding:'9px 12px',textAlign:'right',fontWeight:800,color:(party.ob||0)>0?C.red:C.green}}>{fmt(party.ob||0)}</td>
-        </tr></tfoot>
-      </table>
+            return <span style={{fontSize:12,color:clickable?C.blue:C.sub,textDecoration:clickable?'underline':'none',textDecorationStyle:'dotted'}}>{r.desc}</span>;
+          }},
+          {key:'amount',label:'Amount',align:'right',render:r=><span style={{fontWeight:700,color:typeMeta[r.type].color,fontVariantNumeric:'tabular-nums'}}>{r.delta>0?'+':r.delta<0?'−':''}{fmt(Math.abs(r.delta))}</span>},
+          {key:'balance',label:'Balance',align:'right',render:r=><span style={{fontWeight:700,color:r.balance>0?C.red:C.green,fontVariantNumeric:'tabular-nums'}}>{fmt(r.balance)}</span>},
+        ]}/>
     </div>
     {actTotalPages>1&&<div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:8,marginBottom:16}}>
       <Btn onClick={()=>setActPage(p=>Math.max(0,p-1))} disabled={actPage===0} variant="secondary" size="sm">← Prev</Btn>
@@ -2657,33 +2736,24 @@ function PartyLedger({party,onClose}){
 
     {histRows.length>0&&<div>
       <div style={{fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,marginBottom:8}}>History — rolled into opening balance ({histRows.length})</div>
-      <div style={{border:`1px solid ${C.bdr}`,borderRadius:8,overflow:'hidden'}}>
-        <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}>
-          <thead><tr style={{background:'#F6F8FA'}}>
-            {['Date','Type','Description','Amount','Balance'].map((h,i)=>(
-              <th key={i} style={{padding:'8px 12px',textAlign:i>=3?'right':'left',fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,borderBottom:`1px solid ${C.bdr}`}}>{h}</th>
-            ))}
-          </tr></thead>
-          <tbody>
-            {histPageRows.map((r,i)=>{
-              const meta=typeMeta[r.type];
+      <div style={{border:`1px solid ${C.bdr}`,borderRadius:8,overflow:'hidden',background:mobile?'transparent':undefined,padding:mobile?8:0}}>
+        <CardTable mobile={mobile} rows={histPageRows} keyFn={(r,i)=>i}
+          onRowClick={r=>{
+            const clickable=!isSupplier&&!isTransporterParty&&r.type==='sale'&&r.items;
+            if(!clickable)return;
+            setViewSale({id:null,date:r.date,partyId:party.id,partyName:party.name,total:r.amount,creditDays:party.credit||30,
+              items:r.items.map(x=>Array.isArray(x)?{itemId:null,itemName:x[0],customerName:x[0],qty:x[1],rate:x[2],amount:x[1]*x[2]}:x)});
+          }}
+          columns={[
+            {key:'date',label:'Date',render:r=><span style={{color:C.sub,whiteSpace:'nowrap'}}>{fmtD(r.date)}</span>},
+            {key:'type',label:'Type',render:r=><Badge v={typeMeta[r.type].label} color={typeMeta[r.type].badge}/>},
+            {key:'desc',label:'Description',render:r=>{
               const clickable=!isSupplier&&!isTransporterParty&&r.type==='sale'&&r.items;
-              const openHistInvoice=()=>{
-                if(!clickable)return;
-                setViewSale({id:null,date:r.date,partyId:party.id,partyName:party.name,total:r.amount,creditDays:party.credit||30,
-                  items:r.items.map(x=>Array.isArray(x)?{itemId:null,itemName:x[0],customerName:x[0],qty:x[1],rate:x[2],amount:x[1]*x[2]}:x)});
-              };
-              return <tr key={i} onClick={openHistInvoice} style={{borderBottom:i<histPageRows.length-1?`1px solid ${C.bdr}`:'none',cursor:clickable?'pointer':'default'}}
-                onMouseEnter={e=>{if(clickable)e.currentTarget.style.background='#F9FAFB';}} onMouseLeave={e=>{if(clickable)e.currentTarget.style.background='transparent';}}>
-                <td style={{padding:'8px 12px',color:C.sub,whiteSpace:'nowrap'}}>{fmtD(r.date)}</td>
-                <td style={{padding:'8px 12px'}}><Badge v={meta.label} color={meta.badge}/></td>
-                <td style={{padding:'8px 12px',fontSize:12,color:clickable?C.blue:C.sub,textDecoration:clickable?'underline':'none',textDecorationStyle:'dotted',maxWidth:200,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{r.desc}</td>
-                <td style={{padding:'8px 12px',textAlign:'right',fontWeight:600,color:meta.color,fontVariantNumeric:'tabular-nums'}}>{fmt(r.amount)}</td>
-                <td style={{padding:'8px 12px',textAlign:'right',fontWeight:700,color:r.balance>0?C.red:C.green,fontVariantNumeric:'tabular-nums'}}>{fmt(r.balance)}</td>
-              </tr>;
-            })}
-          </tbody>
-        </table>
+              return <span style={{fontSize:12,color:clickable?C.blue:C.sub,textDecoration:clickable?'underline':'none',textDecorationStyle:'dotted'}}>{r.desc}</span>;
+            }},
+            {key:'amount',label:'Amount',align:'right',render:r=><span style={{fontWeight:600,color:typeMeta[r.type].color,fontVariantNumeric:'tabular-nums'}}>{fmt(r.amount)}</span>},
+            {key:'balance',label:'Balance',align:'right',render:r=><span style={{fontWeight:700,color:r.balance>0?C.red:C.green,fontVariantNumeric:'tabular-nums'}}>{fmt(r.balance)}</span>},
+          ]}/>
       </div>
       {histTotalPages>1&&<div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:8,marginTop:8}}>
         <Btn onClick={()=>setHistPage(p=>Math.max(0,p-1))} disabled={histPage===0} variant="secondary" size="sm">← Prev</Btn>
@@ -3940,6 +4010,7 @@ function Dashboard({navigate}){
 
 // ── ITEM MASTERS ──────────────────────────────────────────────────────────────
 function CategoryDetail({cat,items,onClose}){
+  const mobile=useIsMobile();
   const[search,setSearch]=useState('');
   const[page,setPage]=useState(0);
   const PAGE=20;
@@ -3963,8 +4034,29 @@ function CategoryDetail({cat,items,onClose}){
   const itemRows=useMemo(()=>catMetrics.filter(m=>!search||(m.item.internal||m.item.name||'').toLowerCase().includes(search.toLowerCase())).sort((a,b)=>b.totalRevenue-a.totalRevenue),[catMetrics,search]);
   const pageRows=itemRows.slice(page*PAGE,(page+1)*PAGE);
   const totalPages=Math.ceil(itemRows.length/PAGE);
+  const detailColumns=[
+    {key:'item',label:'Item',render:m=><span style={{fontWeight:600,color:C.txt}}>{m.item.internal||m.item.name}</span>},
+    {key:'stock',label:'Stock',align:'right',render:m=><span style={{color:C.sub}}>{m.item.stock||0}</span>},
+    {key:'stockValue',label:'Stock Value',align:'right',render:m=>{
+      const fifo=fifoMap[m.item.id];
+      const v=fifo?fifo.value:((m.item.stock||0)*(m.item.purch||0));
+      return <span style={{fontWeight:600,color:C.txt}}>{fmt(v)}</span>;
+    }},
+    {key:'expected',label:'Expected',align:'right',render:m=>{
+      const expected=expectedMap[m.item.id]||0;
+      return <span style={{color:expected>0?C.amber:C.muted}}>{expected>0?'+'+expected:'—'}</span>;
+    }},
+    {key:'sold',label:'Sold',align:'right',render:m=><span style={{color:C.sub}}>{m.totalSoldQty}</span>},
+    {key:'revenue',label:'Revenue',align:'right',render:m=><span style={{fontWeight:600,color:C.txt}}>{fmt(m.totalRevenue)}</span>},
+    {key:'profit',label:'Profit',align:'right',render:m=><span style={{fontWeight:600,color:m.profit>=0?C.blue:C.red}}>{fmt(m.profit)}</span>},
+    {key:'profitPct',label:'Profit %',align:'right',render:m=>{
+      const pct=m.totalRevenue>0?Math.round(m.profit/m.totalRevenue*1000)/10:0;
+      return <Badge v={pct+'%'} color={pct>25?'green':pct>15?'amber':'red'}/>;
+    }},
+    {key:'damaged',label:'Damaged',align:'right',render:m=><span style={{color:(m.item.damaged||0)>0?C.amber:C.sub}}>{m.item.damaged||0}</span>},
+  ];
   return <Modal title={cat+' — Category Detail'} onClose={onClose} width={720}>
-    <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:8,marginBottom:16}}>
+    <div style={{display:'grid',gridTemplateColumns:mobile?'repeat(2,1fr)':'repeat(4,1fr)',gap:8,marginBottom:16}}>
       {[['Items',catMetrics.length],['Stock (pcs)',b.stock],['Stock Value',fmt(b.stockValue)],['Damaged Stock',b.damaged+' pcs'],
         ['Total Sold (pcs)',b.totalSoldQty],['Total Revenue',fmt(b.totalRevenue)],['Profit Earned',fmt(b.profit)],['Avg Profit %',avgProfitPct+'%'],['Expected (Incoming)',b.expected+' pcs']]
         .map(([label,value],i)=><div key={i} style={{background:'#F9FAFB',borderRadius:7,padding:'8px 10px',border:`1px solid ${C.bdr}`}}>
@@ -3975,32 +4067,8 @@ function CategoryDetail({cat,items,onClose}){
     <div style={{background:C.surf,borderRadius:7,border:`1px solid ${C.bdr}`,padding:'7px 11px',marginBottom:12}}>
       <input value={search} onChange={e=>{setSearch(e.target.value);setPage(0);}} placeholder="Search items in this category…" style={{width:'100%',border:'none',outline:'none',fontSize:13,color:C.txt,fontFamily:'inherit',background:'transparent'}}/>
     </div>
-    <div style={{border:`1px solid ${C.bdr}`,borderRadius:8,overflow:'hidden',overflowX:'auto'}}>
-      <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}>
-        <thead><tr style={{background:'#F6F8FA'}}>
-          {['Item','Stock','Stock Value','Expected','Sold','Revenue','Profit','Profit %','Damaged'].map((h,i)=><th key={i} style={{padding:'8px 12px',textAlign:i>0?'right':'left',fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,borderBottom:`1px solid ${C.bdr}`,whiteSpace:'nowrap'}}>{h}</th>)}
-        </tr></thead>
-        <tbody>
-          {pageRows.length===0&&<tr><td colSpan={9} style={{padding:'30px',textAlign:'center',color:C.muted}}>No items match</td></tr>}
-          {pageRows.map((m,i)=>{
-            const pct=m.totalRevenue>0?Math.round(m.profit/m.totalRevenue*1000)/10:0;
-            const expected=expectedMap[m.item.id]||0;
-            const fifo=fifoMap[m.item.id];
-            const itemStockValue=fifo?fifo.value:((m.item.stock||0)*(m.item.purch||0));
-            return <tr key={i} style={{borderBottom:`1px solid ${C.bdr}`}}>
-              <td style={{padding:'9px 12px',fontWeight:600,color:C.txt}}>{m.item.internal||m.item.name}</td>
-              <td style={{padding:'9px 12px',textAlign:'right',color:C.sub}}>{m.item.stock||0}</td>
-              <td style={{padding:'9px 12px',textAlign:'right',fontWeight:600,color:C.txt}}>{fmt(itemStockValue)}</td>
-              <td style={{padding:'9px 12px',textAlign:'right',color:expected>0?C.amber:C.muted}}>{expected>0?'+'+expected:'—'}</td>
-              <td style={{padding:'9px 12px',textAlign:'right',color:C.sub}}>{m.totalSoldQty}</td>
-              <td style={{padding:'9px 12px',textAlign:'right',fontWeight:600,color:C.txt}}>{fmt(m.totalRevenue)}</td>
-              <td style={{padding:'9px 12px',textAlign:'right',fontWeight:600,color:m.profit>=0?C.blue:C.red}}>{fmt(m.profit)}</td>
-              <td style={{padding:'9px 12px',textAlign:'right'}}><Badge v={pct+'%'} color={pct>25?'green':pct>15?'amber':'red'}/></td>
-              <td style={{padding:'9px 12px',textAlign:'right',color:(m.item.damaged||0)>0?C.amber:C.sub}}>{m.item.damaged||0}</td>
-            </tr>;
-          })}
-        </tbody>
-      </table>
+    <div style={{border:mobile?'none':`1px solid ${C.bdr}`,borderRadius:8,overflow:'hidden'}}>
+      <CardTable mobile={mobile} columns={detailColumns} rows={pageRows} keyFn={(m,i)=>i} emptyLabel="No items match"/>
     </div>
     {totalPages>1&&<div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:8,marginTop:12}}>
       <Btn onClick={()=>setPage(p=>Math.max(0,p-1))} disabled={page===0} variant="secondary" size="sm">← Prev</Btn>
@@ -4037,41 +4105,35 @@ function CategoryAnalytics(){
     })).sort((a,b)=>b.totalRevenue-a.totalRevenue);
   },[state.sales.length,state.purchases.length,state.items.length,state.repairExpenses.length]);
   const totals=useMemo(()=>rows.reduce((s,r)=>({count:s.count+r.count,stock:s.stock+r.stock,stockValue:s.stockValue+r.stockValue,damaged:s.damaged+r.damaged,totalRevenue:s.totalRevenue+r.totalRevenue,profit:s.profit+r.profit,expected:s.expected+r.expected}),{count:0,stock:0,stockValue:0,damaged:0,totalRevenue:0,profit:0,expected:0}),[rows]);
+  const mobile=useIsMobile();
+  const columns=[
+    {key:'cat',label:'Category',render:r=><Badge v={r.cat} color="blue"/>},
+    {key:'count',label:'Items',align:'right',render:r=><span style={{color:C.sub}}>{r.count}</span>},
+    {key:'stock',label:'Stock (pcs)',align:'right',render:r=><span style={{color:C.sub}}>{r.stock}</span>},
+    {key:'expected',label:'Expected',align:'right',render:r=><span style={{color:r.expected>0?C.amber:C.muted}}>{r.expected>0?'+'+r.expected:'—'}</span>},
+    {key:'stockValue',label:'Stock Value',align:'right',render:r=><span style={{fontWeight:600,color:C.txt}}>{fmt(r.stockValue)}</span>},
+    {key:'sold',label:'Sold (pcs)',align:'right',render:r=><span style={{color:C.sub}}>{r.totalSoldQty}</span>},
+    {key:'revenue',label:'Revenue',align:'right',render:r=><span style={{fontWeight:600,color:C.txt}}>{fmt(r.totalRevenue)}</span>},
+    {key:'profit',label:'Profit',align:'right',render:r=><span style={{fontWeight:600,color:r.profit>=0?C.blue:C.red}}>{fmt(r.profit)}</span>},
+    {key:'profitPct',label:'Profit %',align:'right',render:r=><Badge v={r.avgProfitPct+'%'} color={r.avgProfitPct>25?'green':r.avgProfitPct>15?'amber':'red'}/>},
+    {key:'share',label:'Share of Biz',align:'right',render:r=><span style={{color:C.sub}}>{r.shareOfBusiness}%</span>},
+    {key:'damaged',label:'Damaged',align:'right',render:r=><span style={{color:r.damaged>0?C.amber:C.sub}}>{r.damaged}</span>},
+  ];
+  const footer=rows.length>0&&<div style={{display:'flex',flexWrap:'wrap',gap:14,justifyContent:'space-between',
+    padding:mobile?'10px 14px':'9px 12px',background:'#F6F8FA',fontWeight:700,fontSize:13,
+    borderTop:mobile?`1px solid ${C.bdr}`:'none',borderRadius:mobile?9:0}}>
+    <span>Total</span>
+    <span style={{display:'flex',gap:14,flexWrap:'wrap'}}>
+      <span>{totals.count} items</span><span>{totals.stock} pcs</span><span>{fmt(totals.stockValue)}</span>
+      <span>{fmt(totals.profit)} profit</span><span>{totals.damaged} damaged</span>
+    </span>
+  </div>;
   return <div>
     {catDetail&&<CategoryDetail cat={catDetail} onClose={()=>setCatDetail(null)}/>}
     <SectionHead title="Category Analytics" sub={`${totals.count} active items · ${fmt(totals.stockValue)} total stock value · click a category for item-level detail`}/>
-    <div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,overflow:'hidden',overflowX:'auto'}}>
-      <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}>
-        <thead><tr style={{background:'#F6F8FA'}}>
-          {['Category','Items','Stock (pcs)','Expected','Stock Value','Sold (pcs)','Revenue','Profit','Profit %','Share of Biz','Damaged'].map((h,i)=><th key={i} style={{padding:'9px 12px',textAlign:i>0?'right':'left',fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,borderBottom:`1px solid ${C.bdr}`,whiteSpace:'nowrap'}}>{h}</th>)}
-        </tr></thead>
-        <tbody>
-          {rows.map((r,i)=><tr key={i} style={{borderBottom:`1px solid ${C.bdr}`,cursor:'pointer'}} onClick={()=>setCatDetail(r.cat)} onMouseEnter={e=>e.currentTarget.style.background='#F6F8FA'} onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
-            <td style={{padding:'9px 12px'}}><Badge v={r.cat} color="blue"/></td>
-            <td style={{padding:'9px 12px',textAlign:'right',color:C.sub}}>{r.count}</td>
-            <td style={{padding:'9px 12px',textAlign:'right',color:C.sub}}>{r.stock}</td>
-            <td style={{padding:'9px 12px',textAlign:'right',color:r.expected>0?C.amber:C.muted}}>{r.expected>0?'+'+r.expected:'—'}</td>
-            <td style={{padding:'9px 12px',textAlign:'right',fontWeight:600,color:C.txt}}>{fmt(r.stockValue)}</td>
-            <td style={{padding:'9px 12px',textAlign:'right',color:C.sub}}>{r.totalSoldQty}</td>
-            <td style={{padding:'9px 12px',textAlign:'right',fontWeight:600,color:C.txt}}>{fmt(r.totalRevenue)}</td>
-            <td style={{padding:'9px 12px',textAlign:'right',fontWeight:600,color:r.profit>=0?C.blue:C.red}}>{fmt(r.profit)}</td>
-            <td style={{padding:'9px 12px',textAlign:'right'}}><Badge v={r.avgProfitPct+'%'} color={r.avgProfitPct>25?'green':r.avgProfitPct>15?'amber':'red'}/></td>
-            <td style={{padding:'9px 12px',textAlign:'right',color:C.sub}}>{r.shareOfBusiness}%</td>
-            <td style={{padding:'9px 12px',textAlign:'right',color:r.damaged>0?C.amber:C.sub}}>{r.damaged}</td>
-          </tr>)}
-          {rows.length>0&&<tr style={{background:'#F6F8FA',fontWeight:700}}>
-            <td style={{padding:'9px 12px'}}>Total</td>
-            <td style={{padding:'9px 12px',textAlign:'right'}}>{totals.count}</td>
-            <td style={{padding:'9px 12px',textAlign:'right'}}>{totals.stock}</td>
-            <td style={{padding:'9px 12px',textAlign:'right'}}>{totals.expected>0?'+'+totals.expected:'—'}</td>
-            <td style={{padding:'9px 12px',textAlign:'right'}}>{fmt(totals.stockValue)}</td>
-            <td colSpan={2}></td>
-            <td style={{padding:'9px 12px',textAlign:'right'}}>{fmt(totals.profit)}</td>
-            <td></td><td></td>
-            <td style={{padding:'9px 12px',textAlign:'right'}}>{totals.damaged}</td>
-          </tr>}
-        </tbody>
-      </table>
+    <div style={{background:mobile?'transparent':C.surf,borderRadius:8,border:mobile?'none':`1px solid ${C.bdr}`,overflow:'hidden'}}>
+      <CardTable mobile={mobile} columns={columns} rows={rows} keyFn={(r,i)=>i}
+        onRowClick={r=>setCatDetail(r.cat)} footer={footer}/>
     </div>
   </div>;
 }
@@ -4096,6 +4158,16 @@ function ItemLog(){
   const totalPages=Math.ceil(filtered.length/PAGE);
   const totalIn=Math.round(filtered.filter(r=>r.dir==='in').reduce((s,r)=>s+(r.qty||0),0));
   const totalOut=Math.round(Math.abs(filtered.filter(r=>r.dir==='out').reduce((s,r)=>s+(r.qty||0),0)));
+  const mobile=useIsMobile();
+  const columns=[
+    {key:'date',label:'Date',render:r=><span style={{whiteSpace:'nowrap',color:C.sub}}>{fmtD(r.d)}{r.isNew&&<span style={{fontSize:10,color:C.blue,fontWeight:700,marginLeft:5}}>NEW</span>}</span>},
+    {key:'item',label:'Item',render:r=><span style={{fontWeight:600,color:C.txt}}>{r.item||'—'}</span>},
+    {key:'party',label:'Party',render:r=><span style={{color:C.sub}}>{r.party||'—'}</span>},
+    {key:'qty',label:'Qty',align:'right',render:r=><span style={{color:r.dir==='out'&&r.qty<0?C.amber:C.txt}}>{r.qty}</span>},
+    {key:'rate',label:'Rate ₹',align:'right',render:r=><span style={{color:C.sub}}>{fmt(r.rate)}</span>},
+    {key:'amount',label:'Amount',align:'right',render:r=><span style={{fontWeight:700,color:C.blue,fontVariantNumeric:'tabular-nums'}}>{fmt(r.amount)}</span>},
+    {key:'type',label:'Type',align:'center',render:r=><Badge v={r.isReturn?'Return':r.dir==='in'?'Purchased':'Sold'} color={r.isReturn?'amber':r.dir==='in'?'green':'blue'}/>},
+  ];
 
   return <div>
     <SectionHead title="Item Log" sub={`${filtered.length} lines · ${totalIn} pcs in · ${totalOut} pcs out`}/>
@@ -4112,28 +4184,11 @@ function ItemLog(){
       <Chip v="Sold" active={dirF==='out'} onClick={()=>{setDirF('out');setPage(0);}}/>
       {(search||dateFrom||dateTo||dirF)&&<Btn onClick={()=>{setSearch('');setDateFrom('');setDateTo('');setDirF('');setPage(0);}} variant="secondary" size="sm">Clear</Btn>}
     </div>
-    <div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,overflow:'hidden'}}>
-      <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}>
-        <thead><tr style={{background:'#F6F8FA'}}>
-          {['Date','Item','Party','Qty','Rate ₹','Amount','Type'].map((h,i)=><th key={i} style={{padding:'9px 14px',textAlign:i>=3&&i<6?'right':i===6?'center':'left',fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,borderBottom:`1px solid ${C.bdr}`,whiteSpace:'nowrap'}}>{h}</th>)}
-        </tr></thead>
-        <tbody>
-          {pageData.length===0&&<tr><td colSpan={7} style={{padding:'40px',textAlign:'center',color:C.muted}}>No entries match</td></tr>}
-          {pageData.map((r,i)=><tr key={i} style={{borderBottom:`1px solid ${C.bdr}`,background:r.isNew?C.blueSoft:'transparent'}}
-            onMouseEnter={e=>e.currentTarget.style.background=r.isNew?C.blueSoft:'#F9FAFB'}
-            onMouseLeave={e=>e.currentTarget.style.background=r.isNew?C.blueSoft:'transparent'}>
-            <td style={{padding:'9px 14px',whiteSpace:'nowrap',color:C.sub}}>{fmtD(r.d)}{r.isNew&&<span style={{fontSize:10,color:C.blue,fontWeight:700,marginLeft:5}}>NEW</span>}</td>
-            <td style={{padding:'9px 14px',fontWeight:600,color:C.txt,maxWidth:220,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{r.item||'—'}</td>
-            <td style={{padding:'9px 14px',color:C.sub,maxWidth:180,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{r.party||'—'}</td>
-            <td style={{padding:'9px 14px',textAlign:'right',color:r.dir==='out'&&r.qty<0?C.amber:C.txt}}>{r.qty}</td>
-            <td style={{padding:'9px 14px',textAlign:'right',color:C.sub}}>{fmt(r.rate)}</td>
-            <td style={{padding:'9px 14px',textAlign:'right',fontWeight:700,color:C.blue,fontVariantNumeric:'tabular-nums'}}>{fmt(r.amount)}</td>
-            <td style={{padding:'9px 14px',textAlign:'center'}}><Badge v={r.isReturn?'Return':r.dir==='in'?'Purchased':'Sold'} color={r.isReturn?'amber':r.dir==='in'?'green':'blue'}/></td>
-          </tr>)}
-        </tbody>
-      </table>
+    <div style={{background:mobile?'transparent':C.surf,borderRadius:8,border:mobile?'none':`1px solid ${C.bdr}`,overflow:'hidden'}}>
+      <CardTable mobile={mobile} columns={columns} rows={pageData} keyFn={(r,i)=>i} emptyLabel="No entries match"
+        rowStyle={r=>r.isNew?{background:C.blueSoft}:null}/>
     </div>
-    {totalPages>1&&<div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:8,marginTop:14}}>
+    {totalPages>1&&<div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:8,marginTop:14,flexWrap:'wrap'}}>
       <Btn onClick={()=>setPage(p=>Math.max(0,p-1))} disabled={page===0} variant="secondary" size="sm">← Prev</Btn>
       <span style={{fontSize:12,color:C.sub}}>Page {page+1} of {totalPages} · {filtered.length} lines</span>
       <Btn onClick={()=>setPage(p=>Math.min(totalPages-1,p+1))} disabled={page>=totalPages-1} variant="secondary" size="sm">Next →</Btn>
@@ -4189,58 +4244,52 @@ function DamagedInventory(){
   };
   const totalDamaged=items.reduce((s,it)=>s+(it.damaged||0),0);
   const totalValue=items.reduce((s,it)=>s+(it.damaged||0)*(it.purch||0),0);
+  const mobile=useIsMobile();
+  const columns=[
+    {key:'item',label:'Item',render:it=>{
+      const suspect=!hasReturnHistory.has(it.id);
+      return <div>
+        <span style={{fontWeight:600,color:C.txt}}>{it.internal||it.name}</span>
+        {suspect&&<div title="No sales-return on record for this item — likely a purchase that landed here before that bug was fixed, not real damage" style={{fontSize:10,color:C.amberBright,fontWeight:700,marginTop:2}}>⚠ No return on record</div>}
+      </div>;
+    }},
+    {key:'cat',label:'Category',render:it=><span style={{color:C.sub}}>{it.cat||'—'}</span>},
+    {key:'damaged',label:'Damaged (pcs)',align:'right',render:it=><span style={{fontWeight:700,color:C.amber}}>{it.damaged||0}</span>},
+    {key:'value',label:'Value',align:'right',render:it=><span style={{color:C.sub}}>{fmt((it.damaged||0)*(it.purch||0))}</span>},
+    {key:'repair',label:'Repair (genuinely damaged)',align:'right',render:it=>
+      <div style={{display:'flex',gap:4,justifyContent:'flex-end',alignItems:'center'}}>
+        <input type="number" value={repairQty[it.id]||''} onChange={e=>setRepairQty(r=>({...r,[it.id]:e.target.value}))}
+          placeholder="qty" onKeyDown={e=>{if(e.key==='Enter')doRepair(it);}}
+          style={{width:55,padding:'4px 6px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:12,textAlign:'right',fontFamily:'inherit'}}/>
+        <Btn onClick={()=>doRepair(it)} size="sm">Repair</Btn>
+      </div>},
+    {key:'correct',label:'Correct (never damaged)',align:'right',render:it=>
+      <div style={{display:'flex',gap:4,justifyContent:'flex-end',alignItems:'center'}}>
+        <input type="number" value={fixQty[it.id]||''} onChange={e=>setFixQty(f=>({...f,[it.id]:e.target.value}))}
+          placeholder="qty" onKeyDown={e=>{if(e.key==='Enter')doCorrect(it);}}
+          style={{width:55,padding:'4px 6px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:12,textAlign:'right',fontFamily:'inherit'}}/>
+        <Btn onClick={()=>doCorrect(it)} size="sm" variant="secondary">→ Stock</Btn>
+      </div>},
+  ];
+  const renderSubRow=it=>{
+    const sources=damageSources[it.id]||[];
+    if(!sources.length)return null;
+    const suspect=!hasReturnHistory.has(it.id);
+    return <div style={{padding:mobile?'8px 0 0':'2px 12px 9px 12px',background:mobile?'transparent':(suspect?C.amberSoft:'#FAFAFA')}}>
+      <div style={{fontSize:10,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.3,marginBottom:3}}>Recovered from</div>
+      {sources.slice(0,4).map((s,i)=><div key={i} style={{display:'flex',justifyContent:'space-between',fontSize:11,color:C.sub,padding:'1px 0'}}>
+        <span>{fmtD(s.date)} · {s.party} · {s.qty} pc{s.qty===1?'':'s'}{s.note?' — '+s.note:''}</span>
+      </div>)}
+      {sources.length>4&&<div style={{fontSize:10,color:C.muted}}>+{sources.length-4} more</div>}
+    </div>;
+  };
   return <div>
     <TC/>
     <SectionHead title="Damaged Inventory" sub={`${items.length} items · ${totalDamaged} pcs · ${fmt(totalValue)} value`}/>
-    <div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,overflow:'hidden'}}>
-      <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}>
-        <thead><tr style={{background:'#F6F8FA'}}>
-          {['Item','Category','Damaged (pcs)','Value','Repair (genuinely damaged)','Correct (never damaged)'].map((h,i)=><th key={i} style={{padding:'9px 12px',textAlign:i>=2&&i<4?'right':'left',fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,borderBottom:`1px solid ${C.bdr}`,whiteSpace:'nowrap'}}>{h}</th>)}
-        </tr></thead>
-        <tbody>
-          {items.length===0&&<tr><td colSpan={6} style={{padding:'40px',textAlign:'center',color:C.muted}}>No damaged stock ✓</td></tr>}
-          {items.map(it=>{
-            const suspect=!hasReturnHistory.has(it.id);
-            const sources=damageSources[it.id]||[];
-            return <Fragment key={it.id}>
-            <tr style={{borderBottom:sources.length?'none':`1px solid ${C.bdr}`,background:suspect?C.amberSoft:'transparent'}}>
-              <td style={{padding:'9px 12px',fontWeight:600,color:C.txt}}>
-                {it.internal||it.name}
-                {suspect&&<div title="No sales-return on record for this item — likely a purchase that landed here before that bug was fixed, not real damage" style={{fontSize:10,color:C.amberBright,fontWeight:700,marginTop:2}}>⚠ No return on record</div>}
-              </td>
-              <td style={{padding:'9px 12px',color:C.sub}}>{it.cat||'—'}</td>
-              <td style={{padding:'9px 12px',textAlign:'right',fontWeight:700,color:C.amber}}>{it.damaged||0}</td>
-              <td style={{padding:'9px 12px',textAlign:'right',color:C.sub}}>{fmt((it.damaged||0)*(it.purch||0))}</td>
-              <td style={{padding:'9px 12px',textAlign:'right'}}>
-                <div style={{display:'flex',gap:4,justifyContent:'flex-end',alignItems:'center'}}>
-                  <input type="number" value={repairQty[it.id]||''} onChange={e=>setRepairQty(r=>({...r,[it.id]:e.target.value}))}
-                    placeholder="qty" onKeyDown={e=>{if(e.key==='Enter')doRepair(it);}}
-                    style={{width:55,padding:'4px 6px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:12,textAlign:'right',fontFamily:'inherit'}}/>
-                  <Btn onClick={()=>doRepair(it)} size="sm">Repair</Btn>
-                </div>
-              </td>
-              <td style={{padding:'9px 12px',textAlign:'right'}}>
-                <div style={{display:'flex',gap:4,justifyContent:'flex-end',alignItems:'center'}}>
-                  <input type="number" value={fixQty[it.id]||''} onChange={e=>setFixQty(f=>({...f,[it.id]:e.target.value}))}
-                    placeholder="qty" onKeyDown={e=>{if(e.key==='Enter')doCorrect(it);}}
-                    style={{width:55,padding:'4px 6px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:12,textAlign:'right',fontFamily:'inherit'}}/>
-                  <Btn onClick={()=>doCorrect(it)} size="sm" variant="secondary">→ Stock</Btn>
-                </div>
-              </td>
-            </tr>
-            {sources.length>0&&<tr style={{borderBottom:`1px solid ${C.bdr}`}}>
-              <td colSpan={6} style={{padding:'2px 12px 9px 12px',background:suspect?C.amberSoft:'#FAFAFA'}}>
-                <div style={{fontSize:10,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.3,marginBottom:3}}>Recovered from</div>
-                {sources.slice(0,4).map((s,i)=><div key={i} style={{display:'flex',justifyContent:'space-between',fontSize:11,color:C.sub,padding:'1px 0'}}>
-                  <span>{fmtD(s.date)} · {s.party} · {s.qty} pc{s.qty===1?'':'s'}{s.note?' — '+s.note:''}</span>
-                </div>)}
-                {sources.length>4&&<div style={{fontSize:10,color:C.muted}}>+{sources.length-4} more</div>}
-              </td>
-            </tr>}
-            </Fragment>;
-          })}
-        </tbody>
-      </table>
+    <div style={{background:mobile?'transparent':C.surf,borderRadius:8,border:mobile?'none':`1px solid ${C.bdr}`,overflow:'hidden'}}>
+      <CardTable mobile={mobile} columns={columns} rows={items} keyFn={it=>it.id} emptyLabel="No damaged stock ✓"
+        renderSubRow={renderSubRow}
+        rowStyle={it=>!hasReturnHistory.has(it.id)?{background:C.amberSoft}:null}/>
     </div>
   </div>;
 }
@@ -4267,35 +4316,26 @@ function RepairedInventory(){
   };
   const totalRepaired=items.reduce((s,it)=>s+(it.repaired||0),0);
   const totalValue=items.reduce((s,it)=>s+(it.repaired||0)*(it.purch||0),0);
+  const mobile=useIsMobile();
+  const columns=[
+    {key:'item',label:'Item',render:it=><span style={{fontWeight:600,color:C.txt}}>{it.internal||it.name}</span>},
+    {key:'cat',label:'Category',render:it=><span style={{color:C.sub}}>{it.cat||'—'}</span>},
+    {key:'repaired',label:'Repaired (pcs)',align:'right',render:it=><span style={{fontWeight:700,color:C.green}}>{it.repaired||0}</span>},
+    {key:'value',label:'Value',align:'right',render:it=><span style={{color:C.sub}}>{fmt((it.repaired||0)*(it.purch||0))}</span>},
+    {key:'correct',label:'Correct qty',align:'right',render:it=>
+      <div style={{display:'flex',gap:4,justifyContent:'flex-end',alignItems:'center'}}>
+        <input type="number" value={editVal[it.id]??''} onChange={e=>setEditVal(v=>({...v,[it.id]:e.target.value}))}
+          placeholder={String(it.repaired||0)} onKeyDown={e=>{if(e.key==='Enter')doSet(it);}}
+          style={{width:60,padding:'4px 6px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:12,textAlign:'right',fontFamily:'inherit'}}/>
+        <Btn onClick={()=>doSet(it)} size="sm" variant="secondary">Set</Btn>
+      </div>},
+  ];
   return <div>
     <TC/>
     <SectionHead title="Repaired Inventory" sub={`${items.length} items · ${totalRepaired} pcs · ${fmt(totalValue)} value`}/>
     <div style={{fontSize:12,color:C.sub,marginBottom:12}}>Kept separate from fresh stock — repaired units are for selling on their own (often at a discount), never mixed into a regular sale's available quantity.</div>
-    <div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,overflow:'hidden'}}>
-      <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}>
-        <thead><tr style={{background:'#F6F8FA'}}>
-          {['Item','Category','Repaired (pcs)','Value','Correct qty'].map((h,i)=><th key={i} style={{padding:'9px 12px',textAlign:i>=2&&i<4?'right':'left',fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,borderBottom:`1px solid ${C.bdr}`,whiteSpace:'nowrap'}}>{h}</th>)}
-        </tr></thead>
-        <tbody>
-          {items.length===0&&<tr><td colSpan={5} style={{padding:'40px',textAlign:'center',color:C.muted}}>No repaired stock</td></tr>}
-          {items.map(it=>(
-            <tr key={it.id} style={{borderBottom:`1px solid ${C.bdr}`}}>
-              <td style={{padding:'9px 12px',fontWeight:600,color:C.txt}}>{it.internal||it.name}</td>
-              <td style={{padding:'9px 12px',color:C.sub}}>{it.cat||'—'}</td>
-              <td style={{padding:'9px 12px',textAlign:'right',fontWeight:700,color:C.green}}>{it.repaired||0}</td>
-              <td style={{padding:'9px 12px',textAlign:'right',color:C.sub}}>{fmt((it.repaired||0)*(it.purch||0))}</td>
-              <td style={{padding:'9px 12px',textAlign:'right'}}>
-                <div style={{display:'flex',gap:4,justifyContent:'flex-end',alignItems:'center'}}>
-                  <input type="number" value={editVal[it.id]??''} onChange={e=>setEditVal(v=>({...v,[it.id]:e.target.value}))}
-                    placeholder={String(it.repaired||0)} onKeyDown={e=>{if(e.key==='Enter')doSet(it);}}
-                    style={{width:60,padding:'4px 6px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:12,textAlign:'right',fontFamily:'inherit'}}/>
-                  <Btn onClick={()=>doSet(it)} size="sm" variant="secondary">Set</Btn>
-                </div>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+    <div style={{background:mobile?'transparent':C.surf,borderRadius:8,border:mobile?'none':`1px solid ${C.bdr}`,overflow:'hidden'}}>
+      <CardTable mobile={mobile} columns={columns} rows={items} keyFn={it=>it.id} emptyLabel="No repaired stock"/>
     </div>
   </div>;
 }
@@ -4344,6 +4384,7 @@ function ItemNamingEditor(){
 
 function ItemDetail({item,onClose}){
   const{toast,TC}=useToast();
+  const mobile=useIsMobile();
   const[search,setSearch]=useState('');
   const[page,setPage]=useState(0);
   const[damaged,setDamaged]=useState(item.damaged||0);
@@ -4416,7 +4457,7 @@ function ItemDetail({item,onClose}){
         <div style={{fontSize:11,color:C.sub,marginTop:6}}>Sale ₹{item.sale} · Purch ₹{item.purch}{fifo&&Math.abs(fifoAvgRate-(item.purch||0))>0.01?<span style={{color:C.blue}}> · FIFO avg ₹{fifoAvgRate}</span>:null}</div>
       </div>
     </div>
-    <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:8,marginBottom:16}}>
+    <div style={{display:'grid',gridTemplateColumns:mobile?'repeat(2,1fr)':'repeat(4,1fr)',gap:8,marginBottom:16}}>
       <Card label="Total Sold" value={metrics.totalSoldQty+' pcs'}/>
       <Card label="Total Purchased" value={metrics.totalPurchQty+' pcs'}/>
       <Card label="Profit Earned" value={fmt(metrics.profit)} color={metrics.profit>=0?C.blue:C.red}/>
@@ -4456,23 +4497,16 @@ function ItemDetail({item,onClose}){
     <div style={{background:C.surf,borderRadius:7,border:`1px solid ${C.bdr}`,padding:'7px 11px',marginBottom:12}}>
       <input value={search} onChange={e=>{setSearch(e.target.value);setPage(0);}} placeholder="Search by party…" style={{width:'100%',border:'none',outline:'none',fontSize:13,color:C.txt,fontFamily:'inherit',background:'transparent'}}/>
     </div>
-    <div style={{border:`1px solid ${C.bdr}`,borderRadius:8,overflow:'hidden'}}>
-      <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}>
-        <thead><tr style={{background:'#F6F8FA'}}>
-          {['Date','Party','Qty','Rate','Amount','Type'].map((h,i)=><th key={i} style={{padding:'8px 12px',textAlign:i>=2&&i<5?'right':i===5?'center':'left',fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,borderBottom:`1px solid ${C.bdr}`}}>{h}</th>)}
-        </tr></thead>
-        <tbody>
-          {pageRows.length===0&&<tr><td colSpan={6} style={{padding:'30px',textAlign:'center',color:C.muted}}>No purchase/sale entries for this item</td></tr>}
-          {pageRows.map((r,i)=><tr key={i} style={{borderBottom:`1px solid ${C.bdr}`}}>
-            <td style={{padding:'9px 12px',color:C.sub,whiteSpace:'nowrap'}}>{fmtD(r.d)}</td>
-            <td style={{padding:'9px 12px',fontWeight:500,color:C.txt}}>{r.party||'—'}</td>
-            <td style={{padding:'9px 12px',textAlign:'right'}}>{Math.abs(r.qty||0)}</td>
-            <td style={{padding:'9px 12px',textAlign:'right',color:C.sub}}>{fmt(r.rate)}</td>
-            <td style={{padding:'9px 12px',textAlign:'right',fontWeight:700,color:C.blue}}>{fmt(Math.abs(r.amount||0))}</td>
-            <td style={{padding:'9px 12px',textAlign:'center'}}><Badge v={r.isReturn?'Return':r.dir==='in'?'Purchased':'Sold'} color={r.isReturn?'amber':r.dir==='in'?'green':'blue'}/></td>
-          </tr>)}
-        </tbody>
-      </table>
+    <div style={{border:mobile?'none':`1px solid ${C.bdr}`,borderRadius:8,overflow:'hidden'}}>
+      <CardTable mobile={mobile} keyFn={(r,i)=>i} rows={pageRows} emptyLabel="No purchase/sale entries for this item"
+        columns={[
+          {key:'date',label:'Date',render:r=><span style={{whiteSpace:'nowrap',color:C.sub}}>{fmtD(r.d)}</span>},
+          {key:'party',label:'Party',render:r=><span style={{fontWeight:500,color:C.txt}}>{r.party||'—'}</span>},
+          {key:'qty',label:'Qty',align:'right',render:r=>Math.abs(r.qty||0)},
+          {key:'rate',label:'Rate',align:'right',render:r=><span style={{color:C.sub}}>{fmt(r.rate)}</span>},
+          {key:'amount',label:'Amount',align:'right',render:r=><span style={{fontWeight:700,color:C.blue}}>{fmt(Math.abs(r.amount||0))}</span>},
+          {key:'type',label:'Type',align:'center',render:r=><Badge v={r.isReturn?'Return':r.dir==='in'?'Purchased':'Sold'} color={r.isReturn?'amber':r.dir==='in'?'green':'blue'}/>},
+        ]}/>
     </div>
     {totalPages>1&&<div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:8,marginTop:12}}>
       <Btn onClick={()=>setPage(p=>Math.max(0,p-1))} disabled={page===0} variant="secondary" size="sm">← Prev</Btn>
@@ -4645,59 +4679,61 @@ function ItemMasters(){
     <div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,padding:'8px 12px',marginBottom:12}}>
       <input value={search} onChange={e=>{setSearch(e.target.value);setPage(0);}} placeholder="Search items…" style={{width:'100%',border:'none',outline:'none',fontSize:13,color:C.txt,fontFamily:'inherit',background:'transparent'}}/>
     </div>
-    <div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,overflow:'hidden'}}>
-      <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}>
-        <thead><tr style={{background:'#F6F8FA'}}>
-          {['Internal Name','Customer Name','Category','Peti','Sale ₹','Purch ₹','Margin','Stock','Damaged','Expected',''].map((h,i)=><th key={i} style={{padding:'9px 12px',textAlign:i>2&&i<10?'right':'left',fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,borderBottom:`1px solid ${C.bdr}`}}>{h}</th>)}
-        </tr></thead>
-        <tbody>
-          {pageData.length===0&&<tr><td colSpan={11} style={{padding:'30px',textAlign:'center',color:C.muted}}>No items match</td></tr>}
-          {pageData.map((it,i)=>{
+    <div style={{background:mobile?'transparent':C.surf,borderRadius:8,border:mobile?'none':`1px solid ${C.bdr}`,overflow:'hidden'}}>
+      <CardTable mobile={mobile} rows={pageData} keyFn={(it,i)=>it.id||i} emptyLabel="No items match"
+        groupHeader={(it,prev)=>{
+          const prevCat=prev?prev.cat:(page>0?'__prevpage__':null);
+          const showCatHeader=!catF&&(it.cat||'Other')!==(prevCat||'Other');
+          const prevSubHead=prev?prev.subHead:(page>0?'__prevpage__':null);
+          const showSubHead=it.subHead&&it.subHead!==prevSubHead;
+          if(!showCatHeader&&!showSubHead)return null;
+          return <>
+            {showCatHeader&&<div style={{padding:'10px 12px',background:C.blueSoft,fontSize:13,fontWeight:800,color:C.blue,
+              borderTop:prev?`2px solid ${C.blue}`:'none',borderRadius:mobile?7:0,marginTop:mobile&&prev?10:0}}>{it.cat||'Other'}</div>}
+            {showSubHead&&<div style={{padding:'6px 12px',background:'#EEF2F6',fontSize:11,fontWeight:700,color:C.sub,
+              textTransform:'uppercase',letterSpacing:.5,borderRadius:mobile?7:0,marginTop:mobile?6:0}}>{it.subHead}</div>}
+          </>;
+        }}
+        columns={[
+          {key:'internal',label:'Internal Name',render:it=><span onClick={()=>setDetailItem(it)}
+            style={{fontWeight:600,color:C.blue,cursor:'pointer',textDecoration:'underline',textDecorationStyle:'dotted'}}>{it.internal||it.name}</span>},
+          {key:'customer',label:'Customer Name',cardLabel:'Customer',render:it=><span style={{fontSize:12,color:C.sub}}>{it.customer||'—'}</span>},
+          {key:'cat',label:'Category',render:it=><Badge v={it.cat||'Other'} color="blue"/>},
+          {key:'peti',label:'Peti',align:'right',render:it=><span style={{color:C.sub}}>{it.peti}</span>},
+          {key:'sale',label:'Sale ₹',align:'right',render:it=>{
             const saleDisp=saleOf(it);
-            const purchDisp=purchOf(it);
+            return editSaleId===it.id?
+              <input autoFocus type="number" value={editSaleVal}
+                onChange={e=>setEditSaleVal(e.target.value)}
+                onBlur={()=>commitSale(it,editSaleVal)}
+                onKeyDown={e=>{if(e.key==='Enter')commitSale(it,editSaleVal); if(e.key==='Escape')setEditSaleId(null);}}
+                style={{width:80,padding:'3px 6px',borderRadius:5,border:`1.5px solid ${C.blue}`,fontSize:13,textAlign:'right',outline:'none',fontFamily:'inherit'}}/>
+              :<span onClick={()=>{setEditSaleId(it.id);setEditSaleVal(String(saleDisp||''));}}
+                title={it.sale>0?'Click to edit':'Auto-suggested from recent sales · click to set manually'}
+                style={{fontWeight:600,color:C.blue,cursor:'pointer',fontStyle:it.sale>0?'normal':'italic',borderBottom:'1px dotted currentColor'}}>{fmt(saleDisp)}</span>;
+          }},
+          {key:'purch',label:'Purch ₹',align:'right',render:it=><span style={{color:C.sub}} title="FIFO avg cost of current balance">{fmt(purchOf(it))}</span>},
+          {key:'margin',label:'Margin',align:'right',render:it=>{
+            const saleDisp=saleOf(it),purchDisp=purchOf(it);
             const margin=saleDisp>0?Math.round((saleDisp-purchDisp)/saleDisp*100):0;
+            return <Badge v={margin+'%'} color={margin>25?'green':margin>15?'amber':'red'}/>;
+          }},
+          {key:'stock',label:'Stock',align:'right',render:it=>{
             const stock=it.stock||0;
+            return <Badge v={stock+' pc'+(stock===1?'':'s')} color={stock<=0?'red':'gray'}/>;
+          }},
+          {key:'damaged',label:'Damaged',align:'right',render:it=>(it.damaged||0)>0?<Badge v={it.damaged+' pc'+(it.damaged===1?'':'s')} color="amber"/>:<span style={{color:C.muted}}>—</span>},
+          {key:'expected',label:'Expected',align:'right',render:it=>{
             const expected=expectedMap[it.id]||0;
-            const prevCat=i>0?pageData[i-1].cat:(page>0?'__prevpage__':null);
-            const showCatHeader=!catF&&(it.cat||'Other')!==(prevCat||'Other');
-            const prevSubHead=i>0?pageData[i-1].subHead:(page>0?'__prevpage__':null);
-            const showSubHead=it.subHead&&it.subHead!==prevSubHead;
-            return <Fragment key={i}>
-              {showCatHeader&&<tr><td colSpan={11} style={{padding:'10px 12px',background:C.blueSoft,fontSize:13,fontWeight:800,color:C.blue,borderBottom:`1px solid ${C.bdr}`,borderTop:i>0?`2px solid ${C.blue}`:'none'}}>{it.cat||'Other'}</td></tr>}
-              {showSubHead&&<tr><td colSpan={11} style={{padding:'6px 12px',background:'#EEF2F6',fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,borderBottom:`1px solid ${C.bdr}`}}>{it.subHead}</td></tr>}
-              <tr style={{borderBottom:`1px solid ${C.bdr}`}} onMouseEnter={e=>e.currentTarget.style.background='#F6F8FA'} onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
-                <td style={{padding:'9px 12px',fontWeight:600,color:C.blue,cursor:'pointer',textDecoration:'underline',textDecorationStyle:'dotted'}} onClick={()=>setDetailItem(it)}>{it.internal||it.name}</td>
-                <td style={{padding:'9px 12px',fontSize:12,color:C.sub}}>{it.customer||'—'}</td>
-                <td style={{padding:'9px 12px'}}><Badge v={it.cat||'Other'} color="blue"/></td>
-                <td style={{padding:'9px 12px',textAlign:'right',color:C.sub}}>{it.peti}</td>
-                <td style={{padding:'9px 12px',textAlign:'right'}}>
-                  {editSaleId===it.id?
-                    <input autoFocus type="number" value={editSaleVal}
-                      onChange={e=>setEditSaleVal(e.target.value)}
-                      onBlur={()=>commitSale(it,editSaleVal)}
-                      onKeyDown={e=>{if(e.key==='Enter')commitSale(it,editSaleVal); if(e.key==='Escape')setEditSaleId(null);}}
-                      style={{width:80,padding:'3px 6px',borderRadius:5,border:`1.5px solid ${C.blue}`,fontSize:13,textAlign:'right',outline:'none',fontFamily:'inherit'}}/>
-                    :<span onClick={()=>{setEditSaleId(it.id);setEditSaleVal(String(saleDisp||''));}}
-                      title={it.sale>0?'Click to edit':'Auto-suggested from recent sales · click to set manually'}
-                      style={{fontWeight:600,color:C.blue,cursor:'pointer',fontStyle:it.sale>0?'normal':'italic',borderBottom:'1px dotted currentColor'}}>{fmt(saleDisp)}</span>}
-                </td>
-                <td style={{padding:'9px 12px',textAlign:'right',color:C.sub}} title="FIFO avg cost of current balance">{fmt(purchDisp)}</td>
-                <td style={{padding:'9px 12px',textAlign:'right'}}><Badge v={margin+'%'} color={margin>25?'green':margin>15?'amber':'red'}/></td>
-                <td style={{padding:'9px 12px',textAlign:'right'}}><Badge v={stock+' pc'+(stock===1?'':'s')} color={stock<=0?'red':'gray'}/></td>
-                <td style={{padding:'9px 12px',textAlign:'right'}}>{(it.damaged||0)>0?<Badge v={it.damaged+' pc'+(it.damaged===1?'':'s')} color="amber"/>:<span style={{color:C.muted}}>—</span>}</td>
-                <td style={{padding:'9px 12px',textAlign:'right',color:expected>0?C.amber:C.muted,fontWeight:expected>0?700:400}}>{expected>0?'+'+expected:'—'}</td>
-                <td style={{padding:'9px 12px',textAlign:'right'}}>
-                  <div style={{display:'flex',gap:6,justifyContent:'flex-end'}}>
-                    <Btn onClick={()=>setMoveSrc(it)} variant="ghost" size="sm">Move</Btn>
-                    <Btn onClick={()=>setMergeSrc(it)} variant="ghost" size="sm">Merge</Btn>
-                    <Btn onClick={()=>openEdit(it)} variant="ghost" size="sm">Edit</Btn>
-                  </div>
-                </td>
-              </tr>
-            </Fragment>;
-          })}
-        </tbody>
-      </table>
+            return <span style={{color:expected>0?C.amber:C.muted,fontWeight:expected>0?700:400}}>{expected>0?'+'+expected:'—'}</span>;
+          }},
+          {key:'actions',label:'',cardLabel:'Actions',render:it=>
+            <div style={{display:'flex',gap:6,justifyContent:'flex-end',flexWrap:'wrap'}}>
+              <Btn onClick={()=>setMoveSrc(it)} variant="ghost" size="sm">Move</Btn>
+              <Btn onClick={()=>setMergeSrc(it)} variant="ghost" size="sm">Merge</Btn>
+              <Btn onClick={()=>openEdit(it)} variant="ghost" size="sm">Edit</Btn>
+            </div>},
+        ]}/>
     </div>
     {totalPages>1&&<div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:8,marginTop:14}}>
       <Btn onClick={()=>setPage(p=>Math.max(0,p-1))} disabled={page===0} variant="secondary" size="sm">← Prev</Btn>
@@ -4711,6 +4747,7 @@ function ItemMasters(){
 function MergePartyModal({source,onClose,onMerged}){
   const[pq,setPq]=useState('');
   const[targetId,setTargetId]=useState('');
+  const mobile=useIsMobile();
   const{toast,TC}=useToast();
   const candidates=useMemo(()=>state.parties.filter(p=>p.type===source.type&&p.id!==source.id&&(!pq||p.name.toLowerCase().includes(pq.toLowerCase()))).slice(0,8),[pq,source.id,source.type]);
   const target=state.parties.find(p=>p.id===targetId);
@@ -4728,7 +4765,7 @@ function MergePartyModal({source,onClose,onMerged}){
         <input value={pq} onChange={e=>setPq(e.target.value)} placeholder="Search party to merge into…" autoFocus
           style={{width:'100%',padding:'8px 12px',borderRadius:7,border:`1.5px solid ${C.bdr}`,fontSize:13,outline:'none',fontFamily:'inherit',marginBottom:8,boxSizing:'border-box'}}/>
         {pq.length>0&&candidates.map(p=><div key={p.id} onClick={()=>setTargetId(p.id)} style={{padding:'8px 12px',borderRadius:7,cursor:'pointer',border:`1px solid ${C.bdr}`,marginBottom:6}}
-          onMouseEnter={e=>e.currentTarget.style.background='#F6F8FA'} onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
+          {...(mobile?{}:{onMouseEnter:e=>e.currentTarget.style.background='#F6F8FA',onMouseLeave:e=>e.currentTarget.style.background='transparent'})}>
           <div style={{fontWeight:600,color:C.txt,fontSize:13}}>{p.name}</div>
           <div style={{fontSize:11,color:C.sub}}>{p.city||'—'}</div>
         </div>)}
@@ -4748,6 +4785,7 @@ function MergePartyModal({source,onClose,onMerged}){
 function MergeItemModal({source,onClose,onMerged}){
   const[pq,setPq]=useState('');
   const[targetId,setTargetId]=useState('');
+  const mobile=useIsMobile();
   const{toast,TC}=useToast();
   const candidates=useMemo(()=>state.items.filter(it=>it.id!==source.id&&it.active!==false&&(!pq||(it.internal||it.name||'').toLowerCase().includes(pq.toLowerCase()))).slice(0,8),[pq,source.id]);
   const target=state.items.find(it=>it.id===targetId);
@@ -4765,7 +4803,7 @@ function MergeItemModal({source,onClose,onMerged}){
         <input value={pq} onChange={e=>setPq(e.target.value)} placeholder="Search item to merge into…" autoFocus
           style={{width:'100%',padding:'8px 12px',borderRadius:7,border:`1.5px solid ${C.bdr}`,fontSize:13,outline:'none',fontFamily:'inherit',marginBottom:8,boxSizing:'border-box'}}/>
         {pq.length>0&&candidates.map(it=><div key={it.id} onClick={()=>setTargetId(it.id)} style={{padding:'8px 12px',borderRadius:7,cursor:'pointer',border:`1px solid ${C.bdr}`,marginBottom:6}}
-          onMouseEnter={e=>e.currentTarget.style.background='#F6F8FA'} onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
+          {...(mobile?{}:{onMouseEnter:e=>e.currentTarget.style.background='#F6F8FA',onMouseLeave:e=>e.currentTarget.style.background='transparent'})}>
           <div style={{fontWeight:600,color:C.txt,fontSize:13}}>{it.internal||it.name}</div>
           <div style={{fontSize:11,color:C.sub}}>{it.cat||'—'} · {it.stock||0} pcs in stock</div>
         </div>)}
@@ -4791,6 +4829,7 @@ function MoveStockModal({source,onClose,onMoved}){
   const[pq,setPq]=useState('');
   const[targetId,setTargetId]=useState('');
   const[qty,setQty]=useState(String(source.stock||0));
+  const mobile=useIsMobile();
   const{toast,TC}=useToast();
   const candidates=useMemo(()=>state.items.filter(it=>it.id!==source.id&&it.active!==false&&(!pq||(it.internal||it.name||'').toLowerCase().includes(pq.toLowerCase()))).slice(0,8),[pq,source.id]);
   const target=state.items.find(it=>it.id===targetId);
@@ -4810,7 +4849,7 @@ function MoveStockModal({source,onClose,onMoved}){
         <input value={pq} onChange={e=>setPq(e.target.value)} placeholder="Search item to move stock into…" autoFocus
           style={{width:'100%',padding:'8px 12px',borderRadius:7,border:`1.5px solid ${C.bdr}`,fontSize:13,outline:'none',fontFamily:'inherit',marginBottom:8,boxSizing:'border-box'}}/>
         {pq.length>0&&candidates.map(it=><div key={it.id} onClick={()=>setTargetId(it.id)} style={{padding:'8px 12px',borderRadius:7,cursor:'pointer',border:`1px solid ${C.bdr}`,marginBottom:6}}
-          onMouseEnter={e=>e.currentTarget.style.background='#F6F8FA'} onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
+          {...(mobile?{}:{onMouseEnter:e=>e.currentTarget.style.background='#F6F8FA',onMouseLeave:e=>e.currentTarget.style.background='transparent'})}>
           <div style={{fontWeight:600,color:C.txt,fontSize:13}}>{it.internal||it.name}</div>
           <div style={{fontSize:11,color:C.sub}}>{it.cat||'—'} · {it.stock||0} pcs in stock</div>
         </div>)}
@@ -4835,6 +4874,7 @@ function MoveStockModal({source,onClose,onMoved}){
 
 // ── PARTY MASTERS ─────────────────────────────────────────────────────────────
 function PartyMasters(){
+  const mobile=useIsMobile();
   const[parties,setParties]=useState(state.parties);
   const[search,setSearch]=useState('');
   const[routeF,setRouteF]=useState('');
@@ -4885,45 +4925,34 @@ function PartyMasters(){
     <div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,padding:'8px 12px',marginBottom:12}}>
       <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search parties…" style={{width:'100%',border:'none',outline:'none',fontSize:13,color:C.txt,fontFamily:'inherit',background:'transparent'}}/>
     </div>
-    <div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,overflow:'hidden'}}>
-      <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}>
-        <thead><tr style={{background:'#F6F8FA'}}>
-          {['Name','City','Route',(typeF==='supplier'||typeF==='transporter')?'Payable ₹':'OD ₹','Phone',''].map((h,i)=><th key={i} style={{padding:'9px 12px',textAlign:h.includes('₹')?'right':'left',fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,borderBottom:`1px solid ${C.bdr}`}}>{h}</th>)}
-        </tr></thead>
-        <tbody>
-          {filtered.slice(0,100).map((p,i)=>{
+    <div style={{background:mobile?'transparent':C.surf,borderRadius:8,border:mobile?'none':`1px solid ${C.bdr}`,overflow:'hidden'}}>
+      <CardTable mobile={mobile} rows={filtered.slice(0,100)} keyFn={(p,i)=>p.id||i}
+        columns={[
+          {key:'name',label:'Name',render:p=><span onClick={()=>setLedgerParty(p)} style={{fontWeight:600,color:C.blue,cursor:'pointer',textDecoration:'underline',textDecorationStyle:'dotted'}}>{p.name}</span>},
+          {key:'city',label:'City',render:p=><span style={{color:C.sub,fontSize:12}}>{p.city||'—'}</span>},
+          {key:'route',label:'Route',render:p=><Badge v={p.route||'—'} color={p.route==='CG North'?'blue':p.route==='CG South'?'green':p.route==='Odisha'?'amber':'gray'}/>},
+          {key:'od',label:(typeF==='supplier'||typeF==='transporter')?'Payable ₹':'OD ₹',align:'right',render:p=>{
             const od=(typeF==='supplier'||typeF==='transporter')?getSupplierBal(p.id):getCustomerBal(p.id);
-            return <tr key={i} style={{borderBottom:`1px solid ${C.bdr}`}} onMouseEnter={e=>e.currentTarget.style.background='#F6F8FA'} onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
-            <td style={{padding:'10px 12px'}}>
-              <span onClick={()=>setLedgerParty(p)} style={{fontWeight:600,color:C.blue,cursor:'pointer',textDecoration:'underline',textDecorationStyle:'dotted'}}>{p.name}</span>
-            </td>
-            <td style={{padding:'10px 12px',color:C.sub,fontSize:12}}>{p.city||'—'}</td>
-            <td style={{padding:'10px 12px'}}><Badge v={p.route||'—'} color={p.route==='CG North'?'blue':p.route==='CG South'?'green':p.route==='Odisha'?'amber':'gray'}/></td>
-            <td style={{padding:'10px 12px',textAlign:'right',fontWeight:od!==0?700:400,color:od>0?C.red:od<0?C.green:C.muted}}>{od!==0?(od<0?'−':'')+fmt(Math.abs(od)):'—'}</td>
-            <td style={{padding:'10px 12px'}}>
-              <div style={{display:'flex',gap:6,alignItems:'center'}}>
-                {editPhId===p.id
-                  ?<div style={{display:'flex',gap:4,alignItems:'center'}}>
-                    <input value={editPhVal} onChange={e=>setEditPhVal(e.target.value)} placeholder="10-digit" autoFocus autoComplete="off"
-                      onKeyDown={e=>{if(e.key==='Enter'){updatePartyPhone(p.id,editPhVal);setParties([...state.parties]);setEditPhId(null);toast('Saved ✓');}if(e.key==='Escape')setEditPhId(null);}}
-                      style={{width:130,padding:'4px 8px',borderRadius:6,border:`1.5px solid ${C.blue}`,fontSize:12,outline:'none',fontFamily:'inherit'}}/>
-                    <button onClick={()=>{updatePartyPhone(p.id,editPhVal);setParties([...state.parties]);setEditPhId(null);toast('Saved ✓');}} style={{padding:'4px 10px',borderRadius:6,background:C.blue,color:'#fff',border:'none',cursor:'pointer',fontSize:12,fontFamily:'inherit',fontWeight:600}}>✓</button>
-                    <button onClick={()=>setEditPhId(null)} style={{padding:'4px 8px',borderRadius:6,background:'none',color:C.muted,border:`1px solid ${C.bdr}`,cursor:'pointer',fontSize:12}}>✕</button>
-                  </div>
-                  :<button onClick={()=>{setEditPhId(p.id);setEditPhVal(p.phone||'');}} style={{padding:'4px 10px',borderRadius:6,border:`1px solid ${C.bdr}`,background:p.phone?C.greenSoft:C.amberSoft,color:p.phone?C.green:C.amber,fontSize:11,fontWeight:600,cursor:'pointer',fontFamily:'inherit'}}>
-                    {p.phone?'📞 '+p.phone:'+ Add phone'}
-                  </button>}
+            return <span style={{fontWeight:od!==0?700:400,color:od>0?C.red:od<0?C.green:C.muted}}>{od!==0?(od<0?'−':'')+fmt(Math.abs(od)):'—'}</span>;
+          }},
+          {key:'phone',label:'Phone',render:p=>
+            editPhId===p.id
+              ?<div style={{display:'flex',gap:4,alignItems:'center'}}>
+                <input value={editPhVal} onChange={e=>setEditPhVal(e.target.value)} placeholder="10-digit" autoFocus autoComplete="off"
+                  onKeyDown={e=>{if(e.key==='Enter'){updatePartyPhone(p.id,editPhVal);setParties([...state.parties]);setEditPhId(null);toast('Saved ✓');}if(e.key==='Escape')setEditPhId(null);}}
+                  style={{width:130,padding:'4px 8px',borderRadius:6,border:`1.5px solid ${C.blue}`,fontSize:12,outline:'none',fontFamily:'inherit'}}/>
+                <button onClick={()=>{updatePartyPhone(p.id,editPhVal);setParties([...state.parties]);setEditPhId(null);toast('Saved ✓');}} style={{padding:'4px 10px',borderRadius:6,background:C.blue,color:'#fff',border:'none',cursor:'pointer',fontSize:12,fontFamily:'inherit',fontWeight:600}}>✓</button>
+                <button onClick={()=>setEditPhId(null)} style={{padding:'4px 8px',borderRadius:6,background:'none',color:C.muted,border:`1px solid ${C.bdr}`,cursor:'pointer',fontSize:12}}>✕</button>
               </div>
-            </td>
-            <td style={{padding:'10px 12px',textAlign:'right'}}>
-              <div style={{display:'flex',gap:6,justifyContent:'flex-end'}}>
-                <Btn onClick={()=>setMergeSrc(p)} variant="ghost" size="sm">Merge</Btn>
-                <Btn onClick={()=>openEdit(p)} variant="ghost" size="sm">Edit</Btn>
-              </div>
-            </td>
-          </tr>;})}
-        </tbody>
-      </table>
+              :<button onClick={()=>{setEditPhId(p.id);setEditPhVal(p.phone||'');}} style={{padding:'4px 10px',borderRadius:6,border:`1px solid ${C.bdr}`,background:p.phone?C.greenSoft:C.amberSoft,color:p.phone?C.green:C.amber,fontSize:11,fontWeight:600,cursor:'pointer',fontFamily:'inherit'}}>
+                {p.phone?'📞 '+p.phone:'+ Add phone'}
+              </button>},
+          {key:'actions',label:'',cardLabel:'Actions',align:'right',render:p=>
+            <div style={{display:'flex',gap:6,justifyContent:'flex-end',flexWrap:'wrap'}}>
+              <Btn onClick={()=>setMergeSrc(p)} variant="ghost" size="sm">Merge</Btn>
+              <Btn onClick={()=>openEdit(p)} variant="ghost" size="sm">Edit</Btn>
+            </div>},
+        ]}/>
     </div>
   </div>;
 }
@@ -6105,6 +6134,37 @@ function BackupRestore() {
   );
 }
 
+// Cloud sync status + the one-time "push this device's data up" action —
+// used exactly once, from whichever device already holds the real
+// accumulated business data, to seed the cloud table the first time this
+// feature is turned on. Every other device's initSync() then pulls that
+// real data instead of starting from seed/empty. Renders nothing (not even
+// the card) when this build has no Supabase project configured.
+function CloudSyncPanel(){
+  const{toast,TC}=useToast();
+  const[email,setEmail]=useState(null);
+  const[busy,setBusy]=useState(false);
+  useEffect(()=>{ DB.getSession().then(s=>setEmail(s?.user?.email||null)); },[]);
+  if(!supabase)return null;
+  const upload=async()=>{
+    if(!window.confirm('Upload this device\'s current data to the cloud? Only do this from the device that already has your real, up-to-date data — it will overwrite the cloud copy.'))return;
+    setBusy(true);
+    try{ const n=await DB.pushAllLocal(); toast(`Uploaded ${n} data keys to the cloud ✓`); }
+    catch(e){ toast('Upload failed: '+e.message,'error'); }
+    finally{ setBusy(false); }
+  };
+  const signOut=async()=>{ await DB.signOut(); window.location.reload(); };
+  return <div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,padding:20,marginBottom:20}}>
+    <TC/>
+    <h3 style={{margin:'0 0 4px',fontSize:14,fontWeight:700,color:C.txt}}>Cloud Sync</h3>
+    <p style={{margin:'0 0 12px',fontSize:12,color:C.sub}}>Signed in as <strong style={{color:C.txt}}>{email||'…'}</strong> — this device's data syncs automatically across every signed-in device.</p>
+    <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+      <Btn onClick={upload} disabled={busy} size="sm">{busy?'Uploading…':'Upload this device\'s data to cloud'}</Btn>
+      <button onClick={signOut} style={{fontSize:12,color:C.sub,background:'none',border:`1px solid ${C.bdr}`,cursor:'pointer',fontFamily:'inherit',padding:'6px 12px',borderRadius:6}}>Sign out</button>
+    </div>
+  </div>;
+}
+
 // ── SETTINGS ──────────────────────────────────────────────────────────────────
 function Settings(){
   const[tpls,setTpls]=useState({...state.templates});
@@ -6170,6 +6230,7 @@ function Settings(){
     </div>
 
     <div style={{height:16}}/>
+    <CloudSyncPanel/>
     <BackupRestore/>
   </div>;
 }
@@ -6264,30 +6325,24 @@ function StockBreakdownModal({onClose}){
     return Object.values(byCat).sort((a,b)=>b.stockValue-a.stockValue);
   },[state.items.length,fifoMap]);
   const totals=useMemo(()=>rows.reduce((s,r)=>({count:s.count+r.count,stock:s.stock+r.stock,stockValue:s.stockValue+r.stockValue}),{count:0,stock:0,stockValue:0}),[rows]);
+  const mobile=useIsMobile();
+  const columns=[
+    {key:'cat',label:'Category',render:r=><Badge v={r.cat} color="blue"/>},
+    {key:'count',label:'Items',align:'right',render:r=><span style={{color:C.sub}}>{r.count}</span>},
+    {key:'stock',label:'Stock (pcs)',align:'right',render:r=><span style={{fontWeight:600,color:C.txt}}>{r.stock}</span>},
+    {key:'stockValue',label:'Stock Value',align:'right',render:r=><span style={{fontWeight:600,color:C.txt}}>{fmt(r.stockValue)}</span>},
+  ];
+  const footer=rows.length>0&&<div style={{display:'flex',justifyContent:'space-between',padding:mobile?'10px 14px':'9px 12px',
+    background:'#F6F8FA',fontWeight:700,fontSize:13,borderTop:mobile?`1px solid ${C.bdr}`:'none',borderRadius:mobile?9:0}}>
+    <span>Total</span>
+    <span style={{display:'flex',gap:16}}><span>{totals.count}</span><span>{totals.stock}</span><span>{fmt(totals.stockValue)}</span></span>
+  </div>;
   return <Modal title="Inventory — Category Breakdown" onClose={onClose} width={560}>
     {catDetail&&<CategoryDetail cat={catDetail} onClose={()=>setCatDetail(null)}/>}
     <div style={{fontSize:12,color:C.sub,marginBottom:12}}>Click a category for item-level detail</div>
-    <div style={{border:`1px solid ${C.bdr}`,borderRadius:8,overflow:'hidden'}}>
-      <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}>
-        <thead><tr style={{background:'#F6F8FA'}}>
-          {['Category','Items','Stock (pcs)','Stock Value'].map((h,i)=><th key={i} style={{padding:'8px 12px',textAlign:i>0?'right':'left',fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,borderBottom:`1px solid ${C.bdr}`,whiteSpace:'nowrap'}}>{h}</th>)}
-        </tr></thead>
-        <tbody>
-          {rows.length===0&&<tr><td colSpan={4} style={{padding:'30px',textAlign:'center',color:C.muted}}>No stock</td></tr>}
-          {rows.map((r,i)=><tr key={i} style={{borderBottom:`1px solid ${C.bdr}`,cursor:'pointer'}} onClick={()=>setCatDetail(r.cat)} onMouseEnter={e=>e.currentTarget.style.background='#F6F8FA'} onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
-            <td style={{padding:'9px 12px'}}><Badge v={r.cat} color="blue"/></td>
-            <td style={{padding:'9px 12px',textAlign:'right',color:C.sub}}>{r.count}</td>
-            <td style={{padding:'9px 12px',textAlign:'right',fontWeight:600,color:C.txt}}>{r.stock}</td>
-            <td style={{padding:'9px 12px',textAlign:'right',fontWeight:600,color:C.txt}}>{fmt(r.stockValue)}</td>
-          </tr>)}
-          {rows.length>0&&<tr style={{background:'#F6F8FA',fontWeight:700}}>
-            <td style={{padding:'9px 12px'}}>Total</td>
-            <td style={{padding:'9px 12px',textAlign:'right'}}>{totals.count}</td>
-            <td style={{padding:'9px 12px',textAlign:'right'}}>{totals.stock}</td>
-            <td style={{padding:'9px 12px',textAlign:'right'}}>{fmt(totals.stockValue)}</td>
-          </tr>}
-        </tbody>
-      </table>
+    <div style={{border:mobile?'none':`1px solid ${C.bdr}`,borderRadius:8,overflow:'hidden'}}>
+      <CardTable mobile={mobile} columns={columns} rows={rows} keyFn={(r,i)=>i}
+        onRowClick={r=>setCatDetail(r.cat)} emptyLabel="No stock" footer={footer}/>
     </div>
   </Modal>;
 }
@@ -6534,19 +6589,88 @@ function BusinessIntelligence(){
   </div>;
 }
 
+// ── LOGIN (cloud sync gate) ─────────────────────────────────────────────────────
+// Only rendered when a Supabase project is configured for this build AND no
+// session is cached yet — a dev checkout with no VITE_SUPABASE_* env vars
+// set skips this entirely and runs purely local, same as before this
+// feature existed. One sign-in per device/browser; session persists after
+// that (Supabase's client stores it in localStorage itself).
+function LoginScreen({ onSignedIn }) {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (!email || !password) { setErr('Enter email and password'); return; }
+    setBusy(true); setErr('');
+    try {
+      await DB.signIn(email.trim(), password);
+      onSignedIn();
+    } catch (e) {
+      setErr(e.message || 'Sign in failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return <div style={{display:'flex',alignItems:'center',justifyContent:'center',height:'100vh',background:C.bg}}>
+    <form onSubmit={submit} style={{width:320,background:C.surf,borderRadius:12,border:`1px solid ${C.bdr}`,padding:28,boxShadow:'0 4px 20px rgba(0,0,0,0.06)'}}>
+      <div style={{textAlign:'center',marginBottom:20}}>
+        <div style={{fontSize:32,marginBottom:8}}>🔥</div>
+        <div style={{fontSize:15,fontWeight:700,color:C.txt}}>Upkaran ERP</div>
+        <div style={{fontSize:12,color:C.sub,marginTop:4}}>Sign in to sync your data on this device</div>
+      </div>
+      <div style={{marginBottom:12}}>
+        <label style={{display:'block',fontSize:12,fontWeight:600,color:C.sub,marginBottom:4}}>Email</label>
+        <input type="email" value={email} onChange={e=>setEmail(e.target.value)} autoComplete="username" autoFocus
+          style={{width:'100%',padding:'9px 12px',borderRadius:7,border:`1.5px solid ${C.bdr}`,fontSize:13,outline:'none',fontFamily:'inherit',boxSizing:'border-box'}}/>
+      </div>
+      <div style={{marginBottom:16}}>
+        <label style={{display:'block',fontSize:12,fontWeight:600,color:C.sub,marginBottom:4}}>Password</label>
+        <input type="password" value={password} onChange={e=>setPassword(e.target.value)} autoComplete="current-password"
+          style={{width:'100%',padding:'9px 12px',borderRadius:7,border:`1.5px solid ${C.bdr}`,fontSize:13,outline:'none',fontFamily:'inherit',boxSizing:'border-box'}}/>
+      </div>
+      {err && <div style={{fontSize:12,color:C.red,marginBottom:12}}>{err}</div>}
+      <button type="submit" disabled={busy} style={{width:'100%',padding:'10px 0',borderRadius:7,border:'none',background:C.blue,color:'#fff',fontSize:13,fontWeight:700,cursor:busy?'default':'pointer',opacity:busy?0.7:1,fontFamily:'inherit'}}>
+        {busy ? 'Signing in…' : 'Sign in'}
+      </button>
+    </form>
+  </div>;
+}
+
 // ── APP ───────────────────────────────────────────────────────────────────────
 function App(){
   const initialMod=(window.location.hash||'').slice(1);
   const[mod,setMod]=useState(NAV.some(n=>n.id===initialMod)?initialMod:(initialMod?'dashboard':'orders'));
   const[ready,setReady]=useState(false);
-  const[mobile,setMobile]=useState(window.innerWidth<768);
-  const[sideOpen,setSideOpen]=useState(true);
+  // null = checking cached session, false = show LoginScreen, true = proceed.
+  // Stays `true` immediately when this build has no Supabase project
+  // configured (supabase===null) — cloud sync is opt-in, a plain checkout
+  // still runs fully local with no login gate at all.
+  const[authed,setAuthed]=useState(!supabase);
+  const mobile=useIsMobile();
+  // Desktop: true = sidebar expanded (220px) vs collapsed to icon rail (56px).
+  // Mobile: true = drawer open vs closed — starts closed so it doesn't cover
+  // the screen on load.
+  const[sideOpen,setSideOpen]=useState(()=>window.innerWidth>=MOBILE_BREAKPOINT);
+
+  // DB.initSync() pulls this device's latest cross-device snapshot into
+  // localStorage BEFORE store.js's loadAll() reads it back out — so a
+  // brand-new device sees the real synced data on its very first load
+  // instead of seed data. No-op when cloud sync isn't configured.
+  const bootAfterAuth=()=>{ DB.initSync().then(loadAll).then(()=>setReady(true)); };
 
   useEffect(()=>{
-    const handleResize=()=>setMobile(window.innerWidth<768);
-    window.addEventListener('resize',handleResize);
-    loadAll().then(()=>setReady(true));
-    return()=>window.removeEventListener('resize',handleResize);
+    if(!supabase){ bootAfterAuth(); return; }
+    DB.getSession().then(session=>{
+      if(session){setAuthed(true);bootAfterAuth();}
+      else setAuthed(false);
+    });
+    return DB.onAuthChange(session=>{
+      if(session){setAuthed(true);bootAfterAuth();}
+    });
   },[]);
 
   // Real #hash routing — lets ctrl/cmd/middle-click on a sidebar link open
@@ -6567,6 +6691,8 @@ function App(){
   // picks it up without the user having to hit F5.
   const[liveTick,setLiveTick]=useState(0);
   useEffect(()=>subscribeLive(()=>setLiveTick(t=>t+1)),[]);
+
+  if(authed===false)return <LoginScreen onSignedIn={()=>{setAuthed(true);bootAfterAuth();}}/>;
 
   if(!ready)return <div style={{display:'flex',alignItems:'center',justifyContent:'center',height:'100vh',background:C.bg}}>
     <div style={{textAlign:'center'}}>
@@ -6600,9 +6726,14 @@ function App(){
 
   return <div style={{display:'flex',height:'100vh',background:C.bg,fontFamily:'-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif',overflow:'hidden'}}>
     {/* Sidebar */}
-    {!mobile&&(
-      <div style={{width:sideOpen?220:56,background:'#0A0E1A',display:'flex',flexDirection:'column',
-        flexShrink:0,transition:'width .18s ease',overflow:'hidden',borderRight:'1px solid #1a2035'}}>
+    {mobile&&sideOpen&&(
+      <div onClick={()=>setSideOpen(false)} style={{position:'fixed',inset:0,
+        background:'rgba(0,0,0,0.45)',zIndex:199}}/>
+    )}
+    {(!mobile||sideOpen)&&(
+      <div style={{width:mobile?220:(sideOpen?220:56),background:'#0A0E1A',display:'flex',flexDirection:'column',
+        flexShrink:0,transition:mobile?'none':'width .18s ease',overflow:'hidden',borderRight:'1px solid #1a2035',
+        ...(mobile?{position:'fixed',top:0,left:0,height:'100vh',zIndex:200,boxShadow:'4px 0 24px rgba(0,0,0,0.3)'}:{})}}>
         {/* Logo */}
         <div style={{height:52,display:'flex',alignItems:'center',padding:'0 13px',
           gap:10,justifyContent:sideOpen?'flex-start':'center',borderBottom:'1px solid #1a2035',flexShrink:0}}>
@@ -6679,7 +6810,7 @@ function App(){
       </div>
 
       {/* Content */}
-      <div style={{flex:1,overflowY:'auto',padding:20}}>
+      <div style={{flex:1,overflowY:'auto',padding:mobile?'20px 20px 70px 20px':20}}>
         <div key={mod+'#'+liveTick}>{renderMod()}</div>
       </div>
     </div>

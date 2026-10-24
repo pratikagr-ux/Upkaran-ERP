@@ -23,6 +23,16 @@ jobs:
           node-version: 20
       - run: npm ci
       - run: npm run build
+        env:
+          # Public Supabase anon key — safe to embed in the client bundle,
+          # Row-Level Security on the kv_store table is what actually
+          # protects the data. Set these two repo secrets (Settings →
+          # Secrets and variables → Actions) with values from your
+          # Supabase project's Settings → API page. Leaving them unset is
+          # fine too — the app falls back to local-only mode (no cloud
+          # sync, no login gate), same as before this feature existed.
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
