@@ -248,6 +248,11 @@ const NAV = [
   {id:'settings',   label:'Settings',    icon:<SvgIcon d="M12 15a3 3 0 100-6 3 3 0 000 6z" d2="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/>},
 ];
 
+// Curated 4-tab set for the mobile bottom tab bar — a deliberate subset of
+// NAV (not NAV.slice(0,5)), in a fixed order chosen for what's reached most
+// on a phone. Everything else in NAV stays reachable via the hamburger
+// drawer; "New Sale" additionally has its own shortcut in the top bar.
+const BOTTOM_NAV = ['dashboard','items','outstanding','accounts'].map(id=>NAV.find(n=>n.id===id));
 
 // ── RESPONSIVE HELPERS ─────────────────────────────────────────────────────────
 // Single source of truth for the mobile breakpoint — every component that
@@ -346,12 +351,13 @@ function Grid2({children}){
 }
 
 function SectionHead({title,sub,action}){
-  return <div style={{display:'flex',alignItems:'flex-start',justifyContent:'space-between',marginBottom:18}}>
-    <div>
-      <h2 style={{margin:0,fontSize:18,fontWeight:800,color:C.txt,letterSpacing:-.3}}>{title}</h2>
+  const mobile=useIsMobile();
+  return <div style={{display:'flex',alignItems:mobile?'stretch':'flex-start',justifyContent:'space-between',flexWrap:'wrap',gap:mobile?10:0,marginBottom:mobile?14:18}}>
+    <div style={{minWidth:0}}>
+      <h2 style={{margin:0,fontSize:mobile?16:18,fontWeight:800,color:C.txt,letterSpacing:-.3}}>{title}</h2>
       {sub&&<p style={{margin:'3px 0 0',fontSize:12,color:C.sub}}>{sub}</p>}
     </div>
-    {action}
+    {action&&<div style={mobile?{width:'100%'}:undefined}>{action}</div>}
   </div>;
 }
 
@@ -3871,6 +3877,7 @@ function CategoryLedger({catId,onClose}) {
 }
 
 function Dashboard({navigate}){
+  const mobile=useIsMobile();
   const customers=state.parties.filter(p=>p.type==='customer');
   const salesByParty=state.sales.reduce((m,s)=>{m[s.partyId]=(m[s.partyId]||0)+(s.total||0);return m;},{});
   const paymentsByParty=state.payments.reduce((m,p)=>{m[p.partyId]=(m[p.partyId]||0)+(p.amount||0);return m;},{});
@@ -3900,75 +3907,91 @@ function Dashboard({navigate}){
   const followupsUpcoming=state.followups.filter(f=>f.status==='open'&&f.followUpDate&&f.followUpDate>t).sort((a,b)=>a.followUpDate.localeCompare(b.followUpDate)).slice(0,5);
   const markDone=id=>{state.followups=state.followups.map(f=>f.id===id?{...f,status:'done'}:f);save.followups();forceUpdate(n=>n+1);};
 
+  const followupsBlock=<div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,overflow:'hidden'}}>
+    <div style={{padding:'12px 16px',borderBottom:`1px solid ${C.bdr}`,background:'#FFF8C5',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+      <h3 style={{margin:0,fontSize:14,fontWeight:700,color:C.amberBright}}>📋 Follow-ups · {followupsDue.length} due</h3>
+      {followupsUpcoming.length>0&&<span style={{fontSize:11,color:C.sub}}>{followupsUpcoming.length} upcoming</span>}
+    </div>
+    {[...followupsDue,...followupsUpcoming].length===0
+      ?<div style={{padding:'28px',textAlign:'center',color:C.muted,fontSize:13}}>No follow-ups pending ✓</div>
+      :[...followupsDue,...followupsUpcoming].slice(0,8).map((f,i)=>{
+        const isDue=f.followUpDate<=t;
+        return <div key={i} style={{display:'flex',alignItems:'flex-start',gap:10,padding:'10px 16px',borderBottom:`1px solid ${C.bdr}`,background:isDue?'#FFFFF0':'transparent'}}>
+          <div style={{flex:1,minWidth:0}}>
+            <div onClick={()=>{const p=state.parties.find(pp=>pp.id===f.partyId);if(p)setLedgerParty(p);}}
+              style={{fontWeight:600,color:C.blue,fontSize:13,cursor:'pointer',textDecoration:'underline',textDecorationStyle:'dotted'}}>{f.partyName}</div>
+            <div style={{fontSize:11,marginTop:1}}>
+              <span style={{color:TAG_COLORS[f.tags[0]]||C.blue,fontWeight:700}}>{f.label}</span>
+              <span style={{color:C.sub}}>{' · '}{isDue?'Due today':'Due '+fmtD(f.followUpDate)}</span>
+            </div>
+            <div style={{fontSize:11,color:C.muted,fontStyle:'italic',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>"{f.response}"</div>
+          </div>
+          <div style={{display:'flex',gap:5,flexShrink:0}}>
+            <button onClick={()=>markDone(f.id)} style={{padding:'3px 8px',borderRadius:5,background:C.greenSoft,color:C.green,border:`1px solid ${C.green}40`,cursor:'pointer',fontSize:11,fontWeight:700,fontFamily:'inherit'}}>Done</button>
+            <button onClick={()=>navigate('outstanding')} style={{padding:'3px 8px',borderRadius:5,background:C.blueSoft,color:C.blue,border:`1px solid ${C.blue}40`,cursor:'pointer',fontSize:11,fontWeight:600,fontFamily:'inherit'}}>View</button>
+          </div>
+        </div>;
+      })}
+  </div>;
+  const topOutstandingBlock=<div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,overflow:'hidden'}}>
+    <div style={{padding:'12px 16px',borderBottom:`1px solid ${C.bdr}`,display:'flex',justifyContent:'space-between'}}>
+      <h3 style={{margin:0,fontSize:14,fontWeight:700,color:C.txt}}>Top Outstanding</h3>
+      <button onClick={()=>navigate('outstanding')} style={{background:'none',border:'none',cursor:'pointer',fontSize:12,color:C.blue,fontWeight:600}}>All →</button>
+    </div>
+    {odParties.length===0
+      ?<div style={{padding:'20px',textAlign:'center',color:C.muted,fontSize:13}}>No outstanding dues ✓</div>
+      :odParties.slice(0,6).map((p,i)=><div key={i} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'8px 16px',borderBottom:`1px solid ${C.bdr}`}}>
+        <div>
+          <div onClick={()=>setLedgerParty(p)} style={{fontWeight:600,color:C.blue,fontSize:12,cursor:'pointer',textDecoration:'underline',textDecorationStyle:'dotted'}}>{p.name}</div>
+          <div style={{fontSize:10,color:C.muted}}>{p.city}·{p.route}</div>
+        </div>
+        <span style={{fontWeight:700,color:C.red,fontVariantNumeric:'tabular-nums',fontSize:13}}>{fmt(p.od)}</span>
+      </div>)}
+  </div>;
+  const quickActionsBlock=<div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,padding:'14px 16px'}}>
+    <h3 style={{margin:'0 0 10px',fontSize:14,fontWeight:700,color:C.txt}}>Quick Actions</h3>
+    <div style={{display:'grid',gridTemplateColumns:mobile?'repeat(4,1fr)':'1fr 1fr',gap:8}}>
+      {[{l:'New Sale',i:'🧾',m:'sale',c:C.blue},{l:'Outstanding',i:'⏰',m:'outstanding',c:C.red},{l:'Parties',i:'🏪',m:'parties',c:C.green},{l:'Inventory',i:'📦',m:'items',c:C.purple}].map(a=>(
+        mobile
+          ?<button key={a.m} onClick={()=>navigate(a.m)} style={{display:'flex',flexDirection:'column',alignItems:'center',gap:4,padding:'10px 4px',borderRadius:7,border:`1px solid ${a.c}20`,background:a.c+'08',cursor:'pointer',fontSize:10,fontWeight:600,color:a.c,fontFamily:'inherit'}}>
+            <span style={{fontSize:19}}>{a.i}</span>{a.l}
+          </button>
+          :<button key={a.m} onClick={()=>navigate(a.m)} style={{display:'flex',alignItems:'center',gap:8,padding:'9px 12px',borderRadius:7,border:`1px solid ${a.c}20`,background:a.c+'08',cursor:'pointer',fontSize:12,fontWeight:600,color:a.c,fontFamily:'inherit'}}>
+            <span style={{fontSize:17}}>{a.i}</span>{a.l}
+          </button>
+      ))}
+    </div>
+  </div>;
+
   return <div>
     {ledgerParty&&<PartyLedger party={ledgerParty} onClose={()=>setLedgerParty(null)}/>}
     <div style={{marginBottom:18}}>
-      <h1 style={{margin:0,fontSize:22,fontWeight:800,color:C.txt,letterSpacing:-.5}}>{new Date().getHours()<12?'Good morning':'Good afternoon'}, Pratik 👋</h1>
+      <h1 style={{margin:0,fontSize:mobile?19:22,fontWeight:800,color:C.txt,letterSpacing:-.5}}>{new Date().getHours()<12?'Good morning':'Good afternoon'}, Pratik 👋</h1>
       <p style={{margin:'3px 0 0',fontSize:13,color:C.sub}}>{new Date().toLocaleDateString('en-IN',{weekday:'long',day:'numeric',month:'long'})}</p>
     </div>
-    <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fit,minmax(175px,1fr))',gap:12,marginBottom:18}}>
-      <StatCard label="Total Outstanding" value={fmtL(totalOD)} sub={`${odParties.length} parties`} color={C.red} icon="⏰"/>
+    <div style={{display:'grid',gridTemplateColumns:mobile?'repeat(2,1fr)':'repeat(auto-fit,minmax(175px,1fr))',gap:mobile?10:12,marginBottom:18}}>
+      <StatCard label="Total Outstanding" value={fmtL(totalOD)} sub={`${odParties.length} parties`} color={C.red} icon="⏰" onClick={()=>navigate('outstanding')}/>
       <StatCard label="Sales This Month" value={monthSales.length?fmtL(monthAmt):'—'} sub={monthSales.length?<>
         {monthSales.length} invoices
         <div style={{marginTop:2}}>Lighter {fmtL(monthCatSplit.lighter)} · Appliances {fmtL(monthCatSplit.appliances)}</div>
       </>:'No sales'} color={C.green} icon="🧾"/>
-      <StatCard label="Follow-ups Due" value={String(followupsDue.length||0)} sub={followupsDue.length?'Action needed':'All clear'} color={followupsDue.length>0?C.amber:C.green} icon="📋"/>
-      <StatCard label="Parties" value={String(customers.length)} sub={`${state.parties.filter(p=>p.type==='supplier').length} suppliers`} color={C.blue} icon="🏪"/>
+      <StatCard label="Follow-ups Due" value={String(followupsDue.length||0)} sub={followupsDue.length?'Action needed':'All clear'} color={followupsDue.length>0?C.amber:C.green} icon="📋" onClick={()=>navigate('outstanding')}/>
+      <StatCard label="Parties" value={String(customers.length)} sub={`${state.parties.filter(p=>p.type==='supplier').length} suppliers`} color={C.blue} icon="🏪" onClick={()=>navigate('parties')}/>
       <StatCard label="Out of Stock" value={String(outOfStock.length)} sub={outOfStock.length?'Items need reorder':'All stocked'} color={outOfStock.length>0?C.red:C.green} icon="📦" onClick={()=>navigate('items')}/>
     </div>
-    <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:14,alignItems:'start'}}>
-      <div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,overflow:'hidden'}}>
-        <div style={{padding:'12px 16px',borderBottom:`1px solid ${C.bdr}`,background:'#FFF8C5',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-          <h3 style={{margin:0,fontSize:14,fontWeight:700,color:C.amberBright}}>📋 Follow-ups · {followupsDue.length} due</h3>
-          {followupsUpcoming.length>0&&<span style={{fontSize:11,color:C.sub}}>{followupsUpcoming.length} upcoming</span>}
-        </div>
-        {[...followupsDue,...followupsUpcoming].length===0
-          ?<div style={{padding:'28px',textAlign:'center',color:C.muted,fontSize:13}}>No follow-ups pending ✓</div>
-          :[...followupsDue,...followupsUpcoming].slice(0,8).map((f,i)=>{
-            const isDue=f.followUpDate<=t;
-            return <div key={i} style={{display:'flex',alignItems:'flex-start',gap:10,padding:'10px 16px',borderBottom:`1px solid ${C.bdr}`,background:isDue?'#FFFFF0':'transparent'}}>
-              <div style={{flex:1,minWidth:0}}>
-                <div onClick={()=>{const p=state.parties.find(pp=>pp.id===f.partyId);if(p)setLedgerParty(p);}}
-                  style={{fontWeight:600,color:C.blue,fontSize:13,cursor:'pointer',textDecoration:'underline',textDecorationStyle:'dotted'}}>{f.partyName}</div>
-                <div style={{fontSize:11,marginTop:1}}>
-                  <span style={{color:TAG_COLORS[f.tags[0]]||C.blue,fontWeight:700}}>{f.label}</span>
-                  <span style={{color:C.sub}}>{' · '}{isDue?'Due today':'Due '+fmtD(f.followUpDate)}</span>
-                </div>
-                <div style={{fontSize:11,color:C.muted,fontStyle:'italic',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>"{f.response}"</div>
-              </div>
-              <div style={{display:'flex',gap:5,flexShrink:0}}>
-                <button onClick={()=>markDone(f.id)} style={{padding:'3px 8px',borderRadius:5,background:C.greenSoft,color:C.green,border:`1px solid ${C.green}40`,cursor:'pointer',fontSize:11,fontWeight:700,fontFamily:'inherit'}}>Done</button>
-                <button onClick={()=>navigate('outstanding')} style={{padding:'3px 8px',borderRadius:5,background:C.blueSoft,color:C.blue,border:`1px solid ${C.blue}40`,cursor:'pointer',fontSize:11,fontWeight:600,fontFamily:'inherit'}}>View</button>
-              </div>
-            </div>;
-          })}
+    {mobile
+      ?<div style={{display:'flex',flexDirection:'column',gap:12}}>
+        {quickActionsBlock}
+        {followupsBlock}
+        {topOutstandingBlock}
       </div>
-      <div style={{display:'flex',flexDirection:'column',gap:12}}>
-        <div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,overflow:'hidden'}}>
-          <div style={{padding:'12px 16px',borderBottom:`1px solid ${C.bdr}`,display:'flex',justifyContent:'space-between'}}>
-            <h3 style={{margin:0,fontSize:14,fontWeight:700,color:C.txt}}>Top Outstanding</h3>
-            <button onClick={()=>navigate('outstanding')} style={{background:'none',border:'none',cursor:'pointer',fontSize:12,color:C.blue,fontWeight:600}}>All →</button>
-          </div>
-          {odParties.slice(0,6).map((p,i)=><div key={i} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'8px 16px',borderBottom:`1px solid ${C.bdr}`}}>
-            <div>
-              <div onClick={()=>setLedgerParty(p)} style={{fontWeight:600,color:C.blue,fontSize:12,cursor:'pointer',textDecoration:'underline',textDecorationStyle:'dotted'}}>{p.name}</div>
-              <div style={{fontSize:10,color:C.muted}}>{p.city}·{p.route}</div>
-            </div>
-            <span style={{fontWeight:700,color:C.red,fontVariantNumeric:'tabular-nums',fontSize:13}}>{fmt(p.od)}</span>
-          </div>)}
+      :<div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:14,alignItems:'start'}}>
+        {followupsBlock}
+        <div style={{display:'flex',flexDirection:'column',gap:12}}>
+          {topOutstandingBlock}
+          {quickActionsBlock}
         </div>
-        <div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,padding:'14px 16px'}}>
-          <h3 style={{margin:'0 0 10px',fontSize:14,fontWeight:700,color:C.txt}}>Quick Actions</h3>
-          <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8}}>
-            {[{l:'New Sale',i:'🧾',m:'sale',c:C.blue},{l:'Outstanding',i:'⏰',m:'outstanding',c:C.red},{l:'Parties',i:'🏪',m:'parties',c:C.green},{l:'Inventory',i:'📦',m:'items',c:C.purple}].map(a=>(
-              <button key={a.m} onClick={()=>navigate(a.m)} style={{display:'flex',alignItems:'center',gap:8,padding:'9px 12px',borderRadius:7,border:`1px solid ${a.c}20`,background:a.c+'08',cursor:'pointer',fontSize:12,fontWeight:600,color:a.c,fontFamily:'inherit'}}>
-                <span style={{fontSize:17}}>{a.i}</span>{a.l}
-              </button>
-            ))}
-          </div>
-        </div>
-      </div>
-    </div>
+      </div>}
   </div>;
 }
 
@@ -6764,29 +6787,32 @@ function App(){
     {/* Main */}
     <div style={{flex:1,display:'flex',flexDirection:'column',overflow:'hidden'}}>
       {/* Top bar */}
-      <div style={{padding:'0 24px',height:52,display:'flex',alignItems:'center',justifyContent:'space-between',background:C.surf,borderBottom:`1px solid ${C.bdr}`,flexShrink:0}}>
-        <div style={{display:'flex',alignItems:'center',gap:10}}>
-          {mobile&&<button onClick={()=>setSideOpen(o=>!o)} style={{background:'none',border:'none',cursor:'pointer',fontSize:18,color:C.sub}}>☰</button>}
-          <span style={{fontSize:14,fontWeight:700,color:C.txt}}>{NAV.find(n=>n.id===mod)?.label||'Dashboard'}</span>
+      <div style={{padding:mobile?'0 14px':'0 24px',height:52,display:'flex',alignItems:'center',justifyContent:'space-between',background:C.surf,borderBottom:`1px solid ${C.bdr}`,flexShrink:0,gap:8}}>
+        <div style={{display:'flex',alignItems:'center',gap:mobile?8:10,minWidth:0}}>
+          {mobile&&<button onClick={()=>setSideOpen(o=>!o)} style={{background:'none',border:'none',cursor:'pointer',fontSize:18,color:C.sub,flexShrink:0,padding:0}}>☰</button>}
+          <span style={{fontSize:mobile?13:14,fontWeight:700,color:C.txt,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{NAV.find(n=>n.id===mod)?.label||'Dashboard'}</span>
         </div>
-        <div style={{display:'flex',gap:8}}>
-          <button onClick={()=>nav('sale')} style={{padding:'6px 14px',borderRadius:7,background:C.blue,color:'#fff',border:'none',cursor:'pointer',fontSize:12,fontWeight:700,fontFamily:'inherit'}}>+ New Sale</button>
+        <div style={{display:'flex',gap:8,flexShrink:0}}>
+          <button onClick={()=>nav('sale')} style={{padding:mobile?'6px 10px':'6px 14px',borderRadius:7,background:C.blue,color:'#fff',border:'none',cursor:'pointer',fontSize:mobile?11:12,fontWeight:700,fontFamily:'inherit',whiteSpace:'nowrap'}}>{mobile?'+ Sale':'+ New Sale'}</button>
         </div>
       </div>
 
       {/* Content */}
-      <div style={{flex:1,overflowY:'auto',padding:mobile?'20px 20px 70px 20px':20}}>
+      <div style={{flex:1,overflowY:'auto',padding:mobile?'16px 14px 80px 14px':20}}>
         <div key={mod+'#'+liveTick}>{renderMod()}</div>
       </div>
     </div>
 
-    {/* Mobile bottom tabs */}
-    {mobile&&<div style={{position:'fixed',bottom:0,left:0,right:0,background:C.surf,borderTop:`1px solid ${C.bdr}`,display:'flex',justifyContent:'space-around',padding:'8px 0 env(safe-area-inset-bottom)',zIndex:100}}>
-      {NAV.slice(0,5).map(n=><a key={n.id} href={'#'+n.id} style={{display:'flex',flexDirection:'column',alignItems:'center',gap:2,padding:'4px 8px',background:'none',border:'none',textDecoration:'none',cursor:'pointer',fontFamily:'inherit',position:'relative'}}>
-        <span style={{fontSize:20}}>{n.icon}</span>
-        <span style={{fontSize:9,fontWeight:mod===n.id?700:400,color:mod===n.id?C.blue:C.muted}}>{n.label}</span>
-        {n.id==='outstanding'&&hasDueFU&&<span style={{position:'absolute',top:2,right:2,width:7,height:7,borderRadius:'50%',background:C.amber}}/>}
-      </a>)}
+    {/* Mobile bottom tabs — curated 4-item set (BOTTOM_NAV), not all of NAV */}
+    {mobile&&<div style={{position:'fixed',bottom:0,left:0,right:0,background:C.surf,borderTop:`1px solid ${C.bdr}`,boxShadow:'0 -2px 10px rgba(0,0,0,.05)',display:'flex',padding:'6px 0 calc(4px + env(safe-area-inset-bottom))',zIndex:100}}>
+      {BOTTOM_NAV.map(n=>{
+        const active=mod===n.id;
+        return <a key={n.id} href={'#'+n.id} style={{flex:1,display:'flex',flexDirection:'column',alignItems:'center',gap:3,padding:'2px 0',background:'none',border:'none',textDecoration:'none',cursor:'pointer',fontFamily:'inherit',position:'relative'}}>
+          <span style={{display:'flex',alignItems:'center',justifyContent:'center',width:40,height:26,borderRadius:14,background:active?C.blue+'15':'transparent',color:active?C.blue:C.muted,transition:'background .15s'}}>{n.icon}</span>
+          <span style={{fontSize:10,fontWeight:active?700:500,color:active?C.blue:C.muted}}>{n.label}</span>
+          {n.id==='outstanding'&&hasDueFU&&<span style={{position:'absolute',top:0,right:'28%',width:7,height:7,borderRadius:'50%',background:C.amber,border:`1.5px solid ${C.surf}`}}/>}
+        </a>;
+      })}
     </div>}
   </div>;
 }
