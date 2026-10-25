@@ -31,6 +31,11 @@
 import { supabase } from './supabaseClient.js';
 
 const TABLE = 'kv_store';
+// Supabase Storage bucket for catalogue photos (Feature #2). Must be created
+// once in the Supabase dashboard — see the setup note alongside TeamModule's
+// equivalent one-time doc. Public-read, authenticated-upload RLS, same spirit
+// as kv_store's row-level policy.
+const PHOTO_BUCKET = 'item-photos';
 const QUEUE_KEY = '__pendingSync';
 // Per-tab id so a realtime echo of this tab's own write can be told apart
 // from a genuine change made elsewhere.
@@ -196,5 +201,35 @@ export const DB = {
       if (await pushOne(k, v, false)) n++;
     }
     return n;
+  },
+
+  // ── Catalogue photos (Feature #2) ───────────────────────────────────────
+  // Uploads to the `item-photos` Storage bucket and returns its public URL
+  // (stored in item.photos[] by the caller, same pattern as any other
+  // state field — no new sync mechanism needed since the URL itself is
+  // just a string that rides along with the item through the normal
+  // kv_store sync path).
+  uploadPhoto: async (file, itemId) => {
+    if (!supabase) throw new Error('Cloud sync is not configured for this build.');
+    const uid = await currentUserId();
+    if (!uid) throw new Error('Sign in first.');
+    const ext = (file.name && file.name.includes('.')) ? file.name.split('.').pop().toLowerCase() : 'jpg';
+    const path = `${uid}/${itemId || 'misc'}/${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`;
+    const { error } = await supabase.storage.from(PHOTO_BUCKET).upload(path, file, { cacheControl: '3600', upsert: false });
+    if (error) throw error;
+    const { data } = supabase.storage.from(PHOTO_BUCKET).getPublicUrl(path);
+    return data.publicUrl;
+  },
+  deletePhoto: async (url) => {
+    if (!supabase || !url) return;
+    try {
+      const marker = `/${PHOTO_BUCKET}/`;
+      const idx = url.indexOf(marker);
+      if (idx === -1) return;
+      const path = url.slice(idx + marker.length);
+      await supabase.storage.from(PHOTO_BUCKET).remove([path]);
+    } catch (e) {
+      console.warn('[db] deletePhoto failed', e?.message || e);
+    }
   },
 };

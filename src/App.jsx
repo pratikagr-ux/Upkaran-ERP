@@ -22,6 +22,48 @@ const _py = () => state.payments;
 const _t  = () => state.txns;
 const _fu = () => state.followups;
 
+// ── TEAM / ROLES ───────────────────────────────────────────────────────────────
+// Simple 2-role model: 'owner' (full access) vs 'staff' (can enter sales,
+// purchases, dispatch, payments; cannot see purchase cost/margin, cannot
+// open Accounts/Reports/Insights, cannot edit/delete past entries).
+// state.users is a persisted, synced array of {id,email,role,createdAt}
+// keyed by the signed-in Supabase auth email (state.currentUserEmail, set
+// once at boot in App() — see bootAfterAuth — never itself persisted).
+// A brand-new install has an empty state.users, so EVERY signed-in account
+// is implicitly 'owner' until the Owner opens Team and the very first
+// bootstrap row is written (see ensureOwnerBootstrap, called once at boot)
+// — after that, any email not found in state.users defaults to 'staff'
+// (least-privilege), not 'owner', so a staff account created afterwards by
+// adding only their email is safely restricted by default.
+function computeRole() {
+  const email = (state.currentUserEmail || '').toLowerCase();
+  if (!state.users || state.users.length === 0) return 'owner';
+  const u = state.users.find(x => (x.email || '').toLowerCase() === email);
+  return u ? u.role : 'staff';
+}
+function useRole() {
+  const [, setTick] = useState(0);
+  useEffect(() => subscribeLive(() => setTick(t => t + 1)), []);
+  return computeRole();
+}
+// Called once per boot, right after the signed-in email is known — writes
+// the first-ever users row so this email never falls through to the
+// not-found "staff" default once other staff rows exist later.
+function ensureOwnerBootstrap(email) {
+  if (!email || (state.users && state.users.length > 0)) return;
+  state.users = [{ id: uid('USR'), email, role: 'owner', createdAt: new Date().toISOString() }];
+  save.users();
+}
+// Shared guard for destructive/past-entry actions (delete sale/purchase/
+// return, etc.) — staff are blocked, with a toast explaining why, rather
+// than the button silently doing nothing or being removed entirely (removal
+// would need every call site restyled; this is the smallest-diff approach).
+function requireOwner(toast) {
+  if (computeRole() === 'owner') return true;
+  toast?.('Owners only — ask an owner to do this', 'error');
+  return false;
+}
+
 // delta>0 = stock in (purchase/return), delta<0 = stock out (sale)
 function adjustStock(itemId, delta) {
   if (!itemId || !delta) return;
@@ -100,7 +142,11 @@ function mergeItems(sourceId, targetId) {
 // mergedNames, and the source item is never deleted. For cases where two
 // items are genuinely distinct SKUs and a purchase/count was simply logged
 // under the wrong one, so only the stock number itself needs to move.
-function moveItemStock(sourceId, targetId, qty) {
+// `reason` is required and persisted to state.stockAdjustments as an audit
+// trail — this is the only thing that makes an otherwise-silent stock
+// transfer explainable later (who/when is implicit in date; why is the
+// reason text the user types in MoveStockModal).
+function moveItemStock(sourceId, targetId, qty, reason) {
   if (!sourceId || !targetId || sourceId === targetId || !qty || qty <= 0) return;
   const source = state.items.find(x => x.id === sourceId);
   const target = state.items.find(x => x.id === targetId);
@@ -113,6 +159,58 @@ function moveItemStock(sourceId, targetId, qty) {
     return x;
   });
   save.items();
+  const entry = {
+    id: uid('ADJ'), date: today(), fromItemId: sourceId, toItemId: targetId,
+    fromItemName: source.internal||source.customer||source.name||'', toItemName: target.internal||target.customer||target.name||'',
+    qty: move, reason: (reason||'').trim(), createdAt: new Date().toISOString(),
+  };
+  state.stockAdjustments = [entry, ...state.stockAdjustments];
+  save.stockAdjustments();
+}
+
+// ── PURCHASE ORDER STATUS (Dashboard order-status board, linked backorder) ──
+// A purchase's `status` ('ordered'|'dispatched'|'received') is new, tracked
+// alongside the pre-existing `receivedDate` (kept exactly as-is — markReceived
+// in PurchLog still sets it the same way it always did; it now also stamps
+// status:'received' for consistency). Purchases created before this feature
+// shipped have no `status` field at all, so getPurchaseStatus treats missing
+// status as 'ordered' whenever there's no receivedDate yet — the natural
+// default for "booked but nothing else recorded".
+function getPurchaseStatus(p) {
+  if (p.receivedDate) return 'received';
+  return p.status || 'ordered';
+}
+function markPurchaseOrdered(id) {
+  state.purchases = state.purchases.map(p => p.id===id ? { ...p, status:'ordered', expectedDate:null } : p);
+  save.purchases();
+}
+function markPurchaseDispatched(id, expectedDate) {
+  state.purchases = state.purchases.map(p => p.id===id ? { ...p, status:'dispatched', expectedDate: expectedDate||p.expectedDate||'' } : p);
+  save.purchases();
+}
+// Data-only — adjusts stock exactly like PurchLog's original local
+// markReceived did. UI wrappers (toast/forceUpdate) stay at the call site.
+function markPurchaseReceived(id) {
+  const p = state.purchases.find(x => x.id === id);
+  if (!p || p.receivedDate) return;
+  const rd = today();
+  state.purchases = state.purchases.map(x => x.id===id ? { ...x, receivedDate: rd, status:'received' } : x);
+  save.purchases();
+  (p.items||[]).forEach(l => adjustStock(l.itemId, l.qty));
+}
+// Live-computed display status for a sales-order line (never stored beyond
+// `availability`/`linkedPoId` on the line itself — see SaleEntry mode='order'
+// and OrdersModule) — this is what makes PO status changes auto-propagate to
+// every sales-order line waiting on that PO with no separate sync step.
+function computeOrderLineStatus(line) {
+  if (line.availability !== 'outOfStock') return { label:'Available', color:'gray' };
+  if (!line.linkedPoId) return { label:'Out of Stock', color:'red' };
+  const po = state.purchases.find(p => p.id === line.linkedPoId);
+  if (!po) return { label:'Out of Stock', color:'red' };
+  const st = getPurchaseStatus(po);
+  if (st === 'received') return { label:'Available', color:'green' };
+  if (st === 'dispatched') return { label:'Dispatched'+(po.expectedDate?(' · exp '+fmtD(po.expectedDate)):''), color:'amber' };
+  return { label:'Ordered', color:'blue' };
 }
 
 // Infrared/Induction goods coming back via a sales return aren't known-good —
@@ -233,6 +331,16 @@ function correctDamagedToStock(itemId, qty) {
 // subHead) — self-healing, so reassigning items one at a time via the
 // Sub-Categories manager always produces a correctly clustered table without
 // needing to hand-renumber every item in the category.
+// Shared normalization for subHead text comparisons: trimmed, case-folded,
+// collapsed whitespace. Used both when deciding whether a newly-typed
+// subHead actually matches an existing group (setItemSubHead below) and
+// when deciding whether to print a group header in the item tables
+// (ItemMasters/MobileInventoryList/SubHeadManager) — the same drift that
+// would fork a duplicate group must also not print a redundant header for
+// an item that's really already in the group, just spelled slightly
+// differently ("1B Variants" vs "1b variants ").
+const normSubHeadDisplay = s => (s || '').trim().toLowerCase().replace(/\s+/g, ' ');
+
 function setItemSubHead(itemId, newSubHead) {
   const it = state.items.find(x => x.id === itemId);
   if (!it) return;
@@ -242,7 +350,18 @@ function setItemSubHead(itemId, newSubHead) {
     save.items();
     return;
   }
-  const siblings = state.items.filter(x => x.id !== itemId && x.cat === it.cat && x.subHead === trimmed);
+  // Match siblings by normalized text (trimmed, case-insensitive, collapsed
+  // whitespace) rather than an exact string. Typing "other glass top" or
+  // "1b variants " (a slightly different case/spacing than what's already
+  // in the category) must join the REAL existing group, not silently fork
+  // a lookalike duplicate that sorts and displays as its own stray
+  // one-item group — that drift is exactly how a variant item ends up
+  // looking "misfiled" even though someone did mean to group it correctly.
+  // When a normalized match is found, snap to that group's exact existing
+  // spelling so the group stays single-spelled going forward.
+  const target = normSubHeadDisplay(trimmed);
+  const siblings = state.items.filter(x => x.id !== itemId && x.cat === it.cat && x.subHead && normSubHeadDisplay(x.subHead) === target);
+  const canonical = siblings.length ? siblings[0].subHead : trimmed;
   let newSortOrder;
   if (siblings.length) {
     newSortOrder = Math.max(...siblings.map(s => s.sortOrder ?? 0)) + 0.5;
@@ -250,7 +369,7 @@ function setItemSubHead(itemId, newSubHead) {
     const catItems = state.items.filter(x => x.cat === it.cat && x.id !== itemId);
     newSortOrder = catItems.length ? Math.max(...catItems.map(x => x.sortOrder ?? 0)) + 1 : 0;
   }
-  state.items = state.items.map(x => x.id === itemId ? { ...x, subHead: trimmed, sortOrder: newSortOrder } : x);
+  state.items = state.items.map(x => x.id === itemId ? { ...x, subHead: canonical, sortOrder: newSortOrder } : x);
   save.items();
 }
 
@@ -277,8 +396,14 @@ const NAV = [
   {id:'sales-log',  label:'Sales Log',   icon:<SvgIcon d="M4 6h16M4 10h16M4 14h10"/>},
   {id:'deliveries', label:'Deliveries',  icon:<SvgIcon d="M1 3h15v13H1zM16 8h4l3 3v5h-7V8z" d2="M5.5 21a2.5 2.5 0 100-5 2.5 2.5 0 000 5zM18.5 21a2.5 2.5 0 100-5 2.5 2.5 0 000 5z"/>},
   {id:'purch-log',  label:'Purchases',   icon:<SvgIcon d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" stroke={false}/>},
+  {id:'team',       label:'Team',        icon:<SvgIcon d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2" d2="M9 11a4 4 0 100-8 4 4 0 000 8zm8-5a3 3 0 010 6M23 21v-2a4 4 0 00-3-3.87"/>},
   {id:'settings',   label:'Settings',    icon:<SvgIcon d="M12 15a3 3 0 100-6 3 3 0 000 6z" d2="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/>},
 ];
+
+// Modules that expose cost/margin/profit figures or team management — hidden
+// from the nav and blocked (restricted-access message instead of content)
+// for the 'staff' role. See useRole()/computeRole() above.
+const OWNER_ONLY_NAV = new Set(['accounts','reports','insights','team']);
 
 // Curated 4-tab set for the mobile bottom tab bar — a deliberate subset of
 // NAV (not NAV.slice(0,5)), in a fixed order chosen for what's reached most
@@ -1217,6 +1342,27 @@ function buildInvoiceCanvas(sale,party){
   return canvas;
 }
 
+// Normalizes any image (a catalogue photo may be a camera JPEG, HEIC-derived
+// JPEG, etc.) to a PNG Blob before it goes anywhere near the clipboard — same
+// reasoning as buildInvoiceCanvas above: ClipboardItem's image support is
+// most reliable (and in some browsers, the *only* supported image type) for
+// image/png, so every clipboard-bound image in this app is funneled through
+// a canvas re-encode rather than trusting the source blob's native type.
+function blobToPngBlob(blob){
+  return new Promise((resolve,reject)=>{
+    const img=new Image();
+    const url=URL.createObjectURL(blob);
+    img.onload=()=>{
+      const canvas=document.createElement('canvas');
+      canvas.width=img.naturalWidth||1; canvas.height=img.naturalHeight||1;
+      canvas.getContext('2d').drawImage(img,0,0);
+      canvas.toBlob(b=>{ URL.revokeObjectURL(url); b?resolve(b):reject(new Error('toBlob failed')); },'image/png');
+    };
+    img.onerror=()=>{ URL.revokeObjectURL(url); reject(new Error('image decode failed')); };
+    img.src=url;
+  });
+}
+
 // ── INVOICE MODAL ─────────────────────────────────────────────────────────────
 function InvoiceModal({sale,party,onClose,viewOnly=false}){
   const[ph,setPh]=useState(party?.phone||'');
@@ -1556,7 +1702,16 @@ function SaleEntry({onSaved,mode='sale'}){
     setSaving(true);
     const allItems=[...lines,...freightLine].map(l=>({itemId:l.itemId,itemName:l.itemName,customerName:l.customerName,dispatchName:l.dispatchName,qty:l.qty,rate:l.rate,amount:l.qty*l.rate,warranty:l.warranty,bundledJaali:l.bundledJaali}));
     if(mode==='order'){
-      const order={id:uid('ORD'),date,partyId,partyName:sel?.name||'',transport,bilty,freightMode:fMode,freightAmt:Number(fAmt)||0,freightAddToInv:fAddToInv,creditDays:credit,items:allItems,total,status:'pending',createdAt:new Date().toISOString()};
+      // availability/linkedPoId drive the Dashboard order-status board's
+      // backorder linkage (see computeOrderLineStatus) — computed once at
+      // order-creation time from current stock so it doesn't silently change
+      // later if stock moves for unrelated reasons.
+      const orderItems=allItems.map(l=>{
+        const it=state.items.find(x=>x.id===l.itemId);
+        const outOfStock=l.itemId&&(it?.stock||0)<l.qty;
+        return {...l,availability:outOfStock?'outOfStock':'available',linkedPoId:null};
+      });
+      const order={id:uid('ORD'),date,partyId,partyName:sel?.name||'',transport,bilty,freightMode:fMode,freightAmt:Number(fAmt)||0,freightAddToInv:fAddToInv,creditDays:credit,items:orderItems,total,status:'pending',createdAt:new Date().toISOString()};
       state.orders=[order,...state.orders];save.orders();
       if(transport&&sel)recordCityTransport(sel.city,transport);
       setSaving(false);
@@ -1920,11 +2075,13 @@ function ReviewOrderModal({order,onClose,onSaved}){
 }
 
 // ── NEW ORDER MODULE ──────────────────────────────────────────────────────────
-function OrdersModule(){
+function OrdersModule({navigate}){
   const[dispatchOrder,setDispatchOrder]=useState(null);
   const[reviewOrder,setReviewOrder]=useState(null);
   const[doneSale,setDoneSale]=useState(null);
+  const[linkCtx,setLinkCtx]=useState(null); // {orderId,itemIdx,itemId,itemName}
   const[_fv,_setFv]=useState(0); const forceUpdate=()=>_setFv(v=>v+1);
+  const{toast,TC}=useToast();
 
   const pending=useMemo(()=>state.orders.filter(o=>o.status!=='invoiced').sort((a,b)=>b.createdAt.localeCompare(a.createdAt)),[state.orders.length,_fv]);
 
@@ -1933,7 +2090,19 @@ function OrdersModule(){
     setReviewOrder(o);
   };
 
+  // Backorder linkage — sets linkedPoId on one line of one order; the line's
+  // displayed status then recomputes live from that PO's status (see
+  // computeOrderLineStatus) with no further sync needed.
+  const linkPo=(orderId,itemIdx,poId)=>{
+    state.orders=state.orders.map(o=>o.id!==orderId?o:{...o,items:o.items.map((l,j)=>j!==itemIdx?l:{...l,linkedPoId:poId})});
+    save.orders();
+    setLinkCtx(null);
+    forceUpdate();
+    toast('Linked to Purchase Order ✓');
+  };
+
   return <div>
+    <TC/>
     <SectionHead title="Sales Order" sub="Punch the order, send it to dispatch, then create the invoice once it's out the door"/>
     <SaleEntry mode="order" onSaved={order=>{forceUpdate();setDispatchOrder(order);}}/>
 
@@ -1946,14 +2115,20 @@ function OrdersModule(){
           </tr></thead>
           <tbody>
             {pending.map(o=><tr key={o.id} style={{borderBottom:`1px solid ${C.bdr}`}}>
-              <td style={{padding:'9px 14px',whiteSpace:'nowrap',color:C.sub}}>{fmtD(o.date)}</td>
-              <td style={{padding:'9px 14px',fontWeight:600,color:C.txt}}>{o.partyName}</td>
+              <td style={{padding:'9px 14px',whiteSpace:'nowrap',color:C.sub,verticalAlign:'top'}}>{fmtD(o.date)}</td>
+              <td style={{padding:'9px 14px',fontWeight:600,color:C.txt,verticalAlign:'top'}}>{o.partyName}</td>
               <td style={{padding:'9px 14px',fontSize:12,color:C.sub}}>
-                {(o.items||[]).slice(0,2).map((x,j)=><span key={j} style={{display:'block'}}>{(x.customerName||x.itemName)} ×{x.qty}</span>)}
-                {(o.items||[]).length>2&&<span style={{color:C.muted,fontSize:11}}>+{o.items.length-2} more</span>}
+                {(o.items||[]).map((x,j)=><div key={j} style={{marginBottom:4}}>
+                  <span style={{display:'block'}}>{(x.customerName||x.itemName)} ×{x.qty}</span>
+                  {x.availability==='outOfStock'&&(()=>{const st=computeOrderLineStatus(x);return <div style={{display:'flex',alignItems:'center',gap:6,marginTop:2}}>
+                    <Badge v={st.label} color={st.color}/>
+                    {!x.linkedPoId&&<button onClick={()=>setLinkCtx({orderId:o.id,itemIdx:j,itemId:x.itemId,itemName:x.customerName||x.itemName})}
+                      style={{border:'none',background:'none',color:C.blue,cursor:'pointer',fontSize:11,fontWeight:700,textDecoration:'underline',padding:0}}>Link to PO</button>}
+                  </div>;})()}
+                </div>)}
               </td>
-              <td style={{padding:'9px 14px',textAlign:'right',fontWeight:700,color:C.blue}}>{fmt(o.total)}</td>
-              <td style={{padding:'9px 14px',textAlign:'center'}}><Btn onClick={()=>openReview(o)} size="sm" variant="success">✅ Dispatched</Btn></td>
+              <td style={{padding:'9px 14px',textAlign:'right',fontWeight:700,color:C.blue,verticalAlign:'top'}}>{fmt(o.total)}</td>
+              <td style={{padding:'9px 14px',textAlign:'center',verticalAlign:'top'}}><Btn onClick={()=>openReview(o)} size="sm" variant="success">✅ Dispatched</Btn></td>
             </tr>)}
           </tbody>
         </table>
@@ -1963,7 +2138,45 @@ function OrdersModule(){
     {dispatchOrder&&<DispatchPreviewModal order={dispatchOrder} onClose={()=>{setDispatchOrder(null);forceUpdate();}}/>}
     {reviewOrder&&<ReviewOrderModal order={reviewOrder} onClose={()=>setReviewOrder(null)} onSaved={sale=>{setReviewOrder(null);forceUpdate();setDoneSale(sale);}}/>}
     {doneSale&&<InvoiceModal sale={doneSale} party={state.parties.find(p=>p.id===doneSale.partyId)||{name:doneSale.partyName,phone:''}} onClose={()=>setDoneSale(null)}/>}
+    {linkCtx&&<LinkPurchaseOrderModal itemId={linkCtx.itemId} itemName={linkCtx.itemName}
+      onPick={poId=>linkPo(linkCtx.orderId,linkCtx.itemIdx,poId)}
+      onClose={()=>setLinkCtx(null)}
+      onCreateNew={()=>{setLinkCtx(null);navigate?.('purch-log');toast('Book the Purchase Order here, then come back to Sales Order to link it');}}/>}
   </div>;
+}
+
+// Picker for backorder linkage — open (not-yet-received) Purchase Orders
+// that already carry this item, so an out-of-stock sales-order line can be
+// pointed at the real PO restocking it. Creating a brand-new PO inline here
+// would mean re-embedding the whole PurchaseEntry form a second time (it's
+// already embedded once at the top of PurchLog) just to recover the new
+// purchase's id — instead this hands off to the existing Purchases screen
+// and the user comes back to link afterward; called out as a deliberate
+// scope trim, not an oversight.
+function LinkPurchaseOrderModal({itemId,itemName,onPick,onClose,onCreateNew}){
+  const candidates=useMemo(()=>state.purchases.filter(p=>getPurchaseStatus(p)!=='received'&&(p.items||[]).some(l=>l.itemId===itemId))
+    .sort((a,b)=>(b.createdAt||'').localeCompare(a.createdAt||'')),[itemId,state.purchases.length]);
+  return <Modal title={'Link "'+itemName+'" to a Purchase Order'} onClose={onClose} width={520}>
+    {candidates.length===0
+      ?<div style={{padding:'10px 0',color:C.sub,fontSize:13}}>No open Purchase Orders have this item yet.</div>
+      :<div style={{display:'flex',flexDirection:'column',gap:8,marginBottom:14}}>
+        {candidates.map(p=>{
+          const line=(p.items||[]).find(l=>l.itemId===itemId);
+          const st=getPurchaseStatus(p);
+          return <div key={p.id} style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'9px 12px',borderRadius:7,border:`1px solid ${C.bdr}`}}>
+            <div>
+              <div style={{fontWeight:600,color:C.txt,fontSize:13}}>{p.partyName} · {fmtD(p.date)}</div>
+              <div style={{fontSize:11,color:C.sub}}>Qty {line?.qty||0} · <Badge v={st==='dispatched'?'Dispatched':st==='ordered'?'Ordered':st} color={st==='dispatched'?'amber':'blue'}/>{p.expectedDate?' · exp '+fmtD(p.expectedDate):''}</div>
+            </div>
+            <Btn onClick={()=>onPick(p.id)} size="sm">Link</Btn>
+          </div>;
+        })}
+      </div>}
+    <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',borderTop:`1px solid ${C.bdr}`,paddingTop:12}}>
+      <span style={{fontSize:12,color:C.sub}}>Don't see it?</span>
+      <Btn onClick={onCreateNew} variant="secondary" size="sm">+ Book a new Purchase Order</Btn>
+    </div>
+  </Modal>;
 }
 
 function EditSaleModal({sale,onClose,onSaved}){
@@ -1980,15 +2193,21 @@ function EditSaleModal({sale,onClose,onSaved}){
   const[input,setInput]=useState('');
   const[si,setSi]=useState(0);
   const[draft,setDraft]=useState({itemId:'',iName:'',cName:'',peti:1,qty:'',rate:''});
+  const[swapIdx,setSwapIdx]=useState(null);
+  const[swapQ,setSwapQ]=useState('');
+  const[swapSi,setSwapSi]=useState(0);
   const{toast,TC}=useToast();
   const custs=useMemo(()=>state.parties.filter(p=>p.type==='customer'),[state.parties.length]);
   const selParty=useMemo(()=>custs.find(p=>p.id===partyId),[custs,partyId]);
   const psugg=useMemo(()=>pq.length<1?[]:custs.filter(p=>p.name.toLowerCase().includes(pq.toLowerCase())).slice(0,6),[custs,pq]);
   const total=useMemo(()=>lines.reduce((s,l)=>s+(Number(l.qty)||0)*(Number(l.rate)||0),0),[lines]);
   useEffect(()=>{if(step!=='item'){setTimeout(()=>{const el=document.getElementById('edit-step-input');if(el)el.focus();},30);}else{setTimeout(()=>{const el=document.getElementById('edit-item-search');if(el)el.focus();},30);}  },[step,draft.iName]);
-  const isugg=useMemo(()=>{const q=input.trim().toLowerCase();if(!q||step!=='item')return[];const words=q.split(/[\s,]+/).filter(Boolean);return state.items.filter(it=>it.active!==false).map(it=>{const cn=(it.customer||it.internal||'').toLowerCase();const hay=[cn,(it.internal||'').toLowerCase(),(it.cat||'').toLowerCase()].join(' ');let sc=0;for(const w of words){if(cn.includes(w))sc+=10;if(hay.includes(w))sc+=4;if(cn.startsWith(w))sc+=10;}if(cn.includes(q))sc+=15;return{it,sc};}).filter(x=>x.sc>0).sort((a,b)=>b.sc-a.sc).slice(0,8).map(x=>x.it);},[input,step]);
+  const searchItems=q=>{q=q.trim().toLowerCase();if(!q)return[];const words=q.split(/[\s,]+/).filter(Boolean);return state.items.filter(it=>it.active!==false).map(it=>{const cn=(it.customer||it.internal||'').toLowerCase();const hay=[cn,(it.internal||'').toLowerCase(),(it.cat||'').toLowerCase()].join(' ');let sc=0;for(const w of words){if(cn.includes(w))sc+=10;if(hay.includes(w))sc+=4;if(cn.startsWith(w))sc+=10;}if(cn.includes(q))sc+=15;return{it,sc};}).filter(x=>x.sc>0).sort((a,b)=>b.sc-a.sc).slice(0,8).map(x=>x.it);};
+  const isugg=useMemo(()=>step==='item'?searchItems(input):[],[input,step]);
+  const swapSugg=useMemo(()=>swapIdx===null?[]:searchItems(swapQ),[swapQ,swapIdx]);
   const pickItem=it=>{const rate=selParty?getBestRate(selParty.name,it.internal||'',it.customer||'',it.sale):it.sale;setDraft({itemId:it.id,iName:it.internal||it.name||'',cName:it.customer||it.internal||'',peti:it.peti,qty:'',rate});setStep('qty');setInput('');setSi(0);};
   const commit=()=>{const qty=parseQty(draft.qty,draft.peti);if(isNaN(qty)||qty<=0)return toast('Invalid qty','error');setLines(p=>[...p,{id:uid('EL'),itemId:draft.itemId,itemName:draft.iName,customerName:draft.cName,qty,rate:Number(draft.rate)||0}]);setDraft({itemId:'',iName:'',cName:'',peti:1,qty:'',rate:''});setStep('item');setInput('');setSi(0);};
+  const swapItem=it=>{const i=swapIdx;if(i==null)return;const rate=selParty?getBestRate(selParty.name,it.internal||'',it.customer||'',it.sale):it.sale;setLines(p=>p.map((l,j)=>j!==i?l:{...l,itemId:it.id,itemName:it.internal||it.name||'',customerName:it.customer||it.internal||'',rate}));setSwapIdx(null);setSwapQ('');setSwapSi(0);};
   const onKey=e=>{if(step==='item'){if(e.key==='ArrowDown'){e.preventDefault();setSi(i=>Math.min(i+1,(isugg.length||1)-1));}if(e.key==='ArrowUp'){e.preventDefault();setSi(i=>Math.max(i-1,0));}if(e.key==='Enter'&&isugg.length){e.preventDefault();pickItem(isugg[si]||isugg[0]);}if(e.key==='Escape'){setInput('');setSi(0);}}else if(step==='qty'){if(e.key==='Enter'){e.preventDefault();if(!draft.qty)return;const q=parseQty(draft.qty,draft.peti);if(isNaN(q))return toast('Invalid qty','error');setDraft(d=>({...d,qty:String(q)}));setStep('rate');}if(e.key==='Escape'){setStep('item');setInput('');}}else if(step==='rate'){if(e.key==='Enter'){e.preventDefault();commit();}if(e.key==='Escape'){setStep('qty');}}};
   const editLine=(i,k,v)=>setLines(p=>p.map((l,j)=>j!==i?l:{...l,[k]:k==='qty'||k==='rate'?Number(v)||0:v}));
   const doSave=()=>{
@@ -2055,11 +2274,26 @@ function EditSaleModal({sale,onClose,onSaved}){
           {!lines.length&&<tr><td colSpan={6} style={{padding:'20px',textAlign:'center',color:C.muted}}>No items</td></tr>}
           {lines.map((l,i)=><tr key={l.id} style={{borderBottom:`1px solid ${C.bdr}`}}>
             <td style={{padding:'7px 12px',color:C.muted,fontSize:11}}>{i+1}</td>
-            <td style={{padding:'7px 12px',fontWeight:600,color:C.txt}}>
-              <input value={l.customerName||l.itemName||''} onChange={e=>editLine(i,'customerName',e.target.value)}
-                title="Edit the item name recorded on this sale line"
-                style={{width:'100%',padding:'3px 6px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:12,fontWeight:600,color:C.txt,outline:'none',fontFamily:'inherit',boxSizing:'border-box'}}
-                onFocus={e=>e.target.style.borderColor=C.blue} onBlur={e=>e.target.style.borderColor=C.bdr}/>
+            <td style={{padding:'7px 12px',fontWeight:600,color:C.txt,position:'relative'}}>
+              {swapIdx===i
+                ?<div style={{position:'relative'}}>
+                  <input autoFocus value={swapQ} autoComplete="off"
+                    onChange={e=>{setSwapQ(e.target.value);setSwapSi(0);}}
+                    onKeyDown={e=>{if(e.key==='ArrowDown'){e.preventDefault();setSwapSi(s=>Math.min(s+1,(swapSugg.length||1)-1));}if(e.key==='ArrowUp'){e.preventDefault();setSwapSi(s=>Math.max(s-1,0));}if(e.key==='Enter'&&swapSugg.length){e.preventDefault();swapItem(swapSugg[swapSi]||swapSugg[0]);}if(e.key==='Escape'){setSwapIdx(null);setSwapQ('');}}}
+                    placeholder="Search item to switch to…"
+                    style={{width:'100%',padding:'3px 6px',borderRadius:5,border:`1.5px solid ${C.blue}`,fontSize:12,fontWeight:600,color:C.txt,outline:'none',fontFamily:'inherit',boxSizing:'border-box'}}/>
+                  {swapSugg.length>0&&<div style={{position:'absolute',top:'100%',left:0,right:0,background:C.surf,border:`1px solid ${C.bdr}`,borderRadius:'0 0 8px 8px',zIndex:200,boxShadow:'0 8px 24px rgba(0,0,0,0.12)',overflow:'hidden',maxHeight:180,overflowY:'auto'}}>
+                    {swapSugg.map((it,si2)=><div key={it.id} onMouseDown={()=>swapItem(it)} onMouseEnter={()=>setSwapSi(si2)}
+                      style={{display:'flex',alignItems:'center',padding:'7px 12px',cursor:'pointer',fontSize:12,background:si2===swapSi?C.blueSoft:'transparent',borderBottom:si2<swapSugg.length-1?`1px solid ${C.bdr}`:'none'}}>
+                      <div style={{flex:1}}><span style={{fontWeight:600,color:C.txt}}>{it.internal||it.name}</span><span style={{fontSize:10,color:C.sub,marginLeft:6}}>{it.cat}</span></div>
+                    </div>)}
+                  </div>}
+                  <button onClick={()=>{setSwapIdx(null);setSwapQ('');}} style={{position:'absolute',right:-2,top:-22,background:'none',border:'none',cursor:'pointer',color:C.muted,fontSize:11}}>cancel</button>
+                </div>
+                :<div style={{display:'flex',alignItems:'center',gap:6}}>
+                  <span style={{flex:1}}>{l.customerName||l.itemName||''}</span>
+                  <button onClick={()=>{setSwapIdx(i);setSwapQ('');setSwapSi(0);}} title="Swap this line to a different item" style={{background:'none',border:`1px solid ${C.bdr}`,borderRadius:5,cursor:'pointer',color:C.sub,fontSize:11,padding:'2px 6px',whiteSpace:'nowrap'}}>⇄ Change</button>
+                </div>}
             </td>
             <td style={{padding:'7px 12px',textAlign:'right'}}><input value={l.qty} onChange={e=>editLine(i,'qty',e.target.value)} type="number" style={{width:60,padding:'3px 7px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:12,textAlign:'right',outline:'none',fontFamily:'inherit'}}/></td>
             <td style={{padding:'7px 12px',textAlign:'right'}}><input value={l.rate} onChange={e=>editLine(i,'rate',e.target.value)} type="number" style={{width:75,padding:'3px 7px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:12,textAlign:'right',outline:'none',fontFamily:'inherit'}}/></td>
@@ -2080,7 +2314,7 @@ function EditSaleModal({sale,onClose,onSaved}){
       </div>
     </div>
     <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-      <button onClick={()=>{if(window.confirm('Delete this sale?')){state.sales=state.sales.filter(s=>s.id!==sale.id);save.sales();(sale.items||[]).forEach(l=>adjustStock(l.itemId,l.qty));onSaved?.();onClose();toast('Deleted');}}} style={{padding:'7px 14px',borderRadius:7,border:`1px solid ${C.red}`,background:C.redSoft,color:C.red,cursor:'pointer',fontSize:12,fontWeight:600,fontFamily:'inherit'}}>🗑 Delete</button>
+      <button onClick={()=>{if(!requireOwner(toast))return;if(window.confirm('Delete this sale?')){state.sales=state.sales.filter(s=>s.id!==sale.id);save.sales();(sale.items||[]).forEach(l=>adjustStock(l.itemId,l.qty));onSaved?.();onClose();toast('Deleted');}}} style={{padding:'7px 14px',borderRadius:7,border:`1px solid ${C.red}`,background:C.redSoft,color:C.red,cursor:'pointer',fontSize:12,fontWeight:600,fontFamily:'inherit'}}>🗑 Delete</button>
       <div style={{display:'flex',gap:8}}>
         <Btn onClick={onClose} variant="secondary">Cancel</Btn>
         <Btn onClick={doSave} disabled={!lines.length} icon="💾">Save Changes</Btn>
@@ -2285,6 +2519,7 @@ function EditReturnModal({sale,onClose,onSaved}){
   };
 
   const doDelete=()=>{
+    if(!requireOwner(toast))return;
     if(!window.confirm('Delete this return? Inventory changes it made will be reversed.'))return;
     (sale.items||[]).forEach(old=>{
       if(!old.itemId)return;
@@ -3114,6 +3349,97 @@ function EditTxnModal({txn,onClose,onSaved}) {
   </Modal>;
 }
 
+// Shown in place of Accounts/Reports/Insights/Team for staff accounts —
+// small inline placeholder rather than hiding the route entirely, so a
+// staff member who lands here (e.g. stale bookmark/hash) gets an explanation
+// instead of a blank screen.
+function RestrictedAccess(){
+  return <div style={{display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',
+    gap:10,padding:'60px 20px',textAlign:'center'}}>
+    <div style={{fontSize:32}}>🔒</div>
+    <div style={{fontSize:15,fontWeight:700,color:C.txt}}>Owners only</div>
+    <div style={{fontSize:13,color:C.sub,maxWidth:320}}>This section is restricted to the account owner. Ask an owner if you need access.</div>
+  </div>;
+}
+
+// Owner-only: manage who can sign in and at what role. Actual login
+// creation (Supabase Auth user) must still happen once in the Supabase
+// dashboard — the anon key the app ships with cannot create auth users —
+// this screen only manages the role row that governs what a signed-in
+// email can see, kept in sync via the normal save.users()/kv_store path.
+function TeamModule(){
+  const {toast,TC} = useToast();
+  const mobile = useIsMobile();
+  const [,setTick] = useState(0);
+  const bump = () => setTick(t=>t+1);
+  const [email,setEmail] = useState('');
+  const [role,setRole] = useState('staff');
+
+  const addUser = () => {
+    const e = email.trim().toLowerCase();
+    if (!e) { toast('Enter an email','error'); return; }
+    if (state.users.some(u=>(u.email||'').toLowerCase()===e)) { toast('Already added','error'); return; }
+    state.users = [...state.users, { id: uid('USR'), email: e, role, createdAt: new Date().toISOString() }];
+    save.users();
+    setEmail(''); setRole('staff');
+    toast('Team member added');
+    bump();
+  };
+  const removeUser = (id) => {
+    const u = state.users.find(x=>x.id===id);
+    if (u && u.role==='owner' && state.users.filter(x=>x.role==='owner').length<=1) {
+      toast('Cannot remove the last owner','error'); return;
+    }
+    state.users = state.users.filter(x=>x.id!==id);
+    save.users();
+    bump();
+  };
+  const changeRole = (id, newRole) => {
+    const u = state.users.find(x=>x.id===id);
+    if (u && u.role==='owner' && newRole!=='owner' && state.users.filter(x=>x.role==='owner').length<=1) {
+      toast('Cannot demote the last owner','error'); return;
+    }
+    state.users = state.users.map(x=>x.id===id?{...x,role:newRole}:x);
+    save.users();
+    bump();
+  };
+
+  return <div>
+    <TC/>
+    <SectionHead title="Team" sub="Owner vs Staff access for this account"/>
+
+    <div style={{background:C.surf,border:`1px solid ${C.bdr}`,borderRadius:8,padding:16,marginBottom:18}}>
+      <div style={{fontSize:12,fontWeight:700,color:C.sub,marginBottom:8}}>HOW TO ADD A STAFF LOGIN</div>
+      <ol style={{margin:0,paddingLeft:18,fontSize:12.5,color:C.sub,lineHeight:1.7}}>
+        <li>In the Supabase dashboard, go to <b>Authentication → Users → Add user</b> and create a login (email + password) for the staff member. This is a one-time step per person and must be done from the dashboard — the app itself cannot create logins.</li>
+        <li>Come back here and add their email below with role <b>Staff</b>. They can then sign in with the password you set for them.</li>
+      </ol>
+    </div>
+
+    <Grid2>
+      <Inp label="Email" value={email} onChange={setEmail} placeholder="staff@example.com"/>
+      <Sel label="Role" value={role} onChange={setRole} options={[{value:'staff',label:'Staff'},{value:'owner',label:'Owner'}]}/>
+    </Grid2>
+    <div style={{marginTop:12}}><Btn onClick={addUser}>+ Add team member</Btn></div>
+
+    <div style={{marginTop:24}}>
+      <SectionHead title="Members" sub={`${state.users.length} total`}/>
+      <CardTable
+        mobile={mobile}
+        emptyLabel="No team members yet — this account is open to anyone who signs in."
+        keyFn={u=>u.id}
+        rows={state.users}
+        columns={[
+          {key:'email',label:'Email',render:u=>u.email},
+          {key:'role',label:'Role',render:u=><Sel value={u.role} onChange={r=>changeRole(u.id,r)} options={[{value:'staff',label:'Staff'},{value:'owner',label:'Owner'}]}/>},
+          {key:'createdAt',label:'Added',render:u=>u.createdAt?fmtD(u.createdAt.slice(0,10)):'—'},
+          {key:'actions',label:'',align:'right',render:u=><Btn variant="danger" size="sm" onClick={()=>removeUser(u.id)}>Remove</Btn>},
+        ]}
+      />
+    </div>
+  </div>;
+}
+
 function AccountsModule() {
   // ── FORM STATE — category/account/date persist between saves ──────────────
   const [categoryId,setCategoryId] = useState('party_receipt');
@@ -3383,6 +3709,7 @@ function AccountsModule() {
   };
 
   const deleteTxn = id => {
+    if(!requireOwner(toast))return;
     if(!window.confirm('Delete?')) return;
     state.txns=state.txns.filter(t=>t.id!==id); save.txns();
     state.payments=state.payments.filter(p=>p.txnId!==id); save.payments();
@@ -3819,7 +4146,7 @@ function AccountsModule() {
           }},
           {key:'actions',label:'',cardLabel:'Actions',render:t=>
             <div style={{display:'flex',gap:6,justifyContent:'flex-end'}}>
-              <Btn onClick={()=>setEditTxn(t)} variant="ghost" size="sm">Edit</Btn>
+              <Btn onClick={()=>{if(requireOwner(toast))setEditTxn(t);}} variant="ghost" size="sm">Edit</Btn>
               <Btn onClick={()=>deleteTxn(t.id)} variant="ghost" size="sm">Delete</Btn>
             </div>},
         ]}/>
@@ -4043,6 +4370,86 @@ function Dashboard({navigate}){
   const followupsUpcoming=state.followups.filter(f=>f.status==='open'&&f.followUpDate&&f.followUpDate>t).sort((a,b)=>a.followUpDate.localeCompare(b.followUpDate)).slice(0,5);
   const markDone=id=>{state.followups=state.followups.map(f=>f.id===id?{...f,status:'done'}:f);save.followups();forceUpdate(n=>n+1);};
 
+  // ── Order-status board (linked backorder-style, Feature #6) ─────────────
+  // Sales-order lines still waiting on stock (availability==='outOfStock'),
+  // across every non-invoiced Sales Order — status per line is always
+  // recomputed live from the linked PO (computeOrderLineStatus), never
+  // stored, so a PO update here or in OrdersModule/PurchLog shows up
+  // instantly with no separate sync step.
+  const pendingOrderLines=useMemo(()=>{
+    const rows=[];
+    state.orders.filter(o=>o.status!=='invoiced').forEach(o=>{
+      (o.items||[]).forEach((l,idx)=>{
+        if(l.availability==='outOfStock')rows.push({order:o,line:l,idx});
+      });
+    });
+    return rows;
+  },[state.orders.length,_fvD]);
+  // Open (not-yet-received) Purchase Orders — the other half of the board.
+  const pendingPurchases=useMemo(()=>state.purchases.filter(p=>getPurchaseStatus(p)!=='received')
+    .sort((a,b)=>(b.createdAt||'').localeCompare(a.createdAt||'')),[state.purchases.length,_fvD]);
+  const[dispatchingId,setDispatchingId]=useState(null);
+  const[expectedDraft,setExpectedDraft]=useState('');
+  const confirmDispatch=id=>{
+    markPurchaseDispatched(id,expectedDraft||null);
+    setDispatchingId(null);setExpectedDraft('');
+    forceUpdate(n=>n+1);
+  };
+  const doMarkReceived=id=>{
+    markPurchaseReceived(id);
+    forceUpdate(n=>n+1);
+  };
+
+  const pendingOrdersBlock=<div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,overflow:'hidden'}}>
+    <div style={{padding:'12px 16px',borderBottom:`1px solid ${C.bdr}`,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+      <h3 style={{margin:0,fontSize:14,fontWeight:700,color:C.txt}}>📲 Pending Sales Orders · {pendingOrderLines.length} waiting on stock</h3>
+      <button onClick={()=>navigate('orders')} style={{background:'none',border:'none',cursor:'pointer',fontSize:12,color:C.blue,fontWeight:600}}>All →</button>
+    </div>
+    {pendingOrderLines.length===0
+      ?<div style={{padding:'20px',textAlign:'center',color:C.muted,fontSize:13}}>No sales orders waiting on stock ✓</div>
+      :pendingOrderLines.slice(0,8).map(({order,line},i)=>{
+        const st=computeOrderLineStatus(line);
+        return <div key={order.id+'_'+i} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'8px 16px',borderBottom:`1px solid ${C.bdr}`,gap:10}}>
+          <div style={{minWidth:0}}>
+            <div style={{fontWeight:600,color:C.txt,fontSize:12}}>{order.partyName}</div>
+            <div style={{fontSize:11,color:C.sub,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{line.customerName||line.itemName} ×{line.qty}</div>
+          </div>
+          <Badge v={st.label} color={st.color}/>
+        </div>;
+      })}
+  </div>;
+
+  const pendingPurchasesBlock=<div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,overflow:'hidden'}}>
+    <div style={{padding:'12px 16px',borderBottom:`1px solid ${C.bdr}`,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+      <h3 style={{margin:0,fontSize:14,fontWeight:700,color:C.txt}}>🚚 Pending Purchase Orders · {pendingPurchases.length}</h3>
+      <button onClick={()=>navigate('purch-log')} style={{background:'none',border:'none',cursor:'pointer',fontSize:12,color:C.blue,fontWeight:600}}>All →</button>
+    </div>
+    {pendingPurchases.length===0
+      ?<div style={{padding:'20px',textAlign:'center',color:C.muted,fontSize:13}}>No open purchase orders ✓</div>
+      :pendingPurchases.slice(0,8).map(p=>{
+        const st=getPurchaseStatus(p);
+        return <div key={p.id} style={{padding:'8px 16px',borderBottom:`1px solid ${C.bdr}`}}>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:10}}>
+            <div style={{minWidth:0}}>
+              <div style={{fontWeight:600,color:C.txt,fontSize:12}}>{p.partyName}</div>
+              <div style={{fontSize:11,color:C.sub,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{(p.items||[]).slice(0,2).map(l=>l.customerName||l.itemName).join(', ')}{(p.items||[]).length>2?' +'+(p.items.length-2):''}</div>
+            </div>
+            <Badge v={st==='dispatched'?'Dispatched'+(p.expectedDate?' · exp '+fmtD(p.expectedDate):''):'Ordered'} color={st==='dispatched'?'amber':'blue'}/>
+          </div>
+          <div style={{display:'flex',gap:6,marginTop:6,flexWrap:'wrap'}}>
+            {st==='ordered'&&(dispatchingId===p.id
+              ?<>
+                <input type="date" value={expectedDraft} onChange={e=>setExpectedDraft(e.target.value)} style={{padding:'3px 6px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:11,fontFamily:'inherit'}}/>
+                <Btn onClick={()=>confirmDispatch(p.id)} size="sm" variant="amber">Confirm Dispatched</Btn>
+                <Btn onClick={()=>{setDispatchingId(null);setExpectedDraft('');}} size="sm" variant="ghost">Cancel</Btn>
+              </>
+              :<Btn onClick={()=>{setDispatchingId(p.id);setExpectedDraft(p.expectedDate||'');}} size="sm" variant="secondary">Mark Dispatched</Btn>)}
+            <Btn onClick={()=>doMarkReceived(p.id)} size="sm" variant="success">Mark Received</Btn>
+          </div>
+        </div>;
+      })}
+  </div>;
+
   const followupsBlock=<div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,overflow:'hidden'}}>
     <div style={{padding:'12px 16px',borderBottom:`1px solid ${C.bdr}`,background:'#FFF8C5',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
       <h3 style={{margin:0,fontSize:14,fontWeight:700,color:C.amberBright}}>📋 Follow-ups · {followupsDue.length} due</h3>
@@ -4087,7 +4494,7 @@ function Dashboard({navigate}){
   const quickActionsBlock=<div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,padding:'14px 16px'}}>
     <h3 style={{margin:'0 0 10px',fontSize:14,fontWeight:700,color:C.txt}}>Quick Actions</h3>
     <div style={{display:'grid',gridTemplateColumns:mobile?'repeat(4,1fr)':'1fr 1fr',gap:8}}>
-      {[{l:'New Sale',i:'🧾',m:'sale',c:C.blue},{l:'Outstanding',i:'⏰',m:'outstanding',c:C.red},{l:'Parties',i:'🏪',m:'parties',c:C.green},{l:'Inventory',i:'📦',m:'items',c:C.purple}].map(a=>(
+      {[{l:'New Sale',i:'🧾',m:'sale',c:C.blue},{l:'New Sale Order',i:'📲',m:'orders',c:C.amber},{l:'Outstanding',i:'⏰',m:'outstanding',c:C.red},{l:'Parties',i:'🏪',m:'parties',c:C.green},{l:'Inventory',i:'📦',m:'items',c:C.purple}].map(a=>(
         mobile
           ?<button key={a.m} onClick={()=>navigate(a.m)} style={{display:'flex',flexDirection:'column',alignItems:'center',gap:4,padding:'10px 4px',borderRadius:7,border:`1px solid ${a.c}20`,background:a.c+'08',cursor:'pointer',fontSize:10,fontWeight:600,color:a.c,fontFamily:'inherit'}}>
             <span style={{fontSize:19}}>{a.i}</span>{a.l}
@@ -4120,12 +4527,18 @@ function Dashboard({navigate}){
         {quickActionsBlock}
         {followupsBlock}
         {topOutstandingBlock}
+        {pendingOrdersBlock}
+        {pendingPurchasesBlock}
       </div>
       :<div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:14,alignItems:'start'}}>
-        {followupsBlock}
+        <div style={{display:'flex',flexDirection:'column',gap:12}}>
+          {followupsBlock}
+          {pendingOrdersBlock}
+        </div>
         <div style={{display:'flex',flexDirection:'column',gap:12}}>
           {topOutstandingBlock}
           {quickActionsBlock}
+          {pendingPurchasesBlock}
         </div>
       </div>}
   </div>;
@@ -4463,6 +4876,28 @@ function RepairedInventory(){
   </div>;
 }
 
+// Read-only audit trail of every moveItemStock() transfer (see MoveStockModal
+// above) — surfaces the reason text captured at the time of the transfer so a
+// stock-count correction between two items is explainable later, not silent.
+function StockAdjustmentLog(){
+  const mobile=useIsMobile();
+  const rows=[...state.stockAdjustments].sort((a,b)=>(b.createdAt||'').localeCompare(a.createdAt||''));
+  const columns=[
+    {key:'date',label:'Date',render:r=>fmtD(r.date)},
+    {key:'from',label:'From Item',render:r=><span style={{color:C.red,fontWeight:600}}>{r.fromItemName||'—'}</span>},
+    {key:'to',label:'To Item',render:r=><span style={{color:C.green,fontWeight:600}}>{r.toItemName||'—'}</span>},
+    {key:'qty',label:'Qty',align:'right',render:r=><span style={{fontWeight:700,color:C.txt}}>{r.qty||0}</span>},
+    {key:'reason',label:'Reason',render:r=><span style={{color:C.sub}}>{r.reason||'—'}</span>},
+  ];
+  return <div>
+    <SectionHead title="Stock Adjustments" sub={`${rows.length} adjustment${rows.length===1?'':'s'} logged`}/>
+    <div style={{fontSize:12,color:C.sub,marginBottom:12}}>Every stock transfer between two items (via "Move" in Inventory) is logged here with the reason given, so a correction is always explainable later.</div>
+    <div style={{background:mobile?'transparent':C.surf,borderRadius:8,border:mobile?'none':`1px solid ${C.bdr}`,overflow:'hidden'}}>
+      <CardTable mobile={mobile} columns={columns} rows={rows} keyFn={r=>r.id} emptyLabel="No stock adjustments yet"/>
+    </div>
+  </div>;
+}
+
 function ItemNamingEditor(){
   const[items,setItems]=useState(()=>[...state.items].sort((a,b)=>(a.cat||'').localeCompare(b.cat||'')||(a.internal||a.name||'').localeCompare(b.internal||b.name||'')));
   const[search,setSearch]=useState('');
@@ -4524,8 +4959,15 @@ function SubHeadManager(){
   const refresh=()=>setItems([...state.items]);
   const scoped=items.filter(it=>it.active!==false&&(!catF||(it.cat||'Other')===catF));
   const filtered=scoped.filter(it=>!search||(it.internal||it.name||'').toLowerCase().includes(search.toLowerCase()));
-  const sorted=filtered.slice().sort((a,b)=>(a.subHead||'￿').localeCompare(b.subHead||'￿')||(a.sortOrder??Infinity)-(b.sortOrder??Infinity)||(a.internal||'').localeCompare(b.internal||''));
-  const existingSubHeads=useMemo(()=>[...new Set(scoped.map(it=>it.subHead).filter(Boolean))].sort(),[scoped]);
+  const sorted=filtered.slice().sort((a,b)=>normSubHeadDisplay(a.subHead||'￿').localeCompare(normSubHeadDisplay(b.subHead||'￿'))||(a.sortOrder??Infinity)-(b.sortOrder??Infinity)||(a.internal||'').localeCompare(b.internal||''));
+  // Dedupe suggestions by normalized text too, so the datalist offers one
+  // entry per real group instead of a near-duplicate per casing variant
+  // already lurking in the data.
+  const existingSubHeads=useMemo(()=>{
+    const byNorm=new Map();
+    for(const it of scoped){ if(!it.subHead) continue; const k=normSubHeadDisplay(it.subHead); if(!byNorm.has(k))byNorm.set(k,it.subHead); }
+    return[...byNorm.values()].sort();
+  },[scoped]);
   const applySubHead=(it,val)=>{
     setItemSubHead(it.id,val);
     refresh();
@@ -4551,7 +4993,7 @@ function SubHeadManager(){
           {sorted.length===0&&<tr><td colSpan={4} style={{padding:'40px',textAlign:'center',color:C.muted}}>No items match</td></tr>}
           {sorted.map((it,i)=>{
             const prevSubHead=i>0?sorted[i-1].subHead:undefined;
-            const showHeader=(it.subHead||'')!==(prevSubHead||'');
+            const showHeader=normSubHeadDisplay(it.subHead)!==normSubHeadDisplay(prevSubHead);
             return <Fragment key={it.id}>
               {showHeader&&<tr><td colSpan={4} style={{padding:'6px 12px',background:'#EEF2F6',fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5}}>{it.subHead||'Ungrouped'}</td></tr>}
               <tr style={{borderBottom:`1px solid ${C.bdr}`}}>
@@ -4577,6 +5019,7 @@ function SubHeadManager(){
 function ItemDetail({item,onClose}){
   const{toast,TC}=useToast();
   const mobile=useIsMobile();
+  const role=useRole();
   const[search,setSearch]=useState('');
   const[typeF,setTypeF]=useState('all');
   const[page,setPage]=useState(0);
@@ -4655,14 +5098,14 @@ function ItemDetail({item,onClose}){
       </div>
       <div style={{textAlign:'right'}}>
         <Badge v={item.cat||'Other'} color="blue"/>
-        <div style={{fontSize:11,color:C.sub,marginTop:6}}>Sale ₹{item.sale} · Purch ₹{item.purch}{fifo&&Math.abs(fifoAvgRate-(item.purch||0))>0.01?<span style={{color:C.blue}}> · FIFO avg ₹{fifoAvgRate}</span>:null}</div>
+        <div style={{fontSize:11,color:C.sub,marginTop:6}}>Sale ₹{item.sale}{role==='owner'&&<> · Purch ₹{item.purch}{fifo&&Math.abs(fifoAvgRate-(item.purch||0))>0.01?<span style={{color:C.blue}}> · FIFO avg ₹{fifoAvgRate}</span>:null}</>}</div>
       </div>
     </div>
     <div style={{display:'grid',gridTemplateColumns:mobile?'repeat(2,1fr)':'repeat(4,1fr)',gap:8,marginBottom:16}}>
       <Card label="Total Sold" value={metrics.totalSoldQty+' pcs'}/>
       <Card label="Total Purchased" value={metrics.totalPurchQty+' pcs'}/>
-      <Card label="Profit Earned" value={fmt(metrics.profit)} color={metrics.profit>=0?C.blue:C.red}/>
-      <Card label="Avg Profit %" value={metrics.avgProfitPct+'%'}/>
+      {role==='owner'&&<Card label="Profit Earned" value={fmt(metrics.profit)} color={metrics.profit>=0?C.blue:C.red}/>}
+      {role==='owner'&&<Card label="Avg Profit %" value={metrics.avgProfitPct+'%'}/>}
       <Card label="Total Revenue" value={fmt(metrics.totalRevenue)}/>
       <Card label="Share of Business" value={shareOfBusiness+'%'}/>
       <div style={{background:'#F9FAFB',borderRadius:7,padding:'8px 10px',border:`1px solid ${C.bdr}`}}>
@@ -4695,6 +5138,17 @@ function ItemDetail({item,onClose}){
       <Card label="Stock Value" value={fmt(stockValue)}/>
       <Card label="Expected (Incoming)" value={expectedQty+' pcs'} color={expectedQty>0?C.amber:C.txt}/>
     </div>
+    {((item.photos||[]).length>0||(item.specs||[]).length>0||item.dimensions)&&
+      <div style={{background:'#F9FAFB',borderRadius:8,border:`1px solid ${C.bdr}`,padding:'10px 12px',marginBottom:16}}>
+        <div style={{fontSize:9,color:C.sub,textTransform:'uppercase',letterSpacing:.4,marginBottom:8}}>Catalogue</div>
+        {(item.photos||[]).length>0&&<div style={{display:'flex',gap:8,flexWrap:'wrap',marginBottom:(item.specs||[]).length||item.dimensions?10:0}}>
+          {item.photos.map(url=><img key={url} src={url} alt="" style={{width:56,height:56,objectFit:'cover',borderRadius:6,border:`1px solid ${C.bdr}`}}/>)}
+        </div>}
+        <div style={{display:'flex',gap:10,flexWrap:'wrap'}}>
+          {item.dimensions&&<span style={{fontSize:11,color:C.sub}}><b style={{color:C.txt}}>Dimensions:</b> {item.dimensions}</span>}
+          {(item.specs||[]).filter(s=>s.label||s.value).map((s,i)=><span key={i} style={{fontSize:11,color:C.sub}}><b style={{color:C.txt}}>{s.label}:</b> {s.value}</span>)}
+        </div>
+      </div>}
     <div style={{display:'flex',gap:8,marginBottom:10,flexWrap:'wrap'}}>
       <Chip v="All" active={typeF==='all'} onClick={()=>{setTypeF('all');setPage(0);}}/>
       <Chip v="Sales only" active={typeF==='sale'} onClick={()=>{setTypeF('sale');setPage(0);}}/>
@@ -4721,7 +5175,7 @@ function ItemDetail({item,onClose}){
             </span>;
           }},
           {key:'type',label:'Type',align:'center',render:r=><Badge v={r.isReturn?'Return':r.dir==='in'?'Purchased':'Sold'} color={r.isReturn?'amber':r.dir==='in'?'green':'blue'}/>},
-        ]}/>
+        ].filter(c=>role==='owner'||c.key!=='margin')}/>
     </div>
     {totalPages>1&&<div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:8,marginTop:12}}>
       <Btn onClick={()=>setPage(p=>Math.max(0,p-1))} disabled={page===0} variant="secondary" size="sm">← Prev</Btn>
@@ -4739,7 +5193,7 @@ function ItemDetail({item,onClose}){
 // whole row's job is "tap to expand" — opens the full item ledger
 // (ItemDetail), mirroring "clicking the item can expand... clicking further
 // on the item name can show the item ledger" from the request verbatim.
-function MobileInventoryList({items,catF,saleOf,purchOf,marginOf,expectedMap,onOpenLedger,onMove,onMerge,onEdit}){
+function MobileInventoryList({items,catF,saleOf,purchOf,marginOf,expectedMap,onOpenLedger,onMove,onMerge,onEdit,onShare,role}){
   const[expandedId,setExpandedId]=useState(null);
   if(!items.length)return <div style={{padding:'30px 10px',textAlign:'center',color:C.sub,fontSize:13}}>No items match</div>;
   return <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}>
@@ -4747,7 +5201,7 @@ function MobileInventoryList({items,catF,saleOf,purchOf,marginOf,expectedMap,onO
       {items.map((it,i)=>{
         const prev=i>0?items[i-1]:null;
         const showCat=!catF&&(it.cat||'Other')!==(prev?(prev.cat||'Other'):null);
-        const showSub=it.subHead&&it.subHead!==(prev?prev.subHead:undefined);
+        const showSub=it.subHead&&normSubHeadDisplay(it.subHead)!==normSubHeadDisplay(prev?prev.subHead:undefined);
         const expanded=expandedId===it.id;
         const sale=saleOf(it),purch=purchOf(it),{pct:marginPct,perPc:marginPerPc,isReal}=marginOf(it);
         const stock=it.stock||0,expected=expectedMap[it.id]||0,damaged=it.damaged||0;
@@ -4755,24 +5209,25 @@ function MobileInventoryList({items,catF,saleOf,purchOf,marginOf,expectedMap,onO
           {showCat&&<tr><td colSpan={2} style={{padding:'10px 12px',background:C.blueSoft,fontSize:13,fontWeight:800,color:C.blue,borderTop:prev?`2px solid ${C.blue}`:'none'}}>{it.cat||'Other'}</td></tr>}
           {showSub&&<tr><td colSpan={2} style={{padding:'6px 12px',background:'#EEF2F6',fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5}}>{it.subHead}</td></tr>}
           <tr onClick={()=>setExpandedId(expanded?null:it.id)} style={{borderBottom:expanded?'none':`1px solid ${C.bdr}`,cursor:'pointer',background:expanded?'#F9FAFB':'transparent'}}>
-            <td style={{padding:'10px 12px',fontWeight:600,color:C.txt}}>{it.internal||it.name}</td>
+            <td style={{padding:'10px 12px',fontWeight:600,color:C.txt}}>{it.dispatchName||it.internal||it.name}</td>
             <td style={{padding:'10px 12px',textAlign:'right'}}><Badge v={stock+' pc'+(stock===1?'':'s')} color={stock<=0?'red':'gray'}/></td>
           </tr>
           {expanded&&<tr style={{borderBottom:`1px solid ${C.bdr}`}}><td colSpan={2} style={{padding:'4px 12px 12px'}}>
             <div style={{background:C.surf,border:`1px solid ${C.bdr}`,borderRadius:9,padding:12,display:'flex',flexDirection:'column',gap:8}} onClick={e=>e.stopPropagation()}>
-              <span onClick={()=>onOpenLedger(it)} style={{fontWeight:700,color:C.blue,cursor:'pointer',textDecoration:'underline',textDecorationStyle:'dotted',fontSize:14}}>{it.internal||it.name} — View Ledger →</span>
+              <span onClick={()=>onOpenLedger(it)} style={{fontWeight:700,color:C.blue,cursor:'pointer',textDecoration:'underline',textDecorationStyle:'dotted',fontSize:14}}>{it.dispatchName||it.internal||it.name} — View Ledger →</span>
               {it.customer&&<Row label="Customer Name" value={it.customer}/>}
               <Row label="Category" value={<Badge v={it.cat||'Other'} color="blue"/>}/>
               <Row label="Peti Size" value={it.peti+' pcs'}/>
               <Row label="Selling Rate" value={fmt(sale)}/>
-              <Row label="Landed Cost" value={fmt(purch)}/>
-              <Row label="Avg Margin" value={<span>
+              {role==='owner'&&<Row label="Landed Cost" value={fmt(purch)}/>}
+              {role==='owner'&&<Row label="Avg Margin" value={<span>
                 <Badge v={marginPct+'%'} color={marginPct>25?'green':marginPct>15?'amber':'red'}/>
                 <span style={{fontSize:11,color:C.sub,marginLeft:4}}>{fmt(marginPerPc)}/pc{!isReal?' (est.)':''}</span>
-              </span>}/>
+              </span>}/>}
               {damaged>0&&<Row label="Damaged" value={<Badge v={damaged+' pcs'} color="amber"/>}/>}
               {expected>0&&<Row label="Expected" value={<span style={{color:C.amber,fontWeight:700}}>+{expected}</span>}/>}
               <div style={{display:'flex',gap:6,justifyContent:'flex-end',flexWrap:'wrap',marginTop:4}}>
+                <Btn onClick={()=>onShare(it)} variant="ghost" size="sm">Share</Btn>
                 <Btn onClick={()=>onMove(it)} variant="ghost" size="sm">Move</Btn>
                 <Btn onClick={()=>onMerge(it)} variant="ghost" size="sm">Merge</Btn>
                 <Btn onClick={()=>onEdit(it)} variant="ghost" size="sm">Edit</Btn>
@@ -4803,10 +5258,13 @@ function ItemMasters(){
   const[detailItem,setDetailItem]=useState(null);
   const[mergeSrc,setMergeSrc]=useState(null);
   const[moveSrc,setMoveSrc]=useState(null);
+  const[shareItem,setShareItem]=useState(null);
+  const[shareCatalogue,setShareCatalogue]=useState(false);
   const[editSaleId,setEditSaleId]=useState(null);
   const[editSaleVal,setEditSaleVal]=useState('');
   const{toast,TC}=useToast();
   const mobile=useIsMobile();
+  const role=useRole();
   const PAGE=50;
   const cats=useMemo(()=>[...new Set(state.items.map(i=>i.cat))].sort(),[]);
   const catOptions=useMemo(()=>[...new Set([...cats,'Other'])].sort(),[cats]);
@@ -4847,13 +5305,37 @@ function ItemMasters(){
   ).sort((a,b)=>(a.cat||'').localeCompare(b.cat||'')||(a.sortOrder??Infinity)-(b.sortOrder??Infinity)||(a.internal||'').localeCompare(b.internal||''));
   const pageData=filtered.slice(page*PAGE,(page+1)*PAGE);
   const totalPages=Math.ceil(filtered.length/PAGE);
-  const openEdit=it=>{ setForm({...it}); setModal('edit'); };
+  const openEdit=it=>{ setForm({photos:[],specs:[],dimensions:'',...it}); setModal('edit'); };
   const doSave=()=>{
     if(!form.internal?.trim())return toast('Name required','error');
-    if(modal==='add')state.items=[...state.items,{...form,stock:Number(form.stock)||0,damaged:Number(form.damaged)||0,repaired:Number(form.repaired)||0,active:true,id:uid('ITM')}];
+    if(modal==='add')state.items=[...state.items,{...form,stock:Number(form.stock)||0,damaged:Number(form.damaged)||0,repaired:Number(form.repaired)||0,active:true,id:form.id||uid('ITM')}];
     else state.items=state.items.map(x=>x.id===form.id?{...form,stock:Number(form.stock)||0,damaged:Number(form.damaged)||0,repaired:Number(form.repaired)||0}:x);
     save.items();
     setItems([...state.items]); toast(modal==='add'?'Item added':'Updated'); setModal(null);
+  };
+  // ── Catalogue: specs (generic label/value rows) + photos (Feature #2) ──
+  const addSpecRow=()=>setForm(f=>({...f,specs:[...(f.specs||[]),{label:'',value:''}]}));
+  const updateSpecRow=(i,key,v)=>setForm(f=>({...f,specs:(f.specs||[]).map((r,idx)=>idx===i?{...r,[key]:v}:r)}));
+  const removeSpecRow=i=>setForm(f=>({...f,specs:(f.specs||[]).filter((_,idx)=>idx!==i)}));
+  const [uploadingPhoto,setUploadingPhoto]=useState(false);
+  const handlePhotoUpload=async(e)=>{
+    const file=e.target.files?.[0];
+    e.target.value='';
+    if(!file)return;
+    setUploadingPhoto(true);
+    try{
+      const url=await DB.uploadPhoto(file,form.id);
+      setForm(f=>({...f,photos:[...(f.photos||[]),url]}));
+      toast('Photo uploaded ✓');
+    }catch(err){
+      toast(err?.message||'Photo upload failed — is the item-photos Storage bucket set up?','error');
+    }finally{
+      setUploadingPhoto(false);
+    }
+  };
+  const removePhoto=(url)=>{
+    setForm(f=>({...f,photos:(f.photos||[]).filter(u=>u!==url)}));
+    DB.deletePhoto(url); // best-effort — don't block the UI on storage cleanup
   };
   const csvCell=v=>{
     const s=String(v??'');
@@ -4912,7 +5394,9 @@ function ItemMasters(){
     {detailItem&&<ItemDetail item={detailItem} onClose={()=>setDetailItem(null)}/>}
     {mergeSrc&&<MergeItemModal source={mergeSrc} onClose={()=>setMergeSrc(null)} onMerged={()=>{setItems([...state.items]);setMergeSrc(null);}}/>}
     {moveSrc&&<MoveStockModal source={moveSrc} onClose={()=>setMoveSrc(null)} onMoved={()=>{setItems([...state.items]);setMoveSrc(null);}}/>}
-    <SectionHead title="Inventory" sub={`${items.filter(it=>it.active!==false).length} active items`} action={view==='list'?<div style={{display:'flex',gap:8}}><Btn onClick={downloadReport} variant="secondary" icon="⬇">CSV</Btn><Btn onClick={downloadReportPDF} variant="secondary" icon="⬇">PDF</Btn><Btn onClick={()=>{setForm({cat:'Other',peti:1,sale:0,purch:0,active:true});setModal('add');}}>+ Add Item</Btn></div>:null}/>
+    {shareItem&&<ShareItemModal item={shareItem} onClose={()=>setShareItem(null)}/>}
+    {shareCatalogue&&<CatalogueShareModal onClose={()=>setShareCatalogue(false)}/>}
+    <SectionHead title="Inventory" sub={`${items.filter(it=>it.active!==false).length} active items`} action={view==='list'?<div style={{display:'flex',gap:8,flexWrap:'wrap'}}><Btn onClick={()=>setShareCatalogue(true)} variant="secondary" icon="📲">Share Catalogue</Btn><Btn onClick={downloadReport} variant="secondary" icon="⬇">CSV</Btn><Btn onClick={downloadReportPDF} variant="secondary" icon="⬇">PDF</Btn><Btn onClick={()=>{setForm({cat:'Other',peti:1,sale:0,purch:0,active:true,id:uid('ITM'),photos:[],specs:[],dimensions:''});setModal('add');}}>+ Add Item</Btn></div>:null}/>
     <div style={{display:'flex',gap:8,marginBottom:16,flexWrap:'wrap'}}>
       <Chip v="Item List" active={view==='list'} onClick={()=>setView('list')}/>
       <Chip v="Category Analytics" active={view==='analytics'} onClick={()=>setView('analytics')}/>
@@ -4921,8 +5405,9 @@ function ItemMasters(){
       <Chip v="Sub-Categories" active={view==='subheads'} onClick={()=>setView('subheads')}/>
       <Chip v="Damaged Inventory" active={view==='damaged'} onClick={()=>setView('damaged')}/>
       <Chip v="Repaired Inventory" active={view==='repaired'} onClick={()=>setView('repaired')}/>
+      <Chip v="Stock Adjustments" active={view==='adjustments'} onClick={()=>setView('adjustments')}/>
     </div>
-    {view==='analytics'?<CategoryAnalytics/>:view==='log'?<ItemLog/>:view==='naming'?<ItemNamingEditor/>:view==='subheads'?<SubHeadManager/>:view==='damaged'?<DamagedInventory/>:view==='repaired'?<RepairedInventory/>:<>
+    {view==='analytics'?<CategoryAnalytics/>:view==='log'?<ItemLog/>:view==='naming'?<ItemNamingEditor/>:view==='subheads'?<SubHeadManager/>:view==='damaged'?<DamagedInventory/>:view==='repaired'?<RepairedInventory/>:view==='adjustments'?<StockAdjustmentLog/>:<>
     {modal&&<Modal title={modal==='add'?'Add Item':'Edit Item'} onClose={()=>setModal(null)}>
       <Grid2>
         <div style={{gridColumn:'1/-1'}}><Inp label="Internal Name (Sales Sheet)" value={form.internal||''} onChange={v=>setForm(f=>({...f,internal:v,name:v}))} required hint="How it appears in your Excel/bills"/></div>
@@ -4947,11 +5432,46 @@ function ItemMasters(){
         <Inp label="Stock on Hand (pcs)" value={form.stock||0} onChange={v=>setForm(f=>({...f,stock:Number(v)}))} type="number" hint="Current qty available"/>
         <Inp label="Damaged Stock (pcs)" value={form.damaged||0} onChange={v=>setForm(f=>({...f,damaged:Number(v)}))} type="number" hint="Unsellable / spoiled qty"/>
         <Inp label="Repaired Stock (pcs)" value={form.repaired||0} onChange={v=>setForm(f=>({...f,repaired:Number(v)}))} type="number" hint="Fixed from damaged, tracked separately"/>
+        <Inp label="Dimensions" value={form.dimensions||''} onChange={v=>setForm(f=>({...f,dimensions:v}))} placeholder="e.g. 30x30x12 cm"/>
       </Grid2>
       <label style={{display:'flex',alignItems:'center',gap:8,marginTop:16,fontSize:13,color:C.txt,cursor:'pointer',fontWeight:600}}>
         <input type="checkbox" checked={form.active!==false} onChange={e=>setForm(f=>({...f,active:e.target.checked}))}/>
         Active {form.active===false&&<span style={{color:C.muted,fontWeight:400}}>— hidden from sale/purchase search and inventory reorder alerts</span>}
       </label>
+
+      <div style={{marginTop:20,paddingTop:16,borderTop:`1px solid ${C.bdr}`}}>
+        <div style={{fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,marginBottom:8}}>Catalogue Photos</div>
+        <div style={{display:'flex',gap:8,flexWrap:'wrap',marginBottom:8}}>
+          {(form.photos||[]).map(url=><div key={url} style={{position:'relative',width:72,height:72}}>
+            <img src={url} alt="" style={{width:72,height:72,objectFit:'cover',borderRadius:7,border:`1px solid ${C.bdr}`}}/>
+            <button onClick={()=>removePhoto(url)} title="Remove photo"
+              style={{position:'absolute',top:-6,right:-6,width:20,height:20,borderRadius:'50%',background:C.red,color:'#fff',
+                border:'none',cursor:'pointer',fontSize:12,lineHeight:1,fontFamily:'inherit'}}>×</button>
+          </div>)}
+          <label style={{width:72,height:72,borderRadius:7,border:`1.5px dashed ${C.bdr}`,display:'flex',alignItems:'center',
+            justifyContent:'center',cursor:uploadingPhoto?'wait':'pointer',fontSize:11,color:C.sub,textAlign:'center',flexDirection:'column',gap:2}}>
+            {uploadingPhoto?'Uploading…':<>＋<span>Add photo</span></>}
+            <input type="file" accept="image/*" onChange={handlePhotoUpload} disabled={uploadingPhoto} style={{display:'none'}}/>
+          </label>
+        </div>
+        <div style={{fontSize:11,color:C.muted}}>Photos sync to the cloud and can be shared over WhatsApp from the item list.</div>
+      </div>
+
+      <div style={{marginTop:20,paddingTop:16,borderTop:`1px solid ${C.bdr}`}}>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
+          <div style={{fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5}}>Specs (e.g. Burner, Pan Support, Net Weight…)</div>
+          <Btn onClick={addSpecRow} variant="ghost" size="sm">+ Add spec</Btn>
+        </div>
+        {(form.specs||[]).length===0&&<div style={{fontSize:12,color:C.muted,marginBottom:6}}>No specs yet — add label/value rows as needed for this item.</div>}
+        {(form.specs||[]).map((row,i)=><div key={i} style={{display:'flex',gap:8,marginBottom:6,alignItems:'center'}}>
+          <input value={row.label} onChange={e=>updateSpecRow(i,'label',e.target.value)} placeholder="Label (e.g. Burner)"
+            style={{flex:1,padding:'7px 10px',borderRadius:7,border:`1.5px solid ${C.bdr}`,fontSize:12,outline:'none',fontFamily:'inherit',boxSizing:'border-box'}}/>
+          <input value={row.value} onChange={e=>updateSpecRow(i,'value',e.target.value)} placeholder="Value (e.g. Plating Top)"
+            style={{flex:1,padding:'7px 10px',borderRadius:7,border:`1.5px solid ${C.bdr}`,fontSize:12,outline:'none',fontFamily:'inherit',boxSizing:'border-box'}}/>
+          <button onClick={()=>removeSpecRow(i)} title="Remove row"
+            style={{background:'none',border:'none',color:C.red,cursor:'pointer',fontSize:16,fontFamily:'inherit',padding:'0 4px'}}>×</button>
+        </div>)}
+      </div>
       <div style={{display:'flex',justifyContent:'flex-end',gap:10,marginTop:20}}>
         <Btn onClick={()=>setModal(null)} variant="secondary">Cancel</Btn>
         <Btn onClick={doSave}>{modal==='add'?'Add Item':'Save Changes'}</Btn>
@@ -4970,13 +5490,16 @@ function ItemMasters(){
     </div>
     <div style={{background:mobile?'transparent':C.surf,borderRadius:8,border:mobile?'none':`1px solid ${C.bdr}`,overflow:'hidden'}}>
       {mobile?<MobileInventoryList items={pageData} catF={catF} saleOf={saleOf} purchOf={purchOf} marginOf={marginOf} expectedMap={expectedMap}
-        onOpenLedger={setDetailItem} onMove={setMoveSrc} onMerge={setMergeSrc} onEdit={openEdit}/>:
+        onOpenLedger={setDetailItem} onMove={setMoveSrc} onMerge={setMergeSrc} onEdit={openEdit} onShare={setShareItem} role={role}/>:
       <CardTable mobile={mobile} rows={pageData} keyFn={(it,i)=>it.id||i} emptyLabel="No items match"
         groupHeader={(it,prev)=>{
           const prevCat=prev?prev.cat:(page>0?'__prevpage__':null);
           const showCatHeader=!catF&&(it.cat||'Other')!==(prevCat||'Other');
           const prevSubHead=prev?prev.subHead:(page>0?'__prevpage__':null);
-          const showSubHead=it.subHead&&it.subHead!==prevSubHead;
+          // Normalized (trim+case-insensitive) comparison — a stray casing/
+          // whitespace difference between adjacent same-group items must not
+          // print a duplicate mini-header mid-group (see setItemSubHead above).
+          const showSubHead=it.subHead&&normSubHeadDisplay(it.subHead)!==normSubHeadDisplay(prevSubHead);
           if(!showCatHeader&&!showSubHead)return null;
           return <>
             {showCatHeader&&<div style={{padding:'10px 12px',background:C.blueSoft,fontSize:13,fontWeight:800,color:C.blue,
@@ -4986,8 +5509,8 @@ function ItemMasters(){
           </>;
         }}
         columns={[
-          {key:'internal',label:'Internal Name',render:it=><span onClick={()=>setDetailItem(it)}
-            style={{fontWeight:600,color:C.blue,cursor:'pointer',textDecoration:'underline',textDecorationStyle:'dotted'}}>{it.internal||it.name}</span>},
+          {key:'internal',label:'Item Name',render:it=><span onClick={()=>setDetailItem(it)}
+            style={{fontWeight:600,color:C.blue,cursor:'pointer',textDecoration:'underline',textDecorationStyle:'dotted'}}>{it.dispatchName||it.internal||it.name}</span>},
           {key:'customer',label:'Customer Name',cardLabel:'Customer',render:it=><span style={{fontSize:12,color:C.sub}}>{it.customer||'—'}</span>},
           {key:'cat',label:'Category',render:it=><Badge v={it.cat||'Other'} color="blue"/>},
           {key:'peti',label:'Peti',align:'right',render:it=><span style={{color:C.sub}}>{it.peti}</span>},
@@ -5026,11 +5549,12 @@ function ItemMasters(){
           }},
           {key:'actions',label:'',cardLabel:'Actions',render:it=>
             <div style={{display:'flex',gap:6,justifyContent:'flex-end',flexWrap:'wrap'}}>
+              <Btn onClick={()=>setShareItem(it)} variant="ghost" size="sm">Share</Btn>
               <Btn onClick={()=>setMoveSrc(it)} variant="ghost" size="sm">Move</Btn>
               <Btn onClick={()=>setMergeSrc(it)} variant="ghost" size="sm">Merge</Btn>
               <Btn onClick={()=>openEdit(it)} variant="ghost" size="sm">Edit</Btn>
             </div>},
-        ]}/>}
+        ].filter(c=>role==='owner'||!['purch','margin','marginPerPc'].includes(c.key))}/>}
     </div>
     {totalPages>1&&<div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:8,marginTop:14}}>
       <Btn onClick={()=>setPage(p=>Math.max(0,p-1))} disabled={page===0} variant="secondary" size="sm">← Prev</Btn>
@@ -5118,6 +5642,137 @@ function MergeItemModal({source,onClose,onMerged}){
   </Modal>;
 }
 
+// Inline party search box shared by both share modals below — same
+// candidate-list pattern as MergePartyModal/MergeItemModal above (no
+// dedicated PartyPicker component exists elsewhere in the app, so this
+// mirrors that established inline-search shape rather than inventing a new
+// one just for these two modals).
+function PartyPickBox({value,onPick}){
+  const[pq,setPq]=useState('');
+  const mobile=useIsMobile();
+  const candidates=useMemo(()=>state.parties.filter(p=>!pq||p.name.toLowerCase().includes(pq.toLowerCase())).slice(0,8),[pq]);
+  if(value)return <div style={{padding:'10px 14px',borderRadius:8,border:`1.5px solid ${C.blue}`,background:C.blueSoft,marginBottom:14}}>
+    <div style={{fontSize:11,color:C.sub}}>Sharing with</div>
+    <div style={{fontWeight:700,color:C.txt,fontSize:14}}>{value.name}</div>
+    <div style={{fontSize:11,color:C.sub,marginTop:2}}>{value.phone?'+91 '+value.phone:'No phone on file'}</div>
+    <button onClick={()=>onPick(null)} style={{marginTop:4,background:'none',border:'none',color:C.blue,cursor:'pointer',fontSize:11,textDecoration:'underline',fontFamily:'inherit'}}>Change</button>
+  </div>;
+  return <>
+    <input value={pq} onChange={e=>setPq(e.target.value)} placeholder="Search party to share with…" autoFocus
+      style={{width:'100%',padding:'8px 12px',borderRadius:7,border:`1.5px solid ${C.bdr}`,fontSize:13,outline:'none',fontFamily:'inherit',marginBottom:8,boxSizing:'border-box'}}/>
+    {pq.length>0&&candidates.map(p=><div key={p.id} onClick={()=>onPick(p)} style={{padding:'8px 12px',borderRadius:7,cursor:'pointer',border:`1px solid ${C.bdr}`,marginBottom:6}}
+      {...(mobile?{}:{onMouseEnter:e=>e.currentTarget.style.background='#F6F8FA',onMouseLeave:e=>e.currentTarget.style.background='transparent'})}>
+      <div style={{fontWeight:600,color:C.txt,fontSize:13}}>{p.name}</div>
+      <div style={{fontSize:11,color:C.sub}}>{p.phone?'+91 '+p.phone:'No phone on file'}</div>
+    </div>)}
+  </>;
+}
+
+// Builds the WhatsApp text block for one item: customer-facing name,
+// dimensions, and every spec row — same free-form specs the catalogue
+// editor in ItemMasters writes to item.specs.
+function buildItemShareText(item){
+  const lines=[('*'+(item.customer||item.internal||item.name)+'*')];
+  if(item.dimensions)lines.push('Dimensions: '+item.dimensions);
+  (item.specs||[]).filter(s=>s.label||s.value).forEach(s=>lines.push(s.label+': '+s.value));
+  return lines.join('\n');
+}
+
+// Single-item WhatsApp share (Feature #3). Text always sends via the wa.me
+// link; the photo (if any) has to go over as a *separate* clipboard-paste
+// step — wa.me can only carry text, and the Web Share API isn't reliably
+// wired to WhatsApp as a target on desktop (see InvoiceModal's copyImage
+// above for the identical constraint/workaround). Multiple photos are
+// handled by looping copy→paste with an explicit "Next" step rather than
+// anything automatic, since only one image can sit on the clipboard at a time.
+function ShareItemModal({item,onClose}){
+  const{toast,TC}=useToast();
+  const[party,setParty]=useState(null);
+  const[photoIdx,setPhotoIdx]=useState(0);
+  const[copying,setCopying]=useState(false);
+  const photos=item.photos||[];
+  const text=buildItemShareText(item);
+  const sendText=()=>{
+    const ph=party?.phone;
+    window.open(ph?('https://wa.me/91'+ph+'?text='+encodeURIComponent(text)):('https://wa.me/?text='+encodeURIComponent(text)),'_blank');
+  };
+  const copyPhoto=async()=>{
+    const url=photos[photoIdx];
+    if(!url)return;
+    setCopying(true);
+    try{
+      const resp=await fetch(url);
+      const raw=await resp.blob();
+      const png=await blobToPngBlob(raw);
+      await navigator.clipboard.write([new ClipboardItem({'image/png':png})]);
+      toast(photos.length>1?'Image '+(photoIdx+1)+' of '+photos.length+' copied — paste it, then click Next':'Image copied — paste it in WhatsApp');
+    }catch(e){
+      toast('Could not copy this image — try again or open it directly','error');
+    }finally{
+      setCopying(false);
+    }
+  };
+  return <Modal title={'Share "'+(item.customer||item.internal||item.name)+'"'} onClose={onClose} width={460}>
+    <TC/>
+    <PartyPickBox value={party} onPick={setParty}/>
+    <div style={{background:'#F6F8FA',borderRadius:9,border:`1px solid ${C.bdr}`,padding:14,marginBottom:14,
+      fontFamily:'monospace',fontSize:12,lineHeight:1.9,whiteSpace:'pre-wrap',color:C.txt}}>{text}</div>
+    {photos.length>0&&<div style={{marginBottom:14}}>
+      <div style={{display:'flex',gap:8,alignItems:'center',marginBottom:8}}>
+        <img src={photos[photoIdx]} alt="" style={{width:56,height:56,objectFit:'cover',borderRadius:7,border:`1px solid ${C.bdr}`}}/>
+        {photos.length>1&&<span style={{fontSize:12,color:C.sub}}>Photo {photoIdx+1} of {photos.length}</span>}
+      </div>
+      <div style={{display:'flex',gap:8}}>
+        <Btn onClick={copyPhoto} disabled={copying} variant="secondary" size="sm">🖼️ {copying?'Copying…':'Copy this photo'}</Btn>
+        {photos.length>1&&<Btn onClick={()=>setPhotoIdx(i=>(i+1)%photos.length)} variant="ghost" size="sm">Next photo →</Btn>}
+      </div>
+      <div style={{fontSize:11,color:C.muted,marginTop:6}}>WhatsApp can only take one pasted image at a time — copy, paste in the chat, then come back for the next one.</div>
+    </div>}
+    <div style={{display:'flex',justifyContent:'flex-end',gap:8}}>
+      <Btn onClick={onClose} variant="secondary">Close</Btn>
+      <Btn onClick={sendText}>📲 Send on WhatsApp</Btn>
+    </div>
+  </Modal>;
+}
+
+// Whole-catalogue WhatsApp share (Feature #3) — a checklist of active items
+// (checked by default, "uncheck a few you don't want" per the request),
+// combined into ONE text message. Deliberately text-only: looping
+// copy-image→paste across a whole catalogue the way ShareItemModal does for
+// one item would be impractical UX for a multi-item list, so bulk share is a
+// spec-sheet message for v1 — per-item photo sharing stays on ShareItemModal.
+function CatalogueShareModal({onClose}){
+  const{toast,TC}=useToast();
+  const[party,setParty]=useState(null);
+  const activeItems=useMemo(()=>state.items.filter(it=>it.active!==false)
+    .sort((a,b)=>(a.cat||'').localeCompare(b.cat||'')||(a.internal||'').localeCompare(b.internal||'')),[]);
+  const[checked,setChecked]=useState(()=>new Set(activeItems.map(it=>it.id)));
+  const toggle=id=>setChecked(s=>{const n=new Set(s); n.has(id)?n.delete(id):n.add(id); return n;});
+  const selectedItems=activeItems.filter(it=>checked.has(it.id));
+  const text=selectedItems.map(buildItemShareText).join('\n\n');
+  const sendText=()=>{
+    if(!selectedItems.length)return toast('Select at least one item','error');
+    const ph=party?.phone;
+    window.open(ph?('https://wa.me/91'+ph+'?text='+encodeURIComponent(text)):('https://wa.me/?text='+encodeURIComponent(text)),'_blank');
+  };
+  return <Modal title="Share Catalogue" onClose={onClose} width={520}>
+    <TC/>
+    <PartyPickBox value={party} onPick={setParty}/>
+    <div style={{fontSize:12,color:C.sub,marginBottom:8}}>{selectedItems.length} of {activeItems.length} items selected — uncheck any you don't want to send. Text only (photos aren't included in a bulk share — share a single item for its photo).</div>
+    <div style={{border:`1px solid ${C.bdr}`,borderRadius:8,maxHeight:260,overflowY:'auto',marginBottom:14}}>
+      {activeItems.map(it=><label key={it.id} style={{display:'flex',alignItems:'center',gap:8,padding:'7px 12px',borderBottom:`1px solid ${C.bdr}`,fontSize:13,cursor:'pointer'}}>
+        <input type="checkbox" checked={checked.has(it.id)} onChange={()=>toggle(it.id)}/>
+        <span style={{flex:1}}>{it.customer||it.internal||it.name}</span>
+        <span style={{fontSize:11,color:C.muted}}>{it.cat||'Other'}</span>
+      </label>)}
+    </div>
+    <div style={{display:'flex',justifyContent:'flex-end',gap:8}}>
+      <Btn onClick={onClose} variant="secondary">Close</Btn>
+      <Btn onClick={sendText} disabled={!selectedItems.length}>📲 Send on WhatsApp</Btn>
+    </div>
+  </Modal>;
+}
+
 // Non-destructive counterpart to MergeItemModal: relocates a chosen quantity
 // of stock to another item and leaves both items — and all their history —
 // otherwise untouched. Used when two entries are genuinely distinct SKUs and
@@ -5126,6 +5781,7 @@ function MoveStockModal({source,onClose,onMoved}){
   const[pq,setPq]=useState('');
   const[targetId,setTargetId]=useState('');
   const[qty,setQty]=useState(String(source.stock||0));
+  const[reason,setReason]=useState('');
   const mobile=useIsMobile();
   const{toast,TC}=useToast();
   const candidates=useMemo(()=>state.items.filter(it=>it.id!==source.id&&it.active!==false&&(!pq||(it.internal||it.name||'').toLowerCase().includes(pq.toLowerCase()))).slice(0,8),[pq,source.id]);
@@ -5134,7 +5790,8 @@ function MoveStockModal({source,onClose,onMoved}){
   const doMove=()=>{
     if(!targetId)return toast('Pick an item to move stock into','error');
     if(q<=0||q>(source.stock||0))return toast('Enter a valid qty (≤ '+(source.stock||0)+')','error');
-    moveItemStock(source.id,targetId,q);
+    if(!reason.trim())return toast('Enter a reason for this adjustment','error');
+    moveItemStock(source.id,targetId,q,reason);
     toast('Moved '+q+' pcs from "'+(source.internal||source.name)+'" to "'+(target.internal||target.name)+'" ✓');
     onMoved?.();
   };
@@ -5162,9 +5819,14 @@ function MoveStockModal({source,onClose,onMoved}){
       <input type="number" value={qty} onChange={e=>setQty(e.target.value)}
         style={{width:'100%',padding:'8px 12px',borderRadius:7,border:`1.5px solid ${C.bdr}`,fontSize:13,outline:'none',fontFamily:'inherit',marginTop:4,boxSizing:'border-box'}}/>
     </div>}
+    {target&&<div style={{marginTop:12}}>
+      <label style={{fontSize:11,color:C.sub,fontWeight:600}}>Reason for adjustment (required)</label>
+      <input value={reason} onChange={e=>setReason(e.target.value)} placeholder="e.g. Wrong delivery, data entry error"
+        style={{width:'100%',padding:'8px 12px',borderRadius:7,border:`1.5px solid ${C.bdr}`,fontSize:13,outline:'none',fontFamily:'inherit',marginTop:4,boxSizing:'border-box'}}/>
+    </div>}
     <div style={{display:'flex',justifyContent:'flex-end',gap:8,marginTop:10}}>
       <Btn onClick={onClose} variant="secondary">Cancel</Btn>
-      <Btn onClick={doMove} disabled={!targetId||q<=0} variant="primary">Move</Btn>
+      <Btn onClick={doMove} disabled={!targetId||q<=0||!reason.trim()} variant="primary">Move</Btn>
     </div>
   </Modal>;
 }
@@ -5265,6 +5927,7 @@ function SalesLog() {
   const[viewSale,setViewSale]=useState(null);
   const[ledgerParty,setLedgerParty]=useState(null);
   const[_fvSL,_setFvSL]=useState(0); const forceUpdate=()=>_setFvSL(v=>v+1);
+  const {toast,TC} = useToast();
   const PAGE=50;
 
   // Build from PARTY_HISTORY — no extra data needed
@@ -5292,6 +5955,7 @@ function SalesLog() {
   const totalPages=Math.ceil(filtered.length/PAGE);
 
   return <div>
+    <TC/>
     {editSale&&(editSale.type==='return'
       ?<EditReturnModal sale={editSale} onClose={()=>setEditSale(null)} onSaved={()=>forceUpdate(n=>n+1)}/>
       :<EditSaleModal sale={editSale} onClose={()=>setEditSale(null)} onSaved={()=>forceUpdate(n=>n+1)}/>)}
@@ -5345,7 +6009,7 @@ function SalesLog() {
                 <IconBtn title="View invoice" color={C.blue} bg={C.blueSoft}
                   onClick={e=>{e.stopPropagation();viewSaleForRow();}}>👁</IconBtn>
                 {s.isNew&&<IconBtn title="Edit" color={C.sub} bg={C.surf}
-                  onClick={e=>{e.stopPropagation();setEditSale(state.sales.find(x=>x.date===s.d&&x.partyName===s.party&&x.total===s.total)||null);}}>✎</IconBtn>}
+                  onClick={e=>{e.stopPropagation();if(!requireOwner(toast))return;setEditSale(state.sales.find(x=>x.date===s.d&&x.partyName===s.party&&x.total===s.total)||null);}}>✎</IconBtn>}
                 {!s.isReturn&&<IconBtn title="Record return" color={C.red} bg={C.redSoft}
                   onClick={e=>{e.stopPropagation();
                     if(s.isNew){const found=state.sales.find(x=>x.date===s.d&&x.partyName===s.party&&x.total===s.total);setRetSale(found||null);}
@@ -5353,6 +6017,7 @@ function SalesLog() {
                   }}>↩</IconBtn>}
                 {s.isNew&&<IconBtn title="Delete" color={C.red} bg={C.redSoft}
                   onClick={e=>{e.stopPropagation();
+                    if(!requireOwner(toast))return;
                     if(!window.confirm('Delete this sale?'))return;
                     const found=state.sales.find(x=>x.date===s.d&&x.partyName===s.party&&x.total===s.total);
                     if(found){state.sales=state.sales.filter(x=>x.id!==found.id);save.sales();(found.items||[]).forEach(l=>adjustStock(l.itemId,l.qty));forceUpdate();}
@@ -5564,7 +6229,7 @@ function PurchaseEntry({onSaved}){
     const extraChargesClean=extraCharges.filter(c=>c.name.trim()&&Number(c.amount)>0).map(c=>({id:c.id,name:c.name.trim(),amount:Number(c.amount)||0}));
     const extraChargesTotalSaved=extraChargesClean.reduce((s,c)=>s+c.amount,0);
     const supplierTotal=total+extraChargesTotalSaved;
-    const purchase={id,date,bookedDate:date,receivedDate:receivedDate||null,partyId,partyName:sel?.name||'',items:allItems,total,bilty,
+    const purchase={id,date,bookedDate:date,receivedDate:receivedDate||null,status:receivedDate?'received':'ordered',expectedDate:null,partyId,partyName:sel?.name||'',items:allItems,total,bilty,
       extraCharges:extraChargesClean,extraChargesTotal:extraChargesTotalSaved,
       transporterId:selTr?.id||undefined,transporterName:selTr?.name||undefined,
       totalPetis,freightAmount,
@@ -6003,7 +6668,7 @@ function EditPurchaseModal({purchase,onClose,onSaved}){
     </div>
     {(freightAmount>0||extraChargesTotal>0)&&<div style={{fontSize:12,color:C.sub,marginBottom:14,textAlign:'right'}}>Goods {fmt(total)}{extraChargesTotal>0?' + Charges '+fmt(extraChargesTotal):''}{freightAmount>0?' + Freight '+fmt(freightAmount):''} = <b style={{color:C.txt}}>{fmt(total+extraChargesTotal+freightAmount)}</b></div>}
     <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-      <button onClick={()=>{if(window.confirm('Delete this purchase?')){
+      <button onClick={()=>{if(!requireOwner(toast))return;if(window.confirm('Delete this purchase?')){
           if(purchase.receivedDate)(purchase.items||[]).forEach(l=>adjustStock(l.itemId,-l.qty));
           state.purchases=state.purchases.filter(p=>p.id!==purchase.id);save.purchases();
           state.freightCharges=state.freightCharges.filter(f=>f.purchaseId!==purchase.id);save.freightCharges();
@@ -6131,10 +6796,7 @@ function PurchLog() {
   const markReceived=id=>{
     const p=state.purchases.find(x=>x.id===id);
     if(!p||p.receivedDate)return;
-    const rd=today();
-    state.purchases=state.purchases.map(x=>x.id===id?{...x,receivedDate:rd}:x);
-    save.purchases();
-    (p.items||[]).forEach(l=>adjustStock(l.itemId,l.qty));
+    markPurchaseReceived(id);
     forceUpdate();
     toast('Marked received — stock updated ✓');
   };
@@ -6218,7 +6880,7 @@ function PurchLog() {
                 {r.isNew&&!r.receivedDate&&!r.isReturn&&<Btn onClick={e=>{e.stopPropagation();markReceived(r.id);}} size="sm" variant="success">Mark Received</Btn>}
                 <IconBtn title="View purchase" color={C.blue} bg={C.blueSoft} onClick={e=>{e.stopPropagation();viewRow(r);}}>👁</IconBtn>
                 {r.isNew&&<IconBtn title="Edit" color={C.sub} bg={C.surf}
-                  onClick={e=>{e.stopPropagation();const found=state.purchases.find(x=>x.id===r.id);if(found)setEditPurchase(found);}}>✎</IconBtn>}
+                  onClick={e=>{e.stopPropagation();if(!requireOwner(toast))return;const found=state.purchases.find(x=>x.id===r.id);if(found)setEditPurchase(found);}}>✎</IconBtn>}
                 {!r.isReturn&&<IconBtn title="Record return" color={C.red} bg={C.redSoft}
                   onClick={e=>{e.stopPropagation();
                     if(r.isNew){const found=state.purchases.find(x=>x.id===r.id);setRetPurchase(found||null);}
@@ -6226,6 +6888,7 @@ function PurchLog() {
                   }}>↩</IconBtn>}
                 {r.isNew&&<IconBtn title="Delete" color={C.red} bg={C.redSoft}
                   onClick={e=>{e.stopPropagation();
+                    if(!requireOwner(toast))return;
                     if(!window.confirm('Delete this purchase?'))return;
                     const found=state.purchases.find(x=>x.id===r.id);
                     if(found){
@@ -6904,7 +7567,7 @@ function LoginScreen({ onSignedIn }) {
     setBusy(true); setErr('');
     try {
       await DB.signIn(email.trim(), password);
-      onSignedIn();
+      onSignedIn(email.trim());
     } catch (e) {
       setErr(e.message || 'Sign in failed');
     } finally {
@@ -6957,16 +7620,24 @@ function App(){
   // localStorage BEFORE store.js's loadAll() reads it back out — so a
   // brand-new device sees the real synced data on its very first load
   // instead of seed data. No-op when cloud sync isn't configured.
-  const bootAfterAuth=()=>{ DB.initSync().then(loadAll).then(()=>setReady(true)); };
+  // email (from the Supabase session, when present) is stashed on state for
+  // computeRole()/useRole() to resolve against state.users, and
+  // ensureOwnerBootstrap writes the very first users row once state.users
+  // has actually loaded — so the first-ever signed-in account on this
+  // project becomes a durable Owner row instead of just an implicit default.
+  const bootAfterAuth=(email)=>{
+    state.currentUserEmail=email||'';
+    DB.initSync().then(loadAll).then(()=>{ ensureOwnerBootstrap(email); setReady(true); });
+  };
 
   useEffect(()=>{
     if(!supabase){ bootAfterAuth(); return; }
     DB.getSession().then(session=>{
-      if(session){setAuthed(true);bootAfterAuth();}
+      if(session){setAuthed(true);bootAfterAuth(session.user?.email);}
       else setAuthed(false);
     });
     return DB.onAuthChange(session=>{
-      if(session){setAuthed(true);bootAfterAuth();}
+      if(session){setAuthed(true);bootAfterAuth(session.user?.email);}
     });
   },[]);
 
@@ -6989,7 +7660,7 @@ function App(){
   const[liveTick,setLiveTick]=useState(0);
   useEffect(()=>subscribeLive(()=>setLiveTick(t=>t+1)),[]);
 
-  if(authed===false)return <LoginScreen onSignedIn={()=>{setAuthed(true);bootAfterAuth();}}/>;
+  if(authed===false)return <LoginScreen onSignedIn={(email)=>{setAuthed(true);bootAfterAuth(email);}}/>;
 
   if(!ready)return <div style={{display:'flex',alignItems:'center',justifyContent:'center',height:'100vh',background:C.bg}}>
     <div style={{textAlign:'center'}}>
@@ -6999,18 +7670,21 @@ function App(){
   </div>;
 
   const nav=id=>{window.location.hash=id;setMod(id);if(mobile)setSideOpen(false);};
+  const role=useRole();
+  const visibleNav=NAV.filter(n=>role==='owner'||!OWNER_ONLY_NAV.has(n.id));
 
   const renderMod=()=>{
     switch(mod){
       case'dashboard': return <Dashboard navigate={nav}/>;
       case'sale':      return <SaleEntry/>;
-      case'orders':    return <OrdersModule/>;
+      case'orders':    return <OrdersModule navigate={nav}/>;
       case'outstanding':return <Outstanding/>;
       case'parties':   return <PartyMasters/>;
       case'items':     return <ItemMasters/>;
-      case'accounts':   return <AccountsModule/>;
-      case'reports':    return <ReportsModule/>;
-      case'insights':   return <BusinessIntelligence/>;
+      case'accounts':   return role==='owner'?<AccountsModule/>:<RestrictedAccess/>;
+      case'reports':    return role==='owner'?<ReportsModule/>:<RestrictedAccess/>;
+      case'insights':   return role==='owner'?<BusinessIntelligence/>:<RestrictedAccess/>;
+      case'team':       return role==='owner'?<TeamModule/>:<RestrictedAccess/>;
       case'sales-log':  return <SalesLog/>;
       case'deliveries': return <DeliveriesModule/>;
       case'purch-log':  return <PurchLog/>;
@@ -7049,7 +7723,7 @@ function App(){
         </div>
         {/* Nav */}
         <nav style={{padding:'8px 6px',flex:1,overflowY:'auto'}}>
-          {NAV.map(n=>{
+          {visibleNav.map(n=>{
             const active=mod===n.id;
             const dot=n.id==='outstanding'&&hasDueFU;
             return <a key={n.id} href={'#'+n.id} onClick={()=>{if(mobile)setSideOpen(false);}} style={{
@@ -7114,7 +7788,7 @@ function App(){
 
     {/* Mobile bottom tabs — curated 4-item set (BOTTOM_NAV), not all of NAV */}
     {mobile&&<div style={{position:'fixed',bottom:0,left:0,right:0,background:C.surf,borderTop:`1px solid ${C.bdr}`,boxShadow:'0 -2px 10px rgba(0,0,0,.05)',display:'flex',padding:'6px 0 calc(4px + env(safe-area-inset-bottom))',zIndex:100}}>
-      {BOTTOM_NAV.map(n=>{
+      {BOTTOM_NAV.filter(n=>role==='owner'||!OWNER_ONLY_NAV.has(n.id)).map(n=>{
         const active=mod===n.id;
         return <a key={n.id} href={'#'+n.id} style={{flex:1,display:'flex',flexDirection:'column',alignItems:'center',gap:3,padding:'2px 0',background:'none',border:'none',textDecoration:'none',cursor:'pointer',fontFamily:'inherit',position:'relative'}}>
           <span style={{display:'flex',alignItems:'center',justifyContent:'center',width:40,height:26,borderRadius:14,background:active?C.blue+'15':'transparent',color:active?C.blue:C.muted,transition:'background .15s'}}>{n.icon}</span>

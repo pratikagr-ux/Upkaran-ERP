@@ -1058,6 +1058,13 @@ export const state = {
   cityOrder:        [],
   itemCustomerNames: {},
   repairExpenses:   [],
+  stockAdjustments: [],
+  // Owner/Staff role mapping, keyed by signed-in Supabase auth email — see
+  // computeRole()/useRole() in App.jsx. NOT a persisted-at-boot "current
+  // user" field: currentUserEmail below is runtime-only, set fresh from
+  // DB.getSession() each load, never saved/synced itself.
+  users:            [],
+  currentUserEmail: '',
   loaded:           false,
 };
 
@@ -1082,6 +1089,8 @@ export const save = {
   itemCustomerNames: () => DB.set('data:itemCustomerNames', state.itemCustomerNames),
   cityOrder:        () => DB.set('data:cityOrder',         state.cityOrder),
   repairExpenses:   () => DB.set('data:repairExpenses',    state.repairExpenses),
+  stockAdjustments: () => DB.set('data:stockAdjustments',  state.stockAdjustments),
+  users:            () => DB.set('data:users',             state.users),
 };
 
 // Learns which transporter is typically used for each delivery city, from
@@ -1128,6 +1137,7 @@ const STORAGE_KEY_TO_STATE = {
   'data:categoryTags':'categoryTags', 'data:customCategories':'customCategories',
   'data:orders':'orders', 'data:dispatchPhone':'dispatchPhone', 'data:itemCustomerNames':'itemCustomerNames',
   'data:cityOrder':'cityOrder', 'data:repairExpenses':'repairExpenses',
+  'data:stockAdjustments':'stockAdjustments', 'data:users':'users',
 };
 const liveListeners = new Set();
 export function subscribeLive(fn) { liveListeners.add(fn); return () => liveListeners.delete(fn); }
@@ -1163,13 +1173,13 @@ export function updatePartyPhone(partyId, phone) {
 export async function loadAll() {
   if (state.loaded) return;
   try {
-    const [sales,payments,pe,pt,fu,txns,parties,items,purchases,supplierPayments,freightCharges,customCategories,categoryTags,cityTransport,orders,dispatchPhone,itemCustomerNames,cityOrder,repairExpenses] = await Promise.all([
+    const [sales,payments,pe,pt,fu,txns,parties,items,purchases,supplierPayments,freightCharges,customCategories,categoryTags,cityTransport,orders,dispatchPhone,itemCustomerNames,cityOrder,repairExpenses,stockAdjustments,users] = await Promise.all([
       DB.get('data:sales'), DB.get('data:payments'), DB.get('data:phoneEdits'),
       DB.get('data:partyTransport'), DB.get('data:followups'), DB.get('data:txns'),
       DB.get('data:parties'), DB.get('data:items'), DB.get('data:purchases'), DB.get('data:supplierPayments'),
       DB.get('data:freightCharges'), DB.get('data:customCategories'), DB.get('data:categoryTags'),
       DB.get('data:cityTransport'), DB.get('data:orders'), DB.get('data:dispatchPhone'), DB.get('data:itemCustomerNames'),
-      DB.get('data:cityOrder'), DB.get('data:repairExpenses'),
+      DB.get('data:cityOrder'), DB.get('data:repairExpenses'), DB.get('data:stockAdjustments'), DB.get('data:users'),
     ]);
     if (sales)    state.sales    = sales;
     if (payments) state.payments = payments;
@@ -1187,6 +1197,8 @@ export async function loadAll() {
     if (itemCustomerNames) state.itemCustomerNames = itemCustomerNames;
     if (cityOrder)        state.cityOrder         = cityOrder;
     if (repairExpenses)   state.repairExpenses    = repairExpenses;
+    if (stockAdjustments) state.stockAdjustments  = stockAdjustments;
+    if (users)            state.users             = users;
     // One-time migration: persisted items predate two corrections in the seed
     // data — (1) `purch` used to be a flat 22% of `sale` instead of a real
     // rate, hiding per-item margins, and (2) `stock`/`stockValue` weren't yet
@@ -1219,6 +1231,115 @@ export async function loadAll() {
         state.items = [...state.items, ...SEED_ITEMS.filter(s => !existingIds.has(s.id))];
         save.items();
         await DB.set('data:itemsMigratedV9', true);
+      }
+    }
+    // One-time, narrowly-scoped text fix: the product line sold as "Indus
+    // Surya9" was renamed to "Unidus Surya9" (seed data already carries the
+    // new name), but a browser that already ran the itemsMigratedV9 refresh
+    // above has the old spelling baked into real, already-entered data —
+    // the items master AND every historical sale/purchase line that copied
+    // the item's name at entry time (itemName/customerName/supplierName —
+    // see getAllItemRows below for why those copies exist separately from
+    // the item master). Doing this as a plain string substitution rather
+    // than another full seed-refresh (like V9 above) means it can't clobber
+    // anything else the user has since edited by hand (rates, subHead
+    // reassignments via Sub-Categories, etc.) — it only touches the literal
+    // word "Indus".
+    {
+      const fixIndusText = s => {
+        if (typeof s !== 'string' || !s || !/\bindus\b/i.test(s)) return s;
+        return s.replace(/\bindus\b/gi, m => m === m.toUpperCase() ? 'UNIDUS' : (m[0] === m[0].toUpperCase() ? 'Unidus' : 'unidus'));
+      };
+      const hasIndus = s => typeof s === 'string' && /\bindus\b/i.test(s);
+      const unidusFixed = await DB.get('data:unidusRenameV1');
+      if (!unidusFixed) {
+        let changedItems = false, changedSales = false, changedPurchases = false;
+        state.items = state.items.map(it => {
+          let touched = false;
+          const next = { ...it };
+          for (const f of ['internal', 'customer', 'supplier', 'subHead', 'dispatchName']) {
+            if (hasIndus(next[f])) { next[f] = fixIndusText(next[f]); touched = true; }
+          }
+          if (touched) changedItems = true;
+          return touched ? next : it;
+        });
+        state.sales = state.sales.map(s => {
+          if (!(s.items || []).some(x => hasIndus(x.itemName) || hasIndus(x.customerName))) return s;
+          changedSales = true;
+          return { ...s, items: s.items.map(x => ({ ...x, itemName: fixIndusText(x.itemName), customerName: fixIndusText(x.customerName) })) };
+        });
+        state.purchases = state.purchases.map(p => {
+          if (!(p.items || []).some(x => hasIndus(x.itemName) || hasIndus(x.customerName) || hasIndus(x.supplierName))) return p;
+          changedPurchases = true;
+          return { ...p, items: p.items.map(x => ({ ...x, itemName: fixIndusText(x.itemName), customerName: fixIndusText(x.customerName), supplierName: fixIndusText(x.supplierName) })) };
+        });
+        if (changedItems) save.items();
+        if (changedSales) save.sales();
+        if (changedPurchases) save.purchases();
+        await DB.set('data:unidusRenameV1', true);
+      }
+    }
+    // One-time, generic fix for sub-category (subHead) groups that have
+    // silently forked into near-duplicates: e.g. some "1B Variants" items
+    // and one stray "1b variants " item (extra space) or "1B variants"
+    // (different case) — same intended group, different exact spelling.
+    // The main Item Masters table and mobile Inventory list only print a
+    // group header when adjacent items' subHead text differs, and they
+    // only end up adjacent via sortOrder, which setItemSubHead (App.jsx)
+    // manages whenever someone reassigns a subHead by hand — but that
+    // matching used to be an exact string compare, so a slightly
+    // differently-spelled entry (typed once, long before that function
+    // existed, or added outside it) would sit elsewhere in sortOrder and
+    // show up as its own stray one-item group, exactly looking "misfiled"
+    // or "missing" from its real group even though the data was always
+    // basically right. This migration finds such normalized-duplicate
+    // groups (same cat + same subHead once trimmed/case-folded/whitespace-
+    // collapsed, but not byte-for-byte identical), picks whichever exact
+    // spelling the majority already uses as canonical, rewrites the
+    // stragglers' subHead to that spelling, and moves them to sit right
+    // after the rest of their real group in sortOrder — i.e. exactly what
+    // manually reassigning them via Sub-Categories would now do (see the
+    // normalized matching added to setItemSubHead), just automatically and
+    // once. It deliberately does NOT touch items whose subHead is a
+    // genuinely different group name (that's a real reclassification
+    // decision, left to Sub-Categories) — it only merges near-duplicate
+    // spellings of what's already, unambiguously, the same group.
+    {
+      const subHeadFixed = await DB.get('data:subHeadDedupeV1');
+      if (!subHeadFixed) {
+        const norm = s => (s || '').trim().toLowerCase().replace(/\s+/g, ' ');
+        const groups = new Map(); // "catnormSubHead" -> items[]
+        for (const it of state.items) {
+          if (!it.subHead) continue;
+          const key = (it.cat || '') + '' + norm(it.subHead);
+          if (!groups.has(key)) groups.set(key, []);
+          groups.get(key).push(it);
+        }
+        const rewrites = new Map(); // id -> { subHead, sortOrder }
+        for (const members of groups.values()) {
+          const spellings = new Set(members.map(m => m.subHead));
+          if (spellings.size <= 1) continue; // already consistent, nothing to merge
+          const counts = new Map();
+          for (const m of members) counts.set(m.subHead, (counts.get(m.subHead) || 0) + 1);
+          let canonical = members[0].subHead, bestCount = -1, bestSort = Infinity;
+          for (const m of members) {
+            const c = counts.get(m.subHead);
+            const s = m.sortOrder ?? Infinity;
+            if (c > bestCount || (c === bestCount && s < bestSort)) { bestCount = c; bestSort = s; canonical = m.subHead; }
+          }
+          const canonicalMembers = members.filter(m => m.subHead === canonical);
+          let anchor = Math.max(...canonicalMembers.map(m => m.sortOrder ?? 0));
+          for (const m of members) {
+            if (m.subHead === canonical) continue;
+            anchor += 0.5;
+            rewrites.set(m.id, { subHead: canonical, sortOrder: anchor });
+          }
+        }
+        if (rewrites.size) {
+          state.items = state.items.map(it => rewrites.has(it.id) ? { ...it, ...rewrites.get(it.id) } : it);
+          save.items();
+        }
+        await DB.set('data:subHeadDedupeV1', true);
       }
     }
     // One-time correction: a ₹100,000 payment dated 2026-06-29 was recorded
