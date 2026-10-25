@@ -12,7 +12,7 @@ import * as XLSX from 'xlsx';
 import { C, fmt, fmtL, fmtD, today, uid, ROUTES, ACCOUNTS, ACC_MAP, TXN_CATEGORIES, HISTORICAL_EXPENSES, TAG_COLORS, APP_VERSION } from './constants.js';
 import { DB } from './db.js';
 import { supabase } from './supabaseClient.js';
-import { state, save, loadAll, updatePartyPhone, getBestRate, gPS, getPrevItems, parseQty, parseResponse, getAccBal, getSupplierBal, getCustomerBal, getPartyBills, getSupplierBills, getBestPurchRate, getAllCustomerMetrics, getAllVendorMetrics, getExpenseReport, setCategoryBiz, getCategorySubLedger, getAllItemRows, getItemMetrics, getAllItemMetrics, getExpectedStockMap, getFifoStockMap, getRecentModeSaleRate, getMonthlyBI, getMonthlyBIByCategory, getSalesProfitByCategory, getPnL, getBalanceSheet, getRepairExpenseTotal, splitPosNegItems, recordCityTransport, getTopTransportersForCity, getAllTransporterNames, subscribeLive, getItemCustomerName, setItemCustomerName, PARTY_INVOICES, PARTY_HISTORY, SUPPLIER_HISTORY, ACCOUNT_OB, ACCOUNT_HISTORY, applyTemplate, DEFAULT_TEMPLATES } from './store.js';
+import { state, save, loadAll, updatePartyPhone, getBestRate, gPS, getPrevItems, parseQty, parseResponse, getAccBal, getSupplierBal, getCustomerBal, getPartyBills, getSupplierBills, getBestPurchRate, getAllCustomerMetrics, getAllVendorMetrics, getExpenseReport, setCategoryBiz, getCategorySubLedger, getAllItemRows, getItemMetrics, getAllItemMetrics, getExpectedStockMap, getFifoStockMap, getFifoSaleMarginMap, getFifoSaleCosts, getRecentModeSaleRate, getMonthlyBI, getMonthlyBIByCategory, getSalesProfitByCategory, getPnL, getBalanceSheet, getRepairExpenseTotal, splitPosNegItems, recordCityTransport, getTopTransportersForCity, getAllTransporterNames, subscribeLive, getItemCustomerName, setItemCustomerName, PARTY_INVOICES, PARTY_HISTORY, SUPPLIER_HISTORY, ACCOUNT_OB, ACCOUNT_HISTORY, applyTemplate, DEFAULT_TEMPLATES } from './store.js';
 
 // ── CONVENIENT ALIASES (same pattern as monolith) ─────────────────────────────
 const _p  = () => state.parties;
@@ -219,6 +219,38 @@ function correctDamagedToStock(itemId, qty) {
   const move = Math.min(qty, it.damaged||0);
   if (move <= 0) return;
   state.items = state.items.map(x => x.id === itemId ? { ...x, damaged: (x.damaged||0)-move, stock: (x.stock||0)+move } : x);
+  save.items();
+}
+
+// Reassigns an item's sub-category (subHead) within its category, and keeps
+// it visually grouped with its new siblings in Item Masters' table — that
+// table's groupHeader only prints a subHead banner when adjacent rows share
+// the same subHead (see ItemMasters' groupHeader), so just changing the text
+// field isn't enough; an item landing with a non-adjacent sortOrder would
+// show a stray duplicate mini-header instead of actually joining the group.
+// This also assigns a sortOrder that places the item right after the rest of
+// its new subHead cluster (or at the end of the category, for a brand-new
+// subHead) — self-healing, so reassigning items one at a time via the
+// Sub-Categories manager always produces a correctly clustered table without
+// needing to hand-renumber every item in the category.
+function setItemSubHead(itemId, newSubHead) {
+  const it = state.items.find(x => x.id === itemId);
+  if (!it) return;
+  const trimmed = (newSubHead||'').trim();
+  if (!trimmed) {
+    state.items = state.items.map(x => x.id === itemId ? { ...x, subHead: '' } : x);
+    save.items();
+    return;
+  }
+  const siblings = state.items.filter(x => x.id !== itemId && x.cat === it.cat && x.subHead === trimmed);
+  let newSortOrder;
+  if (siblings.length) {
+    newSortOrder = Math.max(...siblings.map(s => s.sortOrder ?? 0)) + 0.5;
+  } else {
+    const catItems = state.items.filter(x => x.cat === it.cat && x.id !== itemId);
+    newSortOrder = catItems.length ? Math.max(...catItems.map(x => x.sortOrder ?? 0)) + 1 : 0;
+  }
+  state.items = state.items.map(x => x.id === itemId ? { ...x, subHead: trimmed, sortOrder: newSortOrder } : x);
   save.items();
 }
 
@@ -697,6 +729,45 @@ function OutstandingDetail({party,od,onClose}){
   </Modal>;
 }
 
+// Mobile Outstanding: a real party/days/amount table (not the generic
+// CardTable card-per-row) — the user explicitly asked for a table here, like
+// Mobile Inventory. Tapping a row opens OutstandingDetail directly, which
+// already combines follow-up response capture with the WhatsApp
+// payment-reminder link, so no separate drill-down step is needed (unlike
+// Mobile Inventory's expand-then-ledger pattern) — "clicking the line item
+// will open up follow up recording and send whatsapp message for payment
+// reminder" is exactly what OutstandingDetail already does.
+function MobileOutstandingTable({rows,amountOf,onRowClick}){
+  if(!rows.length)return <div style={{padding:'30px 10px',textAlign:'center',color:C.sub,fontSize:13}}>No parties match the filter</div>;
+  return <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}>
+    <thead><tr style={{background:'#F6F8FA'}}>
+      {['Party','Days','Amount'].map((h,i)=><th key={i} style={{padding:'8px 10px',textAlign:i===0?'left':'right',fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,borderBottom:`1px solid ${C.bdr}`,whiteSpace:'nowrap'}}>{h}</th>)}
+    </tr></thead>
+    <tbody>
+      {rows.map(p=>(
+        <tr key={p.id} onClick={()=>onRowClick(p)} style={{borderBottom:`1px solid ${C.bdr}`,cursor:'pointer',
+          background:p.isLighter?'#FAF5FF':p.overdueDays>90?C.redSoft:p.overdueDays>30?C.amberSoft:'transparent'}}>
+          <td style={{padding:'9px 10px',fontWeight:600,color:C.txt}}>
+            {p.name}
+            <div style={{display:'flex',gap:5,marginTop:2,flexWrap:'wrap'}}>
+              {p.isLighter&&<span style={{fontSize:9,background:'#FAF5FF',color:'#7C3AED',fontWeight:700,padding:'1px 6px',borderRadius:20,border:'1px solid #DDD6FE'}}>Lighter</span>}
+              {p.notRecoverable&&<span style={{fontSize:9,background:'#F3F4F6',color:C.muted,fontWeight:700,padding:'1px 6px',borderRadius:20,border:`1px solid ${C.bdr}`}}>Not Recoverable</span>}
+            </div>
+          </td>
+          <td style={{padding:'9px 10px',textAlign:'right',fontSize:11.5,fontWeight:700,whiteSpace:'nowrap',
+            color:p.overdueDays>90?C.red:p.overdueDays>30?C.amber:p.isLighter?C.purple:C.green}}>
+            {p.overdueDays>0?p.overdueDays+'d':(p.isLighter?'3d credit':'In credit')}
+          </td>
+          <td style={{padding:'9px 10px',textAlign:'right',fontWeight:800,whiteSpace:'nowrap',
+            color:p.isLighter?'#7C3AED':C.red,fontVariantNumeric:'tabular-nums'}}>
+            {fmt(amountOf(p))}
+          </td>
+        </tr>
+      ))}
+    </tbody>
+  </table>;
+}
+
 // ── OUTSTANDING ───────────────────────────────────────────────────────────────
 function Outstanding(){
   const mobile=useIsMobile();
@@ -952,6 +1023,7 @@ function Outstanding(){
               📲 Share
             </button>
           </div>
+          {mobile?<MobileOutstandingTable rows={c.parties} amountOf={partyAmt} onRowClick={p=>setDetail({party:p,od:p.ob})}/>:
           <CardTable mobile={mobile} rows={c.parties} keyFn={p=>p.id} onRowClick={p=>setDetail({party:p,od:p.ob})}
             rowStyle={p=>({background:p.isLighter?'#FAF5FF':p.overdueDays>90?C.redSoft:p.overdueDays>30?C.amberSoft:'transparent'})}
             columns={[
@@ -972,13 +1044,14 @@ function Outstanding(){
                 :<span style={{fontSize:12,color:p.isLighter?C.purple:C.green,fontWeight:600}}>{p.isLighter?'3d credit':'In credit'}</span>},
               {key:'amt',label:'Outstanding',align:'right',render:p=>
                 <span style={{fontWeight:800,color:p.isLighter?'#7C3AED':C.red,fontVariantNumeric:'tabular-nums',fontSize:14,whiteSpace:'nowrap'}}>{fmt(partyAmt(p))}</span>},
-            ]}/>
+            ]}/>}
         </div>
       ))}
     </div>
     :<>
     {/* Party table */}
     <div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,overflow:'hidden'}}>
+      {mobile?<MobileOutstandingTable rows={odList} amountOf={partyAmt} onRowClick={p=>setDetail({party:p,od:p.ob})}/>:
       <CardTable mobile={mobile} rows={odList} keyFn={(p,i)=>p.id||i} emptyLabel="No parties match the filter"
         onRowClick={p=>setDetail({party:p,od:p.ob})}
         rowStyle={p=>({background:p.isLighter?'#FAF5FF':p.overdueDays>90?C.redSoft:p.overdueDays>30?C.amberSoft:'transparent'})}
@@ -1022,7 +1095,7 @@ function Outstanding(){
                 :<span style={{fontSize:11,color:C.muted}}>—</span>}
             </div>;
           }},
-        ]}/>
+        ]}/>}
     </div>
     </>}
   </div>;
@@ -1284,6 +1357,63 @@ function InvoiceModal({sale,party,onClose,viewOnly=false}){
       <button onClick={()=>{navigator.clipboard?.writeText(text());toast('Copied');}}
         style={{padding:0,border:'none',background:'none',fontSize:11,color:C.muted,textDecoration:'underline',cursor:'pointer',fontFamily:'inherit'}}>Copy text</button>
       <Btn onClick={onClose} variant="secondary" size="sm">Not now (Esc)</Btn>
+    </div>
+  </Modal>;
+}
+
+// Read-only "complete bill" view for a sale already on record — shown when
+// clicking a sale entry from a Party Ledger or the Sales Log. Deliberately
+// NOT the WhatsApp-template InvoiceModal above (that's for actively sending
+// an estimate to a customer); this is just "what's on this bill", mirroring
+// PurchaseViewModal's plain table-and-total layout below. Works for both a
+// real in-app sale (full item/rate detail, editable name via EditSaleModal
+// elsewhere) and a synthesized pseudo-sale built from historical/pre-ERP
+// ledger data (same shape, sale.id===null, no edit affordance needed there).
+function SaleBillModal({sale,onClose,onEdited}){
+  const[editing,setEditing]=useState(false);
+  const[liveSale,setLiveSale]=useState(sale);
+  if(editing)return <EditSaleModal sale={liveSale} onClose={()=>setEditing(false)} onSaved={()=>{
+    const fresh=state.sales.find(x=>x.id===liveSale.id);
+    if(fresh)setLiveSale(fresh);
+    setEditing(false);
+    onEdited?.();
+  }}/>;
+  const items=liveSale.items||[];
+  const isReturn=liveSale.type==='return'||(liveSale.total||0)<0;
+  const due=()=>{
+    if(!liveSale.creditDays)return'';
+    const d=new Date(liveSale.date+'T00:00:00');d.setDate(d.getDate()+liveSale.creditDays);
+    return d.toLocaleDateString('en-IN',{day:'numeric',month:'short',year:'2-digit'});
+  };
+  return <Modal title={(isReturn?'Sales Return — ':'Sale — ')+(liveSale.partyName||'?')} onClose={onClose} width={600}>
+    <div style={{display:'flex',gap:16,flexWrap:'wrap',marginBottom:14,fontSize:12,color:C.sub}}>
+      <div><b style={{color:C.txt}}>Date:</b> {fmtD(liveSale.date)}</div>
+      {liveSale.transport&&<div><b style={{color:C.txt}}>Transport:</b> {liveSale.transport}{liveSale.bilty?' | LR: '+liveSale.bilty:''}</div>}
+      {liveSale.creditDays>0&&<div><b style={{color:C.txt}}>Credit:</b> {liveSale.creditDays}d{due()?' · Due '+due():''}</div>}
+      {liveSale.freightMode==='paid'&&liveSale.freightAmt>0&&<div><b style={{color:C.txt}}>Freight:</b> {fmt(liveSale.freightAmt)} (paid by us)</div>}
+      {liveSale.freightMode==='topay'&&<div><b style={{color:C.txt}}>Freight:</b> To Pay by party</div>}
+    </div>
+    <table style={{width:'100%',borderCollapse:'collapse',fontSize:13,marginBottom:14}}>
+      <thead><tr style={{background:'#F6F8FA'}}>
+        {['Item','Qty','Rate ₹','Amount'].map((h,i)=><th key={i} style={{padding:'7px 12px',textAlign:i>0?'right':'left',fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,borderBottom:`1px solid ${C.bdr}`}}>{h}</th>)}
+      </tr></thead>
+      <tbody>
+        {!items.length&&<tr><td colSpan={4} style={{padding:'20px',textAlign:'center',color:C.muted}}>No line items on record</td></tr>}
+        {items.map((l,i)=><tr key={i} style={{borderBottom:`1px solid ${C.bdr}`}}>
+          <td style={{padding:'7px 12px',fontWeight:600,color:C.txt}}>{l.customerName||l.itemName}</td>
+          <td style={{padding:'7px 12px',textAlign:'right'}}>{Math.abs(l.qty||0)}</td>
+          <td style={{padding:'7px 12px',textAlign:'right'}}>{fmt(l.rate)}</td>
+          <td style={{padding:'7px 12px',textAlign:'right',fontWeight:700,color:isReturn?C.amber:C.blue}}>{fmt(Math.abs(l.amount??(l.qty*l.rate)))}</td>
+        </tr>)}
+      </tbody>
+      {items.length>0&&<tfoot>
+        <tr style={{background:'#F6F8FA'}}><td colSpan={3} style={{padding:'9px 12px',fontWeight:800,textAlign:'right',color:C.txt}}>{isReturn?'Return Total':'Grand Total'}</td>
+          <td style={{padding:'9px 12px',textAlign:'right',fontSize:15,fontWeight:800,color:isReturn?C.amber:C.blue}}>{fmt(Math.abs(liveSale.total||0))}</td></tr>
+      </tfoot>}
+    </table>
+    <div style={{display:'flex',justifyContent:'space-between'}}>
+      {liveSale.id?<Btn onClick={()=>setEditing(true)} variant="secondary" icon="✎">Edit Sale</Btn>:<span/>}
+      <Btn onClick={onClose} variant="secondary">Close</Btn>
     </div>
   </Modal>;
 }
@@ -1925,7 +2055,12 @@ function EditSaleModal({sale,onClose,onSaved}){
           {!lines.length&&<tr><td colSpan={6} style={{padding:'20px',textAlign:'center',color:C.muted}}>No items</td></tr>}
           {lines.map((l,i)=><tr key={l.id} style={{borderBottom:`1px solid ${C.bdr}`}}>
             <td style={{padding:'7px 12px',color:C.muted,fontSize:11}}>{i+1}</td>
-            <td style={{padding:'7px 12px',fontWeight:600,color:C.txt}}>{l.customerName||l.itemName}</td>
+            <td style={{padding:'7px 12px',fontWeight:600,color:C.txt}}>
+              <input value={l.customerName||l.itemName||''} onChange={e=>editLine(i,'customerName',e.target.value)}
+                title="Edit the item name recorded on this sale line"
+                style={{width:'100%',padding:'3px 6px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:12,fontWeight:600,color:C.txt,outline:'none',fontFamily:'inherit',boxSizing:'border-box'}}
+                onFocus={e=>e.target.style.borderColor=C.blue} onBlur={e=>e.target.style.borderColor=C.bdr}/>
+            </td>
             <td style={{padding:'7px 12px',textAlign:'right'}}><input value={l.qty} onChange={e=>editLine(i,'qty',e.target.value)} type="number" style={{width:60,padding:'3px 7px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:12,textAlign:'right',outline:'none',fontFamily:'inherit'}}/></td>
             <td style={{padding:'7px 12px',textAlign:'right'}}><input value={l.rate} onChange={e=>editLine(i,'rate',e.target.value)} type="number" style={{width:75,padding:'3px 7px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:12,textAlign:'right',outline:'none',fontFamily:'inherit'}}/></td>
             <td style={{padding:'7px 12px',textAlign:'right',fontWeight:700,color:C.blue,fontVariantNumeric:'tabular-nums'}}>{fmt(l.qty*l.rate)}</td>
@@ -2637,7 +2772,7 @@ function PartyLedger({party,onClose}){
 
   return <Modal title={party.name+' — Ledger'} onClose={onClose} width={680}>
     <TC/>
-    {viewSale&&<InvoiceModal sale={viewSale} party={party} onClose={()=>setViewSale(null)} viewOnly/>}
+    {viewSale&&<SaleBillModal sale={viewSale} onClose={()=>setViewSale(null)}/>}
     {viewPurchase&&<PurchaseViewModal purchase={viewPurchase} onClose={()=>setViewPurchase(null)}/>}
     {showRepairModal&&<RepairExpenseModal party={party} onClose={()=>setShowRepairModal(false)} onSaved={()=>setShowRepairModal(false)}/>}
     <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}}>
@@ -3303,7 +3438,7 @@ function AccountsModule() {
         gridTemplateRows:mobile?undefined:'auto auto',gap:mobile?14:10,position:'relative'}}>
 
         {/* 1. DATE */}
-        <div style={{gridRow:1,alignSelf:'end'}}>
+        <div style={{gridRow:1,alignSelf:mobile?'stretch':'end'}}>
           <label style={labelStyle}>Date <span style={{color:C.muted,fontWeight:400}}>↑↓</span></label>
           <input id="acct-date" type="date" value={date} onChange={e=>setDate(e.target.value)}
             onKeyDown={dateKey} onFocus={()=>setFocused('date')} onBlur={()=>setFocused('')}
@@ -3311,7 +3446,7 @@ function AccountsModule() {
         </div>
 
         {/* 2. CATEGORY */}
-        <div style={{gridRow:1,alignSelf:'end'}}>
+        <div style={{gridRow:1,alignSelf:mobile?'stretch':'end'}}>
           <label style={labelStyle}>Category</label>
           <select id="acct-category" value={categoryId} onChange={e=>chooseCategory(e.target.value)}
             onKeyDown={e=>{if(e.key==='Enter'){e.preventDefault();foc('acct-party');}else categoryTypeahead(e);}}
@@ -3323,12 +3458,13 @@ function AccountsModule() {
         </div>
 
         {/* Direction toggle — sits a row lower, under Category, so it never disturbs the main row's alignment */}
-        <div style={{gridRow:2,gridColumn:2,alignSelf:'start'}}>
-          {!isTransfer&&<div style={{display:'flex',gap:4}}>
+        <div style={{gridRow:2,gridColumn:2,alignSelf:mobile?'stretch':'start'}}>
+          {mobile&&!isTransfer&&<label style={labelStyle}>Direction</label>}
+          {!isTransfer&&<div style={{display:'flex',gap:mobile?6:4}}>
             {['in','out'].map(d=><button key={d} onClick={()=>setDir(d)} type="button" style={{
-              flex:1,padding:'3px 6px',borderRadius:5,border:`1px solid ${dir===d?(d==='in'?C.green:C.red):C.bdr}`,
+              flex:1,padding:mobile?'7px 6px':'3px 6px',borderRadius:5,border:`1px solid ${dir===d?(d==='in'?C.green:C.red):C.bdr}`,
               background:dir===d?(d==='in'?C.greenSoft:C.redSoft):'transparent',
-              color:dir===d?(d==='in'?C.green:C.red):C.muted,fontSize:10,fontWeight:700,cursor:'pointer',fontFamily:'inherit'}}>
+              color:dir===d?(d==='in'?C.green:C.red):C.muted,fontSize:mobile?12:10,fontWeight:700,cursor:'pointer',fontFamily:'inherit'}}>
               {d==='in'?'↑ In':'↓ Out'}
             </button>)}
           </div>}
@@ -3338,7 +3474,7 @@ function AccountsModule() {
 
         {/* 3. PARTY / PAYEE — or To-Account for a transfer */}
         {isTransfer
-          ?<div style={{gridRow:1,alignSelf:'end'}}>
+          ?<div style={{gridRow:1,alignSelf:mobile?'stretch':'end'}}>
             <label style={labelStyle}>To Account</label>
             <select value={toAccount} onChange={e=>setToAcc(e.target.value)}
               onKeyDown={e=>{if(e.key==='Enter'){e.preventDefault();foc('acct-amount');}}}
@@ -3346,7 +3482,7 @@ function AccountsModule() {
               {ACCOUNTS.filter(a=>a.id!==account).map(a=><option key={a.id} value={a.id}>{a.icon} {a.short}</option>)}
             </select>
           </div>
-          :<div style={{gridRow:1,alignSelf:'end',position:'relative'}}>
+          :<div style={{gridRow:1,alignSelf:mobile?'stretch':'end',position:'relative'}}>
             <label style={labelStyle}>
               {isSupplier?'Supplier':isTransporter?'Transporter':isParty?'Party':'Payee / Description'}
               {!selParty&&<span style={{color:C.muted,fontWeight:400,marginLeft:5,fontSize:9}}>
@@ -3421,7 +3557,7 @@ function AccountsModule() {
           </div>}
 
         {/* 4. AMOUNT */}
-        <div style={{gridRow:1,alignSelf:'end'}}>
+        <div style={{gridRow:1,alignSelf:mobile?'stretch':'end'}}>
           <label style={labelStyle}>Amount ₹ <span style={{color:C.muted,fontWeight:400}}>e.g. 5000</span></label>
           <div style={{position:'relative'}}>
             <span style={{position:'absolute',left:9,top:'50%',transform:'translateY(-50%)',fontWeight:800,color:C.sub,fontSize:13,pointerEvents:'none'}}>₹</span>
@@ -3434,7 +3570,7 @@ function AccountsModule() {
         </div>
 
         {/* 5. ACCOUNT */}
-        <div style={{gridRow:1,alignSelf:'end'}}>
+        <div style={{gridRow:1,alignSelf:mobile?'stretch':'end'}}>
           <label style={labelStyle}>{isTransfer?'From Account':'Account'}</label>
           <select id="acct-account" value={account} onChange={e=>{
               const newAcc=e.target.value;
@@ -3459,7 +3595,7 @@ function AccountsModule() {
         </div>
 
         {/* 6. NOTES */}
-        <div style={{gridRow:1,alignSelf:'end'}}>
+        <div style={{gridRow:1,alignSelf:mobile?'stretch':'end'}}>
           <label style={labelStyle}>Notes <span style={{color:C.muted,fontWeight:400}}>optional</span></label>
           <input id="acct-notes" value={notes} onChange={e=>setNotes(e.target.value)}
             onFocus={()=>setFocused('notes')} onBlur={()=>setFocused('')}
@@ -3469,7 +3605,7 @@ function AccountsModule() {
         </div>
 
         {/* 7. SAVE */}
-        <div style={{gridRow:1,alignSelf:'end',paddingTop:mobile?0:18}}>
+        <div style={{gridRow:1,alignSelf:mobile?'stretch':'end',paddingTop:mobile?4:18}}>
           <button onClick={doSave} disabled={!canSave}
             style={{padding:'9px 18px',borderRadius:8,border:'none',fontFamily:'inherit',fontWeight:700,fontSize:14,
               background:!canSave?'#E5E7EB':dir==='out'?C.red:dir==='contra'?C.purple:C.green,
@@ -4369,10 +4505,80 @@ function ItemNamingEditor(){
   </div>;
 }
 
+// Lets a sub-category (subHead) — the mini-headers inside a category in Item
+// Masters' table, e.g. "1B Variants" or "Supya Ivansh" under Gas Stoves — be
+// reassigned per item, grouped by category so a messy category can be
+// reviewed and fixed item-by-item in one screen. There was previously no UI
+// for this field at all (not even in the Add/Edit Item modal), which is how
+// a category's sub-groupings silently drift out of sync with reality (an
+// item physically belonging to one variant group ends up tagged into
+// another, or ungrouped). Reassigning here goes through setItemSubHead
+// (above), which also re-sequences sortOrder so the item visually rejoins
+// its new group in the main table, not just in this field.
+function SubHeadManager(){
+  const[items,setItems]=useState(()=>[...state.items]);
+  const[catF,setCatF]=useState('');
+  const[search,setSearch]=useState('');
+  const{toast,TC}=useToast();
+  const cats=useMemo(()=>[...new Set(state.items.map(i=>i.cat||'Other'))].sort(),[]);
+  const refresh=()=>setItems([...state.items]);
+  const scoped=items.filter(it=>it.active!==false&&(!catF||(it.cat||'Other')===catF));
+  const filtered=scoped.filter(it=>!search||(it.internal||it.name||'').toLowerCase().includes(search.toLowerCase()));
+  const sorted=filtered.slice().sort((a,b)=>(a.subHead||'￿').localeCompare(b.subHead||'￿')||(a.sortOrder??Infinity)-(b.sortOrder??Infinity)||(a.internal||'').localeCompare(b.internal||''));
+  const existingSubHeads=useMemo(()=>[...new Set(scoped.map(it=>it.subHead).filter(Boolean))].sort(),[scoped]);
+  const applySubHead=(it,val)=>{
+    setItemSubHead(it.id,val);
+    refresh();
+    toast(val?'Moved to "'+val.trim()+'" ✓':'Ungrouped ✓');
+  };
+  return <div>
+    <TC/>
+    <SectionHead title="Sub-Categories" sub="Fix which variant/sub-group each item belongs to within its category"/>
+    <div style={{display:'flex',gap:8,marginBottom:10,flexWrap:'wrap'}}>
+      <Chip v="All categories" active={!catF} onClick={()=>setCatF('')}/>
+      {cats.map(c=><Chip key={c} v={c} active={catF===c} onClick={()=>setCatF(catF===c?'':c)}/>)}
+    </div>
+    <div style={{background:C.surf,borderRadius:7,border:`1px solid ${C.bdr}`,padding:'7px 11px',marginBottom:12}}>
+      <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search items…" style={{width:'100%',border:'none',outline:'none',fontSize:13,color:C.txt,fontFamily:'inherit',background:'transparent'}}/>
+    </div>
+    <datalist id="subhead-suggestions">{existingSubHeads.map(s=><option key={s} value={s}/>)}</datalist>
+    <div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,overflow:'hidden'}}>
+      <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}>
+        <thead><tr style={{background:'#F6F8FA'}}>
+          {['Category','Item','Stock','Sub-Category'].map((h,i)=><th key={i} style={{padding:'9px 12px',textAlign:i===2?'right':'left',fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,borderBottom:`1px solid ${C.bdr}`,whiteSpace:'nowrap'}}>{h}</th>)}
+        </tr></thead>
+        <tbody>
+          {sorted.length===0&&<tr><td colSpan={4} style={{padding:'40px',textAlign:'center',color:C.muted}}>No items match</td></tr>}
+          {sorted.map((it,i)=>{
+            const prevSubHead=i>0?sorted[i-1].subHead:undefined;
+            const showHeader=(it.subHead||'')!==(prevSubHead||'');
+            return <Fragment key={it.id}>
+              {showHeader&&<tr><td colSpan={4} style={{padding:'6px 12px',background:'#EEF2F6',fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5}}>{it.subHead||'Ungrouped'}</td></tr>}
+              <tr style={{borderBottom:`1px solid ${C.bdr}`}}>
+                <td style={{padding:'6px 12px',color:C.sub,whiteSpace:'nowrap'}}>{it.cat||'Other'}</td>
+                <td style={{padding:'6px 12px',fontWeight:600,color:C.txt}}>{it.internal||it.name}</td>
+                <td style={{padding:'6px 12px',textAlign:'right',color:C.sub}}>{it.stock||0}</td>
+                <td style={{padding:'4px 6px'}}>
+                  <input defaultValue={it.subHead||''} list="subhead-suggestions" placeholder="— none —"
+                    onBlur={e=>{if(e.target.value!==(it.subHead||''))applySubHead(it,e.target.value);}}
+                    onKeyDown={e=>{if(e.key==='Enter')e.target.blur();}}
+                    style={{width:'100%',minWidth:160,padding:'6px 8px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:12.5,outline:'none',fontFamily:'inherit'}}
+                    onFocus={e=>e.target.style.borderColor=C.blue}/>
+                </td>
+              </tr>
+            </Fragment>;
+          })}
+        </tbody>
+      </table>
+    </div>
+  </div>;
+}
+
 function ItemDetail({item,onClose}){
   const{toast,TC}=useToast();
   const mobile=useIsMobile();
   const[search,setSearch]=useState('');
+  const[typeF,setTypeF]=useState('all');
   const[page,setPage]=useState(0);
   const[damaged,setDamaged]=useState(item.damaged||0);
   const[repaired,setRepaired]=useState(item.repaired||0);
@@ -4398,7 +4604,15 @@ function ItemDetail({item,onClose}){
     const l=(p.items||[]).find(x=>x.itemId===item.id);
     return s+(l?l.qty:0);
   },0),[item.id,state.purchases.length]);
-  const rows=useMemo(()=>metrics.rows.filter(r=>!search||(r.party||'').toLowerCase().includes(search.toLowerCase())).sort((a,b)=>b.d.localeCompare(a.d)),[metrics,search]);
+  // Per-sale FIFO cost/margin (see getFifoSaleCosts in store.js) — keyed by
+  // saleId, only populated for in-app sales (same documented FIFO-costing
+  // restriction as getFifoStockMap/getFifoSaleMarginMap: historical,
+  // pre-app sale rows have no dated layer to cost against).
+  const fifoSaleCosts=useMemo(()=>getFifoSaleCosts(item.id),[item.id,state.purchases.length,state.sales.length,state.repairExpenses.length,state.items.length]);
+  const rows=useMemo(()=>metrics.rows
+    .filter(r=>!search||(r.party||'').toLowerCase().includes(search.toLowerCase()))
+    .filter(r=>typeF==='all'||(typeF==='sale'?r.dir==='out':r.dir==='in'))
+    .sort((a,b)=>b.d.localeCompare(a.d)),[metrics,search,typeF]);
   const pageRows=rows.slice(page*PAGE,(page+1)*PAGE);
   const totalPages=Math.ceil(rows.length/PAGE);
   const doRepair=()=>{
@@ -4481,6 +4695,11 @@ function ItemDetail({item,onClose}){
       <Card label="Stock Value" value={fmt(stockValue)}/>
       <Card label="Expected (Incoming)" value={expectedQty+' pcs'} color={expectedQty>0?C.amber:C.txt}/>
     </div>
+    <div style={{display:'flex',gap:8,marginBottom:10,flexWrap:'wrap'}}>
+      <Chip v="All" active={typeF==='all'} onClick={()=>{setTypeF('all');setPage(0);}}/>
+      <Chip v="Sales only" active={typeF==='sale'} onClick={()=>{setTypeF('sale');setPage(0);}}/>
+      <Chip v="Purchases only" active={typeF==='purch'} onClick={()=>{setTypeF('purch');setPage(0);}}/>
+    </div>
     <div style={{background:C.surf,borderRadius:7,border:`1px solid ${C.bdr}`,padding:'7px 11px',marginBottom:12}}>
       <input value={search} onChange={e=>{setSearch(e.target.value);setPage(0);}} placeholder="Search by party…" style={{width:'100%',border:'none',outline:'none',fontSize:13,color:C.txt,fontFamily:'inherit',background:'transparent'}}/>
     </div>
@@ -4492,6 +4711,15 @@ function ItemDetail({item,onClose}){
           {key:'qty',label:'Qty',align:'right',render:r=>Math.abs(r.qty||0)},
           {key:'rate',label:'Rate',align:'right',render:r=><span style={{color:C.sub}}>{fmt(r.rate)}</span>},
           {key:'amount',label:'Amount',align:'right',render:r=><span style={{fontWeight:700,color:C.blue}}>{fmt(Math.abs(r.amount||0))}</span>},
+          {key:'margin',label:'Margin',align:'right',render:r=>{
+            if(r.dir!=='out'||r.isReturn)return<span style={{color:C.muted}}>—</span>;
+            const m=r.saleId&&fifoSaleCosts[r.saleId];
+            if(!m)return<span style={{color:C.muted}} title="No FIFO cost data — historical sale predating in-app tracking">—</span>;
+            return<span title="FIFO-costed margin at the time of this sale">
+              <Badge v={m.marginPct+'%'} color={m.marginPct>25?'green':m.marginPct>15?'amber':'red'}/>
+              <span style={{fontSize:11,color:C.sub,marginLeft:4}}>{fmt(m.marginPerPc)}/pc</span>
+            </span>;
+          }},
           {key:'type',label:'Type',align:'center',render:r=><Badge v={r.isReturn?'Return':r.dir==='in'?'Purchased':'Sold'} color={r.isReturn?'amber':r.dir==='in'?'green':'blue'}/>},
         ]}/>
     </div>
@@ -4501,6 +4729,66 @@ function ItemDetail({item,onClose}){
       <Btn onClick={()=>setPage(p=>Math.min(totalPages-1,p+1))} disabled={page>=totalPages-1} variant="secondary" size="sm">Next →</Btn>
     </div>}
   </Modal>;
+}
+
+// Mobile Inventory: a real category-wise table of just name+qty (not the
+// generic CardTable card-per-row — the user explicitly asked for a table
+// here, unlike every other mobile view in this app). Tapping a row expands
+// it in place into a detail card (rates, margin, damaged/expected, actions);
+// tapping the item name — only live once expanded, since collapsed the
+// whole row's job is "tap to expand" — opens the full item ledger
+// (ItemDetail), mirroring "clicking the item can expand... clicking further
+// on the item name can show the item ledger" from the request verbatim.
+function MobileInventoryList({items,catF,saleOf,purchOf,marginOf,expectedMap,onOpenLedger,onMove,onMerge,onEdit}){
+  const[expandedId,setExpandedId]=useState(null);
+  if(!items.length)return <div style={{padding:'30px 10px',textAlign:'center',color:C.sub,fontSize:13}}>No items match</div>;
+  return <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}>
+    <tbody>
+      {items.map((it,i)=>{
+        const prev=i>0?items[i-1]:null;
+        const showCat=!catF&&(it.cat||'Other')!==(prev?(prev.cat||'Other'):null);
+        const showSub=it.subHead&&it.subHead!==(prev?prev.subHead:undefined);
+        const expanded=expandedId===it.id;
+        const sale=saleOf(it),purch=purchOf(it),{pct:marginPct,perPc:marginPerPc,isReal}=marginOf(it);
+        const stock=it.stock||0,expected=expectedMap[it.id]||0,damaged=it.damaged||0;
+        return <Fragment key={it.id}>
+          {showCat&&<tr><td colSpan={2} style={{padding:'10px 12px',background:C.blueSoft,fontSize:13,fontWeight:800,color:C.blue,borderTop:prev?`2px solid ${C.blue}`:'none'}}>{it.cat||'Other'}</td></tr>}
+          {showSub&&<tr><td colSpan={2} style={{padding:'6px 12px',background:'#EEF2F6',fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5}}>{it.subHead}</td></tr>}
+          <tr onClick={()=>setExpandedId(expanded?null:it.id)} style={{borderBottom:expanded?'none':`1px solid ${C.bdr}`,cursor:'pointer',background:expanded?'#F9FAFB':'transparent'}}>
+            <td style={{padding:'10px 12px',fontWeight:600,color:C.txt}}>{it.internal||it.name}</td>
+            <td style={{padding:'10px 12px',textAlign:'right'}}><Badge v={stock+' pc'+(stock===1?'':'s')} color={stock<=0?'red':'gray'}/></td>
+          </tr>
+          {expanded&&<tr style={{borderBottom:`1px solid ${C.bdr}`}}><td colSpan={2} style={{padding:'4px 12px 12px'}}>
+            <div style={{background:C.surf,border:`1px solid ${C.bdr}`,borderRadius:9,padding:12,display:'flex',flexDirection:'column',gap:8}} onClick={e=>e.stopPropagation()}>
+              <span onClick={()=>onOpenLedger(it)} style={{fontWeight:700,color:C.blue,cursor:'pointer',textDecoration:'underline',textDecorationStyle:'dotted',fontSize:14}}>{it.internal||it.name} — View Ledger →</span>
+              {it.customer&&<Row label="Customer Name" value={it.customer}/>}
+              <Row label="Category" value={<Badge v={it.cat||'Other'} color="blue"/>}/>
+              <Row label="Peti Size" value={it.peti+' pcs'}/>
+              <Row label="Selling Rate" value={fmt(sale)}/>
+              <Row label="Landed Cost" value={fmt(purch)}/>
+              <Row label="Avg Margin" value={<span>
+                <Badge v={marginPct+'%'} color={marginPct>25?'green':marginPct>15?'amber':'red'}/>
+                <span style={{fontSize:11,color:C.sub,marginLeft:4}}>{fmt(marginPerPc)}/pc{!isReal?' (est.)':''}</span>
+              </span>}/>
+              {damaged>0&&<Row label="Damaged" value={<Badge v={damaged+' pcs'} color="amber"/>}/>}
+              {expected>0&&<Row label="Expected" value={<span style={{color:C.amber,fontWeight:700}}>+{expected}</span>}/>}
+              <div style={{display:'flex',gap:6,justifyContent:'flex-end',flexWrap:'wrap',marginTop:4}}>
+                <Btn onClick={()=>onMove(it)} variant="ghost" size="sm">Move</Btn>
+                <Btn onClick={()=>onMerge(it)} variant="ghost" size="sm">Merge</Btn>
+                <Btn onClick={()=>onEdit(it)} variant="ghost" size="sm">Edit</Btn>
+              </div>
+            </div>
+          </td></tr>}
+        </Fragment>;
+      })}
+    </tbody>
+  </table>;
+}
+function Row({label,value}){
+  return <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:10}}>
+    <span style={{fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5}}>{label}</span>
+    <span style={{fontSize:13,color:C.txt,textAlign:'right'}}>{value}</span>
+  </div>;
 }
 
 function ItemMasters(){
@@ -4533,6 +4821,18 @@ function ItemMasters(){
   // of the item's recent in-app sale rates ("what we're actually charging
   // lately") — auto-suggested until manually overridden inline in this table.
   const saleOf=it=>(it.sale>0?it.sale:(getRecentModeSaleRate(it.id)??0));
+  // Avg margin % / ₹ per pc — real, FIFO-costed margin from actual in-app
+  // sales when the item has any (getFifoSaleMarginMap in store.js); falls
+  // back to the theoretical current-sale-rate-vs-current-cost estimate for
+  // an item that hasn't been sold in-app yet, same spirit as the sale-rate
+  // auto-suggest above. `isReal` flags which one a render is looking at.
+  const fifoMarginMap=useMemo(()=>getFifoSaleMarginMap(),[state.purchases.length,state.sales.length,state.repairExpenses.length,state.items.length]);
+  const marginOf=it=>{
+    const m=fifoMarginMap[it.id];
+    if(m&&m.soldQty>0)return{pct:m.marginPct,perPc:m.marginPerPc,isReal:true};
+    const saleDisp=saleOf(it),purchDisp=purchOf(it);
+    return{pct:saleDisp>0?Math.round((saleDisp-purchDisp)/saleDisp*1000)/10:0,perPc:Math.round((saleDisp-purchDisp)*100)/100,isReal:false};
+  };
   const commitSale=(it,raw)=>{
     const v=Math.max(0,Number(raw)||0);
     state.items=state.items.map(x=>x.id===it.id?{...x,sale:v}:x);
@@ -4560,13 +4860,13 @@ function ItemMasters(){
     return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;
   };
   const downloadReport=()=>{
-    const header=['Internal Name','Customer Name','Category','Peti Size','Sale Rate','Purchase Rate','Margin %','Stock (pcs)','Damaged (pcs)','Repaired (pcs)','Expected Incoming (pcs)','Stock Value (₹)','Status'];
+    const header=['Internal Name','Customer Name','Category','Peti Size','Sale Rate','Purchase Rate','Margin %','Margin ₹/pc','Stock (pcs)','Damaged (pcs)','Repaired (pcs)','Expected Incoming (pcs)','Stock Value (₹)','Status'];
     const rows=filtered.map(it=>{
       const sale=saleOf(it), purch=purchOf(it);
-      const margin=sale>0?Math.round((sale-purch)/sale*100):0;
+      const{pct:margin,perPc:marginPerPc}=marginOf(it);
       const stock=it.stock||0;
       const value=fifoMap[it.id]&&fifoMap[it.id].qty>0?fifoMap[it.id].value:stock*purch;
-      return [it.internal||it.name||'',it.customer||'',it.cat||'Other',it.peti||0,sale,purch,margin,stock,it.damaged||0,it.repaired||0,expectedMap[it.id]||0,value,it.active!==false?'Active':'Discontinued'];
+      return [it.internal||it.name||'',it.customer||'',it.cat||'Other',it.peti||0,sale,purch,margin,marginPerPc,stock,it.damaged||0,it.repaired||0,expectedMap[it.id]||0,value,it.active!==false?'Active':'Discontinued'];
     });
     const csv=[header,...rows].map(r=>r.map(csvCell).join(',')).join('\n');
     const blob=new Blob([csv],{type:'text/csv'});
@@ -4580,10 +4880,10 @@ function ItemMasters(){
   const downloadReportPDF=()=>{
     const rows=filtered.map(it=>{
       const sale=saleOf(it), purch=purchOf(it);
-      const margin=sale>0?Math.round((sale-purch)/sale*100):0;
+      const{pct:margin,perPc:marginPerPc}=marginOf(it);
       const stock=it.stock||0;
       const value=fifoMap[it.id]&&fifoMap[it.id].qty>0?fifoMap[it.id].value:stock*purch;
-      return {name:it.internal||it.name||'',cat:it.cat||'Other',peti:it.peti||0,sale,purch,margin,stock,damaged:it.damaged||0,repaired:it.repaired||0,expected:expectedMap[it.id]||0,value,status:it.active!==false?'Active':'Discontinued'};
+      return {name:it.internal||it.name||'',cat:it.cat||'Other',peti:it.peti||0,sale,purch,margin,marginPerPc,stock,damaged:it.damaged||0,repaired:it.repaired||0,expected:expectedMap[it.id]||0,value,status:it.active!==false?'Active':'Discontinued'};
     });
     const totalValue=rows.reduce((s,r)=>s+r.value,0);
     const rs=n=>'Rs '+Number(n||0).toLocaleString('en-IN');
@@ -4595,13 +4895,13 @@ function ItemMasters(){
     doc.text('Generated '+fmtD(today())+'   '+filterBits+'   '+rows.length+' items',40,58);
     autoTable(doc,{
       startY:72,
-      head:[['Item','Category','Peti','Sale Rate','Purch Rate','Margin','Stock','Damaged','Repaired','Expected','Value','Status']],
-      body:rows.map(r=>[r.name,r.cat,r.peti,rs(r.sale),rs(r.purch),r.margin+'%',r.stock,r.damaged||'-',r.repaired||'-',r.expected||'-',rs(r.value),r.status]),
-      foot:[['','','','','','','','','','Total',rs(totalValue),'']],
+      head:[['Item','Category','Peti','Sale Rate','Purch Rate','Margin %','Margin ₹/pc','Stock','Damaged','Repaired','Expected','Value','Status']],
+      body:rows.map(r=>[r.name,r.cat,r.peti,rs(r.sale),rs(r.purch),r.margin+'%',rs(r.marginPerPc),r.stock,r.damaged||'-',r.repaired||'-',r.expected||'-',rs(r.value),r.status]),
+      foot:[['','','','','','','','','','','Total',rs(totalValue),'']],
       styles:{fontSize:8,cellPadding:4},
       headStyles:{fillColor:[37,99,235],textColor:255,fontStyle:'bold'},
       footStyles:{fillColor:[243,244,246],textColor:20,fontStyle:'bold'},
-      columnStyles:{2:{halign:'right'},3:{halign:'right'},4:{halign:'right'},5:{halign:'right'},6:{halign:'right'},7:{halign:'right'},8:{halign:'right'},9:{halign:'right'},10:{halign:'right'}},
+      columnStyles:{2:{halign:'right'},3:{halign:'right'},4:{halign:'right'},5:{halign:'right'},6:{halign:'right'},7:{halign:'right'},8:{halign:'right'},9:{halign:'right'},10:{halign:'right'},11:{halign:'right'}},
       margin:{left:40,right:40},
     });
     doc.save('inventory-report-'+today()+'.pdf');
@@ -4618,10 +4918,11 @@ function ItemMasters(){
       <Chip v="Category Analytics" active={view==='analytics'} onClick={()=>setView('analytics')}/>
       <Chip v="Item Log" active={view==='log'} onClick={()=>setView('log')}/>
       <Chip v="Naming Conventions" active={view==='naming'} onClick={()=>setView('naming')}/>
+      <Chip v="Sub-Categories" active={view==='subheads'} onClick={()=>setView('subheads')}/>
       <Chip v="Damaged Inventory" active={view==='damaged'} onClick={()=>setView('damaged')}/>
       <Chip v="Repaired Inventory" active={view==='repaired'} onClick={()=>setView('repaired')}/>
     </div>
-    {view==='analytics'?<CategoryAnalytics/>:view==='log'?<ItemLog/>:view==='naming'?<ItemNamingEditor/>:view==='damaged'?<DamagedInventory/>:view==='repaired'?<RepairedInventory/>:<>
+    {view==='analytics'?<CategoryAnalytics/>:view==='log'?<ItemLog/>:view==='naming'?<ItemNamingEditor/>:view==='subheads'?<SubHeadManager/>:view==='damaged'?<DamagedInventory/>:view==='repaired'?<RepairedInventory/>:<>
     {modal&&<Modal title={modal==='add'?'Add Item':'Edit Item'} onClose={()=>setModal(null)}>
       <Grid2>
         <div style={{gridColumn:'1/-1'}}><Inp label="Internal Name (Sales Sheet)" value={form.internal||''} onChange={v=>setForm(f=>({...f,internal:v,name:v}))} required hint="How it appears in your Excel/bills"/></div>
@@ -4668,6 +4969,8 @@ function ItemMasters(){
       <input value={search} onChange={e=>{setSearch(e.target.value);setPage(0);}} placeholder="Search items…" style={{width:'100%',border:'none',outline:'none',fontSize:13,color:C.txt,fontFamily:'inherit',background:'transparent'}}/>
     </div>
     <div style={{background:mobile?'transparent':C.surf,borderRadius:8,border:mobile?'none':`1px solid ${C.bdr}`,overflow:'hidden'}}>
+      {mobile?<MobileInventoryList items={pageData} catF={catF} saleOf={saleOf} purchOf={purchOf} marginOf={marginOf} expectedMap={expectedMap}
+        onOpenLedger={setDetailItem} onMove={setMoveSrc} onMerge={setMergeSrc} onEdit={openEdit}/>:
       <CardTable mobile={mobile} rows={pageData} keyFn={(it,i)=>it.id||i} emptyLabel="No items match"
         groupHeader={(it,prev)=>{
           const prevCat=prev?prev.cat:(page>0?'__prevpage__':null);
@@ -4701,10 +5004,16 @@ function ItemMasters(){
                 style={{fontWeight:600,color:C.blue,cursor:'pointer',fontStyle:it.sale>0?'normal':'italic',borderBottom:'1px dotted currentColor'}}>{fmt(saleDisp)}</span>;
           }},
           {key:'purch',label:'Purch ₹',align:'right',render:it=><span style={{color:C.sub}} title="FIFO avg cost of current balance">{fmt(purchOf(it))}</span>},
-          {key:'margin',label:'Margin',align:'right',render:it=>{
-            const saleDisp=saleOf(it),purchDisp=purchOf(it);
-            const margin=saleDisp>0?Math.round((saleDisp-purchDisp)/saleDisp*100):0;
-            return <Badge v={margin+'%'} color={margin>25?'green':margin>15?'amber':'red'}/>;
+          {key:'margin',label:'Margin %',align:'right',render:it=>{
+            const{pct,isReal}=marginOf(it);
+            return <span title={isReal?'FIFO-costed margin from actual sales':'Estimated — no in-app sales yet'}>
+              <Badge v={pct+'%'} color={pct>25?'green':pct>15?'amber':'red'}/>
+              {!isReal&&<span style={{fontSize:10,color:C.muted,marginLeft:4,fontStyle:'italic'}}>est.</span>}
+            </span>;
+          }},
+          {key:'marginPerPc',label:'Margin ₹/pc',align:'right',render:it=>{
+            const{perPc,isReal}=marginOf(it);
+            return <span style={{color:perPc>=0?C.sub:C.red,fontWeight:600}} title={isReal?'FIFO-costed margin from actual sales':'Estimated — no in-app sales yet'}>{fmt(perPc)}</span>;
           }},
           {key:'stock',label:'Stock',align:'right',render:it=>{
             const stock=it.stock||0;
@@ -4721,7 +5030,7 @@ function ItemMasters(){
               <Btn onClick={()=>setMergeSrc(it)} variant="ghost" size="sm">Merge</Btn>
               <Btn onClick={()=>openEdit(it)} variant="ghost" size="sm">Edit</Btn>
             </div>},
-        ]}/>
+        ]}/>}
     </div>
     {totalPages>1&&<div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:8,marginTop:14}}>
       <Btn onClick={()=>setPage(p=>Math.max(0,p-1))} disabled={page===0} variant="secondary" size="sm">← Prev</Btn>
@@ -4986,7 +5295,7 @@ function SalesLog() {
     {editSale&&(editSale.type==='return'
       ?<EditReturnModal sale={editSale} onClose={()=>setEditSale(null)} onSaved={()=>forceUpdate(n=>n+1)}/>
       :<EditSaleModal sale={editSale} onClose={()=>setEditSale(null)} onSaved={()=>forceUpdate(n=>n+1)}/>)}
-    {viewSale&&<InvoiceModal sale={viewSale} party={state.parties.find(p=>p.id===viewSale.partyId)||{name:viewSale.partyName,phone:''}} onClose={()=>setViewSale(null)} viewOnly/>}
+    {viewSale&&<SaleBillModal sale={viewSale} onClose={()=>setViewSale(null)}/>}
     {retSale!==false&&<SalesReturnModal sale={retSale||null} onClose={()=>setRetSale(false)} onSaved={()=>forceUpdate(n=>n+1)}/>}
     {ledgerParty&&<PartyLedger party={ledgerParty} onClose={()=>setLedgerParty(null)}/>}
     <SectionHead title="Sales Log" sub={`${filtered.filter(s=>!s.isReturn).length} invoices · ${fmtL(filtered.filter(s=>!s.isReturn).reduce((s,r)=>s+r.total,0))} · ${filtered.filter(s=>s.isReturn).length>0?filtered.filter(s=>s.isReturn).length+' returns −'+fmtL(Math.abs(filtered.filter(s=>s.isReturn).reduce((s,r)=>s+r.total,0))):''}`} action={<Btn onClick={()=>setRetSale(null)} variant='danger' size='sm'>+ New Return</Btn>}/>

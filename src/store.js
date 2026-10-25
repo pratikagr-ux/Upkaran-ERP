@@ -394,7 +394,11 @@ export function getAllItemRows() {
   for (const s of state.sales) {
     const isReturn = s.type === 'return';
     for (const x of (s.items || [])) {
-      rows.push({ d: s.date, item: x.customerName||x.itemName, itemId: x.itemId, qty: x.qty, rate: x.rate, amount: x.amount ?? ((x.qty||0)*(x.rate||0)), dir: 'out', party: s.partyName, isNew: true, isReturn });
+      // saleId lets a per-row consumer (e.g. the Item Ledger's margin column)
+      // look this exact transaction up in getFifoSaleCosts(itemId) below —
+      // historical rows elsewhere in this function have no equivalent id,
+      // same documented exclusion getFifoStockMap/getFifoSaleMarginMap use.
+      rows.push({ d: s.date, item: x.customerName||x.itemName, itemId: x.itemId, qty: x.qty, rate: x.rate, amount: x.amount ?? ((x.qty||0)*(x.rate||0)), dir: 'out', party: s.partyName, isNew: true, isReturn, saleId: s.id });
     }
   }
   for (const [vendor, hist] of Object.entries(SUPPLIER_HISTORY)) {
@@ -580,6 +584,123 @@ export function getFifoStockMap() {
     map[it.id] = { qty, value, avgRate };
   }
   return map;
+}
+
+// Real, FIFO-costed margin on actual in-app sales — same dated/itemId-tagged
+// event universe as getFifoStockMap (purchases, sales, repair-expense draws),
+// replayed in chronological order per item so each sale line is costed from
+// whatever layers were actually on hand *at that point in time*, not today's
+// average. Bulk historical (pre-app, name-matched) sales are excluded — same
+// restriction getFifoStockMap documents above: that seed data can't support a
+// trustworthy per-unit cost reconstruction. Returns one map keyed by item id;
+// soldQty/marginPct/marginPerPc are null-ish (0/null) for an item with no
+// in-app sales yet, so callers can fall back to the theoretical
+// sale-rate-vs-current-cost estimate.
+export function getFifoSaleMarginMap() {
+  const eventsById = {};
+  const add = (id, date, seq, type, netQty, rate) => {
+    if (!id) return;
+    (eventsById[id] ||= []).push({ date, seq: seq || '', type, netQty, rate });
+  };
+  for (const p of state.purchases) for (const l of (p.items || [])) add(l.itemId, p.date, p.createdAt, 'purch', l.qty || 0, l.rate || 0);
+  for (const s of state.sales) for (const x of (s.items || [])) add(x.itemId, s.date, s.createdAt, 'sale', -(x.qty || 0), x.rate);
+  for (const r of state.repairExpenses) add(r.itemId, r.date, r.createdAt, 'repair', -(r.qty || 0), null);
+
+  const map = {};
+  for (const it of state.items) {
+    const events = (eventsById[it.id] || []).slice().sort((a, b) => a.date.localeCompare(b.date) || a.seq.localeCompare(b.seq));
+    const netFromEvents = events.reduce((s, e) => s + e.netQty, 0);
+    const plug = (it.stock || 0) - netFromEvents; // same baseline-layer reconciliation as getFifoStockMap
+    const layers = [];
+    if (plug > 1e-9) layers.push({ qty: plug, rate: it.purch || 0 });
+    const withdraw = qty => {
+      let need = qty, costSum = 0, got = 0;
+      while (need > 1e-9 && layers.length) {
+        const l = layers[0]; const take = Math.min(l.qty, need);
+        costSum += take * l.rate; got += take; l.qty -= take; need -= take;
+        if (l.qty <= 1e-9) layers.shift();
+      }
+      if (need > 1e-9) { costSum += need * (it.purch || 0); got += need; } // ran out of dated layers — fall back to flat purch rate for the shortfall
+      return got > 0 ? costSum / got : (it.purch || 0);
+    };
+    let soldQty = 0, soldRevenue = 0, soldCost = 0;
+    for (const e of events) {
+      if (e.type === 'purch') {
+        if (e.netQty > 1e-9) layers.push({ qty: e.netQty, rate: e.rate });
+        else if (e.netQty < -1e-9) withdraw(-e.netQty);
+      } else if (e.type === 'repair') {
+        if (e.netQty < -1e-9) withdraw(-e.netQty);
+      } else if (e.type === 'sale') {
+        if (e.netQty < -1e-9) {
+          const qty = -e.netQty; const costRate = withdraw(qty);
+          soldQty += qty; soldRevenue += qty * (e.rate || 0); soldCost += qty * costRate;
+        } else if (e.netQty > 1e-9) {
+          layers.push({ qty: e.netQty, rate: it.purch || 0 }); // sales return — back at current cost, not the billed price
+        }
+      }
+    }
+    const marginPerPc = soldQty > 0 ? Math.round((soldRevenue - soldCost) / soldQty * 100) / 100 : null;
+    const marginPct = soldRevenue > 0 ? Math.round((soldRevenue - soldCost) / soldRevenue * 1000) / 10 : null;
+    map[it.id] = { soldQty: Math.round(soldQty * 100) / 100, marginPerPc, marginPct };
+  }
+  return map;
+}
+
+// Per-sale FIFO cost/margin detail for ONE item, keyed by sale id — same
+// replay as getFifoSaleMarginMap above, but kept per-transaction instead of
+// aggregated, for the Item Ledger's per-row margin column. A sales-return
+// line resolves to isReturn:true with no margin (a return isn't a sale).
+export function getFifoSaleCosts(itemId) {
+  const it = state.items.find(x => x.id === itemId);
+  if (!it) return {};
+  const events = [];
+  for (const p of state.purchases) for (const l of (p.items || [])) {
+    if (l.itemId !== itemId) continue;
+    events.push({ date: p.date, seq: p.createdAt || '', type: 'purch', netQty: l.qty || 0, rate: l.rate || 0 });
+  }
+  for (const s of state.sales) for (const x of (s.items || [])) {
+    if (x.itemId !== itemId) continue;
+    events.push({ date: s.date, seq: s.createdAt || '', type: 'sale', netQty: -(x.qty || 0), rate: x.rate, saleId: s.id });
+  }
+  for (const r of state.repairExpenses) {
+    if (r.itemId !== itemId) continue;
+    events.push({ date: r.date, seq: r.createdAt || '', type: 'repair', netQty: -(r.qty || 0) });
+  }
+  events.sort((a, b) => a.date.localeCompare(b.date) || a.seq.localeCompare(b.seq));
+  const netFromEvents = events.reduce((s, e) => s + e.netQty, 0);
+  const plug = (it.stock || 0) - netFromEvents;
+  const layers = [];
+  if (plug > 1e-9) layers.push({ qty: plug, rate: it.purch || 0 });
+  const withdraw = qty => {
+    let need = qty, costSum = 0, got = 0;
+    while (need > 1e-9 && layers.length) {
+      const l = layers[0]; const take = Math.min(l.qty, need);
+      costSum += take * l.rate; got += take; l.qty -= take; need -= take;
+      if (l.qty <= 1e-9) layers.shift();
+    }
+    if (need > 1e-9) { costSum += need * (it.purch || 0); got += need; }
+    return got > 0 ? costSum / got : (it.purch || 0);
+  };
+  const results = {};
+  for (const e of events) {
+    if (e.type === 'purch') {
+      if (e.netQty > 1e-9) layers.push({ qty: e.netQty, rate: e.rate });
+      else if (e.netQty < -1e-9) withdraw(-e.netQty);
+    } else if (e.type === 'repair') {
+      if (e.netQty < -1e-9) withdraw(-e.netQty);
+    } else if (e.type === 'sale') {
+      if (e.netQty < -1e-9) {
+        const qty = -e.netQty; const costRate = withdraw(qty);
+        const marginPerPc = Math.round(((e.rate || 0) - costRate) * 100) / 100;
+        const marginPct = e.rate > 0 ? Math.round(marginPerPc / e.rate * 1000) / 10 : 0;
+        results[e.saleId] = { qty, rate: e.rate, costRate: Math.round(costRate * 100) / 100, marginPerPc, marginPct, isReturn: false };
+      } else if (e.netQty > 1e-9) {
+        layers.push({ qty: e.netQty, rate: it.purch || 0 });
+        results[e.saleId] = { qty: -e.netQty, rate: e.rate, costRate: it.purch || 0, marginPerPc: 0, marginPct: 0, isReturn: true };
+      }
+    }
+  }
+  return results;
 }
 
 // "What are we actually selling this at lately?" — the mode (most frequent
