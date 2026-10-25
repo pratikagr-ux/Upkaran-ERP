@@ -941,7 +941,10 @@ function Outstanding(){
   // can show up under more than one bucket when its invoices span both.
   const odList=useMemo(()=>allOD.filter(p=>{
     const routeMatch = !routeF ||(routeF==='Lighter'?p.isLighter&&!p.notRecoverable:p.route===routeF&&!p.isLighter&&!p.notRecoverable);
-    const ageMatch   = !ageF  ||(ageF==='not-recoverable'?p.notRecoverable:!p.notRecoverable&&bucketAmt(p,ageF)>0.5);
+    // Not Recoverable parties are hidden from the plain, unfiltered list —
+    // they only surface via the dedicated "🚫 Not Recoverable" bucket below,
+    // same as they're already excluded from the route/Lighter cards above.
+    const ageMatch   = !ageF  ?!p.notRecoverable:(ageF==='not-recoverable'?p.notRecoverable:!p.notRecoverable&&bucketAmt(p,ageF)>0.5);
     const srchMatch  = !search||p.name.toLowerCase().includes(search.toLowerCase())||p.city?.toLowerCase().includes(search.toLowerCase());
     return routeMatch&&ageMatch&&srchMatch;
   }).sort((a,b)=>b.overdueDays-a.overdueDays||b.od-a.od),[allOD,routeF,ageF,search]);
@@ -4346,7 +4349,9 @@ function Dashboard({navigate}){
   const paymentsByParty=state.payments.reduce((m,p)=>{m[p.partyId]=(m[p.partyId]||0)+(p.amount||0);return m;},{});
   const odParties=customers
     .map(p=>({...p,od:(p.ob||0)+(salesByParty[p.id]||0)-(paymentsByParty[p.id]||0)}))
-    .filter(p=>p.od>0).sort((a,b)=>b.od-a.od);
+    // Not Recoverable parties are excluded here too, matching the main
+    // Outstanding list — they're bad debt, not a "due to collect" figure.
+    .filter(p=>p.od>0&&!p.notRecoverable).sort((a,b)=>b.od-a.od);
   const totalOD=odParties.reduce((s,p)=>s+p.od,0);
   const outOfStock=state.items.filter(it=>it.active!==false&&(it.stock||0)<=0);
   const monthPrefix=today().slice(0,7);
