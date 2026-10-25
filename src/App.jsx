@@ -7665,6 +7665,15 @@ function App(){
   const[liveTick,setLiveTick]=useState(0);
   useEffect(()=>subscribeLive(()=>setLiveTick(t=>t+1)),[]);
 
+  // useRole() must be called unconditionally, on every render, before any
+  // early return below — it calls useState/useEffect internally, so calling
+  // it only AFTER the authed/ready gates (as it used to be) meant App()
+  // called a different number of hooks on the "show LoginScreen"/"loading"
+  // renders vs. the fully-booted render, which is exactly React error #310
+  // ("Rendered fewer hooks than expected"). Hoisted here, alongside this
+  // function's other hooks, fixes that.
+  const role=useRole();
+
   if(authed===false)return <LoginScreen onSignedIn={(email)=>{setAuthed(true);bootAfterAuth(email);}}/>;
 
   if(!ready)return <div style={{display:'flex',alignItems:'center',justifyContent:'center',height:'100vh',background:C.bg}}>
@@ -7675,7 +7684,6 @@ function App(){
   </div>;
 
   const nav=id=>{window.location.hash=id;setMod(id);if(mobile)setSideOpen(false);};
-  const role=useRole();
   const visibleNav=NAV.filter(n=>role==='owner'||!OWNER_ONLY_NAV.has(n.id));
 
   const renderMod=()=>{
