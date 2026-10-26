@@ -2760,8 +2760,13 @@ function PartyLedger({party,onClose}){
   const pmtDesc = p => p.notes || ((isSupplier||isTransporterParty?'Paid — ':'Received — ')+(ACC_MAP[p.account]?.short||p.account||'—'));
 
   const newSales=isSupplier
+    // s.extraChargesTotal (loading/packing/octroi etc. billed by this same
+    // supplier) is owed to them just like the goods — same treatment as
+    // getSupplierBal/getAllVendorMetrics — so it's folded into the ledger
+    // amount here too, otherwise this ledger's running balance understates
+    // what getSupplierBal reports as actually owed.
     ?state.purchases.filter(s=>s.partyId===party.id).map(s=>({
-        date:s.date, type:s.total<0?'return':'purchase', amount:s.total,
+        date:s.date, type:s.total<0?'return':'purchase', amount:s.total+(s.extraChargesTotal||0),
         desc:(s.items||[]).slice(0,3).map(x=>(x.supplierName||x.customerName||x.itemName)+' ×'+x.qty).join(', ')||(s.total<0?'Purchase Return':'Purchase'),
         createdAt:s.createdAt||'', purchaseId:s.id,
       }))
@@ -2857,8 +2862,9 @@ function PartyLedger({party,onClose}){
   const exportEntries=useMemo(()=>{
     const lineOf=x=>Array.isArray(x)?{name:x[0],qty:x[1],rate:x[2],amount:(x[1]!=null&&x[2]!=null)?x[1]*x[2]:null}:{name:String(x),qty:null,rate:null,amount:null};
     const inAppTx=isSupplier
-      ?state.purchases.filter(s=>s.partyId===party.id).map(s=>({date:s.date,type:s.total<0?'return':'purchase',amount:s.total,
-          items:(s.items||[]).map(x=>({name:x.supplierName||x.customerName||x.itemName||'Item',qty:x.qty,rate:x.rate,amount:x.amount??(x.qty*x.rate)}))}))
+      ?state.purchases.filter(s=>s.partyId===party.id).map(s=>({date:s.date,type:s.total<0?'return':'purchase',amount:s.total+(s.extraChargesTotal||0),
+          items:[...(s.items||[]).map(x=>({name:x.supplierName||x.customerName||x.itemName||'Item',qty:x.qty,rate:x.rate,amount:x.amount??(x.qty*x.rate)})),
+            ...(s.extraChargesTotal?[{name:(s.extraCharges||[]).map(c=>c.name).join(', ')||'Extra charges',qty:null,rate:null,amount:s.extraChargesTotal}]:[])]}))
       :isTransporterParty
       ?state.freightCharges.filter(f=>f.transporterId===party.id).map(f=>({date:f.date,type:'freight',amount:f.amount,
           items:[{name:f.notes||'Freight',qty:f.totalPetis,rate:f.ratePerPeti,amount:f.amount}]}))
@@ -6939,7 +6945,11 @@ function PurchLog() {
       }
     }
     for(const p of state.purchases){
-      rows.push({d:p.bookedDate||p.date,receivedDate:p.receivedDate||null,party:p.partyName,total:p.total,items:(p.items||[]).map(x=>([x.supplierName||x.customerName||x.itemName,x.qty,x.rate])),isNew:true,isReturn:p.total<0,id:p.id});
+      // p.extraChargesTotal (loading/packing/octroi etc. billed by the same
+      // supplier) is owed to this same party just like the goods themselves —
+      // same treatment as getSupplierBal — so it's rolled into the amount
+      // shown here, not silently dropped.
+      rows.push({d:p.bookedDate||p.date,receivedDate:p.receivedDate||null,party:p.partyName,total:p.total+(p.extraChargesTotal||0),items:(p.items||[]).map(x=>([x.supplierName||x.customerName||x.itemName,x.qty,x.rate])),isNew:true,isReturn:p.total<0,id:p.id});
     }
     return rows.sort((a,b)=>b.d.localeCompare(a.d));
   },[state.purchases.length,_fvPL]);
