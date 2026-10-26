@@ -219,7 +219,10 @@ export function getAllCustomerMetrics() {
   }
   const costOf = name => itemCost.get(String(name || '').toLowerCase()) || 0;
 
-  const customers = state.parties.filter(p => p.type === 'customer');
+  // A 'both'-type party (customer AND supplier) counts as a customer here too
+  // — mirrors isCustomerParty() in App.jsx, duplicated here since store.js
+  // has no dependency on App.jsx.
+  const customers = state.parties.filter(p => p.type === 'customer' || p.type === 'both');
   return customers.map(p => {
     const hist = PARTY_HISTORY[p.name] || {};
     const histBills = (hist.s || []).map(([d, total, items]) => ({ date: d, total, items }));
@@ -268,7 +271,7 @@ export function getAllCustomerMetrics() {
 // SUPPLIER_HISTORY (raw Purchase sheet's Cash Paid + Bank Paid columns), so avg
 // payment days is FIFO-matched across the full history, not just new ERP data.
 export function getAllVendorMetrics() {
-  const suppliers = state.parties.filter(p => p.type === 'supplier');
+  const suppliers = state.parties.filter(p => p.type === 'supplier' || p.type === 'both');
   return suppliers.map(p => {
     const hist = SUPPLIER_HISTORY[p.name] || {};
     const histBills = (hist.s || []).map(([d, total]) => ({ date: d, total }));
@@ -469,6 +472,19 @@ export function getSaleProfitAnalysis() {
     const grossMarginPct = rec.revenue > 0 ? Math.round(grossProfit / rec.revenue * 1000) / 10 : 0;
     const traceableSegs = rec.segs.filter(g => g.purchaseId);
     const traceableCost = traceableSegs.reduce((s2, g) => s2 + g.amt, 0);
+    // Value-weighted share of each supplying purchase's extraChargesTotal
+    // (loading/packing/octroi/freight — see getItemLandingCost's identical
+    // apportioning logic) folded into this sale's cost, for the "gross
+    // profit according to landing cost" figure (request #26) — distinct
+    // from the plain grossProfit above, which only reflects the bare
+    // purchase rate.
+    const transportCost = traceableSegs.reduce((s2, g) => {
+      const p = state.purchases.find(pu => pu.id === g.purchaseId);
+      return (p && p.total > 0 && p.extraChargesTotal) ? s2 + g.amt * (p.extraChargesTotal / p.total) : s2;
+    }, 0);
+    const landedCost = rec.cost + transportCost;
+    const grossProfitLanded = rec.revenue - landedCost;
+    const grossMarginLandedPct = rec.revenue > 0 ? Math.round(grossProfitLanded / rec.revenue * 1000) / 10 : 0;
     let interestLoad = 0;
     if (traceableCost > 1e-6) {
       const weightedPurchMs = traceableSegs.reduce((s2, g) => s2 + (purchasePaidMap.get(g.purchaseId) ?? todayMs) * g.amt, 0) / traceableCost;
@@ -478,14 +494,58 @@ export function getSaleProfitAnalysis() {
     }
     const netProfit = Math.round(grossProfit - interestLoad);
     const netMarginPct = rec.revenue > 0 ? Math.round(netProfit / rec.revenue * 1000) / 10 : 0;
+    // Plain "days from sale date to payment received date" (request #23) —
+    // distinct from the interest calc above (which measures from the
+    // supplier's weighted PAID date, not the sale date, since that's the
+    // actual capital-gap the interest load represents). This is the simpler,
+    // literal collection-days figure the user asked to see alongside it.
+    const saleRecMsForDays = saleReceivedMap.get(s.id) ?? todayMs;
+    const daysToPayment = Math.round((saleRecMsForDays - msOf(s.date)) / (1000 * 60 * 60 * 24));
     out.push({
       saleId: s.id, date: s.date, partyId: s.partyId, partyName: party?.name || s.partyName || '—',
       qty: Math.round(rec.qty * 100) / 100, revenue: Math.round(rec.revenue), cost: Math.round(rec.cost),
       grossProfit: Math.round(grossProfit), grossMarginPct,
-      traceableCost: Math.round(traceableCost), interestLoad, netProfit, netMarginPct,
+      traceableCost: Math.round(traceableCost), interestLoad, netProfit, netMarginPct, daysToPayment,
+      transportCost: Math.round(transportCost), landedCost: Math.round(landedCost),
+      grossProfitLanded: Math.round(grossProfitLanded), grossMarginLandedPct,
     });
   }
   return out.sort((a, b) => b.date.localeCompare(a.date));
+}
+
+// Whole-business profit breakdown for an arbitrary date range (request #26)
+// — three successive refinements of the same number, each netting off one
+// more real cost than the last:
+//   grossProfit  = revenue − landed cost (purchase rate + apportioned
+//                  transport/loading/packing share, see getSaleProfitAnalysis)
+//   netProfit    = grossProfit − business-tagged operating expenses booked
+//                  in the same range (rent, salary, etc. — getExpensesInRange)
+//   trueProfit   = netProfit − the 1%/month interest burden on the capital
+//                  tied up between paying the supplier and collecting from
+//                  the customer (same interestLoad getSaleProfitAnalysis
+//                  already computes per sale)
+// nonBusinessExpenses is reported alongside for visibility only — it's
+// personal/non-business spend (e.g. Ghar Kharch) and is never netted against
+// business profit, same convention as getPnL().
+export function getProfitBreakdownInRange(fromDate, toDate) {
+  const sales = getSaleProfitAnalysis().filter(s => s.date >= fromDate && s.date <= toDate);
+  const revenue = sales.reduce((s, r) => s + r.revenue, 0);
+  const landedCost = sales.reduce((s, r) => s + r.landedCost, 0);
+  const interestLoad = sales.reduce((s, r) => s + r.interestLoad, 0);
+  const grossProfit = revenue - landedCost;
+  const grossMarginPct = revenue > 0 ? Math.round(grossProfit / revenue * 1000) / 10 : 0;
+  const { business: businessExpenses, nonBusiness: nonBusinessExpenses } = getExpensesInRange(fromDate, toDate);
+  const netProfit = grossProfit - businessExpenses;
+  const netMarginPct = revenue > 0 ? Math.round(netProfit / revenue * 1000) / 10 : 0;
+  const trueProfit = netProfit - interestLoad;
+  const trueMarginPct = revenue > 0 ? Math.round(trueProfit / revenue * 1000) / 10 : 0;
+  return {
+    fromDate, toDate, revenue, landedCost, orderCount: sales.length,
+    grossProfit: Math.round(grossProfit), grossMarginPct,
+    businessExpenses, netProfit: Math.round(netProfit), netMarginPct,
+    interestLoad, trueProfit: Math.round(trueProfit), trueMarginPct,
+    nonBusinessExpenses,
+  };
 }
 
 // Per-customer roll-up of getSaleProfitAnalysis — avg profit % (both gross
@@ -696,8 +756,14 @@ export function getPnL() {
   // above, since it's tracked per-party (repairExpenses) rather than by the
   // party-less TXN_CATEGORIES those rows are built from.
   const repairExpenseTotal = Math.round(state.repairExpenses.reduce((s, r) => s + (r.expenseAmount || 0), 0));
-  const netProfit = grossProfit - businessExpenses - repairExpenseTotal;
-  return { revenue, cogs, grossProfit, businessExpenses, nonBusinessExpenses, repairExpenseTotal, netProfit, expenseRows };
+  // Stock reconciliation adjustments (physical count vs book qty, see
+  // reconcileItemStock() in App.jsx) feed straight into profit: a shortfall's
+  // `value` is negative (loss), an excess's is positive (profit) — exactly
+  // as the user described it ("lost items will lead to loss, and excess
+  // will lead to profit").
+  const reconciliationAdj = Math.round(state.stockReconciliations.reduce((s, r) => s + (r.value || 0), 0));
+  const netProfit = grossProfit - businessExpenses - repairExpenseTotal + reconciliationAdj;
+  return { revenue, cogs, grossProfit, businessExpenses, nonBusinessExpenses, repairExpenseTotal, reconciliationAdj, netProfit, expenseRows };
 }
 
 // Total warranty/repair expenditure booked against one party — sums both
@@ -790,6 +856,93 @@ export function getFifoStockMap() {
     map[it.id] = { qty, value, avgRate };
   }
   return map;
+}
+
+// ── Item landing cost — base rate + transportation + interest burden, per
+// piece of currently-held balance stock (request #24) ──────────────────────
+// "Landing cost" here means what this stock actually costs to hold right
+// now, not just the entered purchase rate: this item's current FIFO layers
+// (same replay getFifoStockMap does) are rebuilt WITH each layer's
+// originating purchase id, so each surviving layer (i.e. the stock still on
+// hand) can look up (a) its share of that purchase's extraChargesTotal
+// (loading/packing/octroi/freight — apportioned across that purchase's
+// lines by value, so a costlier line carries a proportionally bigger share)
+// and (b) the same 1%/month interest-load formula getSaleProfitAnalysis
+// uses, but measured from the supplier's weighted-paid date to TODAY rather
+// than to a sale's received date — this capital is tied up in stock that
+// hasn't sold yet, so the interest clock on it is still running right now.
+// A layer with no traceable purchase (opening-stock plug, or a sales return
+// put back at current cost) carries no transport/interest share, same
+// documented restriction as getSaleProfitAnalysis's traceableCost.
+export function getItemLandingCost(itemId) {
+  const it = state.items.find(x => x.id === itemId);
+  if (!it) return null;
+  const events = [];
+  for (const p of state.purchases) for (const l of (p.items || [])) {
+    if (l.itemId !== itemId) continue;
+    events.push({ date: p.date, seq: p.createdAt || '', netQty: l.qty || 0, rate: l.rate || 0, purchaseId: p.id });
+  }
+  for (const s of state.sales) for (const x of (s.items || [])) {
+    if (x.itemId !== itemId) continue;
+    events.push({ date: s.date, seq: s.createdAt || '', netQty: -(x.qty || 0), rate: null, purchaseId: null });
+  }
+  for (const r of state.repairExpenses) {
+    if (r.itemId !== itemId) continue;
+    events.push({ date: r.date, seq: r.createdAt || '', netQty: -(r.qty || 0), rate: null, purchaseId: null });
+  }
+  events.sort((a, b) => a.date.localeCompare(b.date) || a.seq.localeCompare(b.seq));
+
+  const layers = [];
+  const withdraw = qty => {
+    let need = qty;
+    while (need > 1e-9 && layers.length) {
+      const l = layers[0];
+      const take = Math.min(l.qty, need);
+      l.qty -= take; need -= take;
+      if (l.qty <= 1e-9) layers.shift();
+    }
+  };
+  for (const e of events) {
+    if (e.netQty > 1e-9) layers.push({ qty: e.netQty, rate: e.rate != null ? e.rate : (it.purch || 0), purchaseId: e.purchaseId });
+    else if (e.netQty < -1e-9) withdraw(-e.netQty);
+  }
+  // Reconcile to item.stock exactly like getFifoStockMap does.
+  const inAppQty = layers.reduce((s, l) => s + l.qty, 0);
+  const plug = (it.stock || 0) - inAppQty;
+  if (plug > 1e-9) layers.unshift({ qty: plug, rate: it.purch || 0, purchaseId: null });
+  else if (plug < -1e-9) withdraw(-plug);
+
+  const qty = Math.round(layers.reduce((s, l) => s + l.qty, 0) * 100) / 100;
+  const baseRateFallback = it.purch || 0;
+  if (qty <= 0) {
+    return { qty: 0, baseCost: 0, transport: 0, interest: 0, landingCost: 0,
+      baseRate: baseRateFallback, transportPerPc: 0, interestPerPc: 0, landingCostPerPc: baseRateFallback, hasUntraceable: false };
+  }
+
+  const purchasePaidMap = getPurchasePaidDateMap();
+  const todayMs = msOf(today());
+  let baseCost = 0, transport = 0, interest = 0, hasUntraceable = false;
+  for (const l of layers) {
+    const lineCost = l.qty * l.rate;
+    baseCost += lineCost;
+    if (!l.purchaseId) { hasUntraceable = true; continue; }
+    const p = state.purchases.find(pu => pu.id === l.purchaseId);
+    if (p && p.total > 0 && p.extraChargesTotal) {
+      transport += lineCost * (p.extraChargesTotal / p.total);
+    }
+    const paidMs = purchasePaidMap.get(l.purchaseId) ?? todayMs;
+    const months = (todayMs - paidMs) / (1000 * 60 * 60 * 24 * 30);
+    if (months > 0) interest += lineCost * 0.01 * months;
+  }
+  baseCost = Math.round(baseCost); transport = Math.round(transport); interest = Math.round(interest);
+  const landingCost = baseCost + transport + interest;
+  return {
+    qty, baseCost, transport, interest, landingCost, hasUntraceable,
+    baseRate: Math.round(baseCost / qty * 100) / 100,
+    transportPerPc: Math.round(transport / qty * 100) / 100,
+    interestPerPc: Math.round(interest / qty * 100) / 100,
+    landingCostPerPc: Math.round(landingCost / qty * 100) / 100,
+  };
 }
 
 // Real, FIFO-costed margin on actual in-app sales — same dated/itemId-tagged
@@ -903,6 +1056,32 @@ export function getFifoProfitInRange(fromDate, toDate) {
     }
   }
   return { revenue: Math.round(revenue), cost: Math.round(cost), profit: Math.round(revenue - cost), qty: Math.round(qty * 100) / 100 };
+}
+
+// Business- vs non-business-tagged operating expenses actually incurred
+// within an arbitrary date range — same source data as getMonthlyBI's
+// per-month expense bucket (dated EXPENSE_SUBLEDGER entries, which reconcile
+// to HISTORICAL_EXPENSES, plus new in-app txns), just filtered by a date
+// range instead of calendar months. Used by the Dashboard's "Profit Net of
+// Business Expenses" tile (request #25) and Profit Analysis's
+// gross/net/true-profit date-range breakdown (request #26).
+export function getExpensesInRange(fromDate, toDate) {
+  const cats = [...TXN_CATEGORIES, ...state.customCategories].filter(c => c.dir === 'out' && c.party === null);
+  let business = 0, nonBusiness = 0;
+  for (const c of cats) {
+    const isBiz = getCategoryBiz(c.id) === 'business';
+    const subs = EXPENSE_SUBLEDGER[c.id] || {};
+    for (const head in subs) for (const [d, amt] of subs[head]) {
+      if (d >= fromDate && d <= toDate) { if (isBiz) business += amt; else nonBusiness += amt; }
+    }
+  }
+  const bizIds = new Set(cats.filter(c => getCategoryBiz(c.id) === 'business').map(c => c.id));
+  for (const t of state.txns) {
+    if (t.type !== 'payment' || !cats.some(c => c.id === t.category)) continue;
+    if (t.date < fromDate || t.date > toDate) continue;
+    if (bizIds.has(t.category)) business += t.amount; else nonBusiness += t.amount;
+  }
+  return { business: Math.round(business), nonBusiness: Math.round(nonBusiness) };
 }
 
 // Per-sale FIFO cost/margin detail for ONE item, keyed by sale id — same
@@ -1318,6 +1497,11 @@ export const state = {
   itemCustomerNames: {},
   repairExpenses:   [],
   stockAdjustments: [],
+  // Physical-count reconciliations (book qty vs counted qty) — see
+  // reconcileItemStock() in App.jsx. Each entry's `value` (diff × purchase
+  // rate) feeds into getPnL()'s netProfit below: a shortfall is a loss, an
+  // excess is a profit, exactly as the user described it.
+  stockReconciliations: [],
   // Item ids temporarily dismissed from the Dashboard's "Out of Stock" list
   // (item #4 of the dashboard request) — a soft hide, not a data change:
   // the item is still genuinely out of stock, the user just doesn't want it
@@ -1333,30 +1517,37 @@ export const state = {
   loaded:           false,
 };
 
+// Every save.x() both persists (DB.set, as before) AND notifies the shared
+// liveListeners set (see notifyLive() in the LIVE UPDATE section below) —
+// see the comment there for why (request #21: stale UI until refresh).
+// `mk` is just a small factory to keep that pairing from having to be
+// retyped correctly on all ~25 lines below.
+const mk = (key, getVal) => () => { const r = DB.set(key, getVal()); notifyLive(); return r; };
 export const save = {
-  sales:            () => DB.set('data:sales',            state.sales),
-  payments:         () => DB.set('data:payments',          state.payments),
-  purchases:        () => DB.set('data:purchases',         state.purchases),
-  supplierPayments: () => DB.set('data:supplierPayments',  state.supplierPayments),
-  freightCharges:   () => DB.set('data:freightCharges',    state.freightCharges),
-  txns:             () => DB.set('data:txns',              state.txns),
-  followups:        () => DB.set('data:followups',         state.followups),
-  templates:        () => DB.set('data:templates',         state.templates),
-  phoneEdits:       () => DB.set('data:phoneEdits',        state.phoneEdits),
-  partyTransport:   () => DB.set('data:partyTransport',    state.partyTransport),
-  cityTransport:    () => DB.set('data:cityTransport',     state.cityTransport),
-  parties:          () => DB.set('data:parties',           state.parties),
-  items:            () => DB.set('data:items',             state.items),
-  categoryTags:     () => DB.set('data:categoryTags',      state.categoryTags),
-  customCategories: () => DB.set('data:customCategories',  state.customCategories),
-  orders:           () => DB.set('data:orders',            state.orders),
-  dispatchPhone:    () => DB.set('data:dispatchPhone',     state.dispatchPhone),
-  itemCustomerNames: () => DB.set('data:itemCustomerNames', state.itemCustomerNames),
-  cityOrder:        () => DB.set('data:cityOrder',         state.cityOrder),
-  repairExpenses:   () => DB.set('data:repairExpenses',    state.repairExpenses),
-  stockAdjustments: () => DB.set('data:stockAdjustments',  state.stockAdjustments),
-  users:            () => DB.set('data:users',             state.users),
-  dashboardHiddenOOS: () => DB.set('data:dashboardHiddenOOS', state.dashboardHiddenOOS),
+  sales:            mk('data:sales',            () => state.sales),
+  payments:         mk('data:payments',         () => state.payments),
+  purchases:        mk('data:purchases',        () => state.purchases),
+  supplierPayments: mk('data:supplierPayments', () => state.supplierPayments),
+  freightCharges:   mk('data:freightCharges',   () => state.freightCharges),
+  txns:             mk('data:txns',             () => state.txns),
+  followups:        mk('data:followups',        () => state.followups),
+  templates:        mk('data:templates',        () => state.templates),
+  phoneEdits:       mk('data:phoneEdits',       () => state.phoneEdits),
+  partyTransport:   mk('data:partyTransport',   () => state.partyTransport),
+  cityTransport:    mk('data:cityTransport',    () => state.cityTransport),
+  parties:          mk('data:parties',          () => state.parties),
+  items:            mk('data:items',            () => state.items),
+  categoryTags:     mk('data:categoryTags',     () => state.categoryTags),
+  customCategories: mk('data:customCategories', () => state.customCategories),
+  orders:           mk('data:orders',           () => state.orders),
+  dispatchPhone:    mk('data:dispatchPhone',    () => state.dispatchPhone),
+  itemCustomerNames: mk('data:itemCustomerNames', () => state.itemCustomerNames),
+  cityOrder:        mk('data:cityOrder',        () => state.cityOrder),
+  repairExpenses:   mk('data:repairExpenses',   () => state.repairExpenses),
+  stockAdjustments: mk('data:stockAdjustments', () => state.stockAdjustments),
+  stockReconciliations: mk('data:stockReconciliations', () => state.stockReconciliations),
+  users:            mk('data:users',            () => state.users),
+  dashboardHiddenOOS: mk('data:dashboardHiddenOOS', () => state.dashboardHiddenOOS),
 };
 
 // ── Dashboard: Out of Stock hide/unhide (request #4) ────────────────────────
@@ -1437,16 +1628,28 @@ const STORAGE_KEY_TO_STATE = {
   'data:orders':'orders', 'data:dispatchPhone':'dispatchPhone', 'data:itemCustomerNames':'itemCustomerNames',
   'data:cityOrder':'cityOrder', 'data:repairExpenses':'repairExpenses',
   'data:stockAdjustments':'stockAdjustments', 'data:users':'users',
+  'data:stockReconciliations':'stockReconciliations',
   'data:dashboardHiddenOOS':'dashboardHiddenOOS',
 };
 const liveListeners = new Set();
 export function subscribeLive(fn) { liveListeners.add(fn); return () => liveListeners.delete(fn); }
+// Shared notify, used by the cross-tab/cross-device paths below AND (see
+// `save` object above, request #21 fix) by every same-tab local write too —
+// previously a same-tab mutation relied entirely on whichever component
+// called it also remembering to call its OWN local forceUpdate(); any call
+// site anywhere in this large app that forgot left that one action
+// "stale until refreshed" on whatever page it happened on. Routing every
+// save.x() through this one shared notify instead means App.jsx's
+// `key={mod+'#'+liveTick}` remount trick (already built for the cross-tab
+// case) now also fires for local writes, so the currently-open page always
+// gets a guaranteed-fresh remount after ANY state mutation, local or not.
+export function notifyLive() { liveListeners.forEach(fn => fn()); }
 if (typeof window !== 'undefined') {
   window.addEventListener('storage', (e) => {
     const key = STORAGE_KEY_TO_STATE[e.key];
     if (!key || e.newValue == null) return;
     try { state[key] = JSON.parse(e.newValue); } catch { return; }
-    liveListeners.forEach(fn => fn());
+    notifyLive();
   });
 }
 
@@ -1456,11 +1659,35 @@ if (typeof window !== 'undefined') {
 // components, reusing the exact same STORAGE_KEY_TO_STATE map and notify
 // mechanism (components already subscribed via subscribeLive() need no
 // changes at all to pick up a remote-origin update).
+// Sound alert on "new Sales Order" / "order Dispatched" — zero extra
+// Supabase infra needed (no push subscriptions, no Edge Function, no
+// webhook): this device's own Realtime subscription already receives
+// every order-array write made on any OTHER signed-in device, so we just
+// diff the array that's about to replace state.orders against the one
+// already sitting in memory, and surface a browser Notification (which
+// carries the OS's own notification sound) for whatever changed. The only
+// requirement is that this tab stays open (foreground or background) —
+// there's no way to reach a fully closed browser without real Web Push.
+export function describeOrder(o) {
+  const items = o.items || [];
+  const first = items[0];
+  const label = first ? (first.customerName || first.itemName || 'item') + (items.length > 1 ? ` +${items.length - 1} more` : '') : '';
+  return `${o.partyName || 'Party'} — ${label} — ₹${Math.round(o.total || 0).toLocaleString('en-IN')}`;
+}
+function notifyOrderDiff(oldOrders, newOrders) {
+  const oldById = new Map((oldOrders || []).map(o => [o.id, o]));
+  for (const o of (newOrders || [])) {
+    const prev = oldById.get(o.id);
+    if (!prev) DB.notify('🆕 New Sales Order', describeOrder(o));
+    else if (prev.status !== 'dispatched' && o.status === 'dispatched') DB.notify('📦 Order Dispatched', describeOrder(o));
+  }
+}
 DB.onRemoteUpdate((storageKey, value) => {
   const key = STORAGE_KEY_TO_STATE[storageKey];
   if (!key) return;
+  if (key === 'orders') notifyOrderDiff(state.orders, value);
   state[key] = value;
-  liveListeners.forEach(fn => fn());
+  notifyLive();
 });
 
 export function updatePartyPhone(partyId, phone) {
@@ -1473,14 +1700,14 @@ export function updatePartyPhone(partyId, phone) {
 export async function loadAll() {
   if (state.loaded) return;
   try {
-    const [sales,payments,pe,pt,fu,txns,parties,items,purchases,supplierPayments,freightCharges,customCategories,categoryTags,cityTransport,orders,dispatchPhone,itemCustomerNames,cityOrder,repairExpenses,stockAdjustments,users,dashboardHiddenOOS] = await Promise.all([
+    const [sales,payments,pe,pt,fu,txns,parties,items,purchases,supplierPayments,freightCharges,customCategories,categoryTags,cityTransport,orders,dispatchPhone,itemCustomerNames,cityOrder,repairExpenses,stockAdjustments,users,stockReconciliations,dashboardHiddenOOS] = await Promise.all([
       DB.get('data:sales'), DB.get('data:payments'), DB.get('data:phoneEdits'),
       DB.get('data:partyTransport'), DB.get('data:followups'), DB.get('data:txns'),
       DB.get('data:parties'), DB.get('data:items'), DB.get('data:purchases'), DB.get('data:supplierPayments'),
       DB.get('data:freightCharges'), DB.get('data:customCategories'), DB.get('data:categoryTags'),
       DB.get('data:cityTransport'), DB.get('data:orders'), DB.get('data:dispatchPhone'), DB.get('data:itemCustomerNames'),
       DB.get('data:cityOrder'), DB.get('data:repairExpenses'), DB.get('data:stockAdjustments'), DB.get('data:users'),
-      DB.get('data:dashboardHiddenOOS'),
+      DB.get('data:stockReconciliations'), DB.get('data:dashboardHiddenOOS'),
     ]);
     if (sales)    state.sales    = sales;
     if (payments) state.payments = payments;
@@ -1500,6 +1727,7 @@ export async function loadAll() {
     if (repairExpenses)   state.repairExpenses    = repairExpenses;
     if (stockAdjustments) state.stockAdjustments  = stockAdjustments;
     if (users)            state.users             = users;
+    if (stockReconciliations) state.stockReconciliations = stockReconciliations;
     if (dashboardHiddenOOS) state.dashboardHiddenOOS = dashboardHiddenOOS;
     // One-time migration: persisted items predate two corrections in the seed
     // data — (1) `purch` used to be a flat 22% of `sale` instead of a real

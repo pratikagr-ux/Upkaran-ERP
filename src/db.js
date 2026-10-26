@@ -232,4 +232,66 @@ export const DB = {
       console.warn('[db] deletePhoto failed', e?.message || e);
     }
   },
+
+  // ── Sound notifications (new Sales Order / new Dispatch) ───────────────
+  // Deliberately NOT real Web Push — that needs a server (Edge Function +
+  // VAPID keys + a Database Webhook), real infra to stand up and maintain.
+  // Instead this rides the cross-device sync that already exists: every
+  // device's Supabase Realtime subscription (see onRemoteUpdate below)
+  // already receives every order-array write from every other signed-in
+  // device, so store.js just diffs old-vs-new and calls DB.notify() —
+  // which shows a browser Notification (with the OS's own notification
+  // sound) via the Service Worker already registered in main.jsx. Zero
+  // Supabase setup, zero secrets. The one real trade-off: this only fires
+  // while the tab is open somewhere on that device (foreground or a
+  // backgrounded tab) — a fully closed browser gets nothing, since that
+  // needs true push and there's no way around it.
+  notificationsSupported: () => typeof window !== 'undefined' && 'serviceWorker' in navigator && typeof Notification !== 'undefined',
+
+  // 'unsupported' | 'default' (not yet asked) | 'granted' | 'denied'
+  getNotificationPermission: () => {
+    if (!DB.notificationsSupported()) return 'unsupported';
+    return Notification.permission;
+  },
+
+  isNotificationsMuted: () => { try { return localStorage.getItem('__notifyMuted') === '1'; } catch { return false; } },
+  setNotificationsMuted: (muted) => { try { localStorage.setItem('__notifyMuted', muted ? '1' : '0'); } catch {} },
+
+  enableNotifications: async () => {
+    if (!DB.notificationsSupported()) throw new Error('Notifications aren\'t supported in this browser.');
+    const perm = await Notification.requestPermission();
+    if (perm !== 'granted') throw new Error('Notification permission was not granted.');
+    DB.setNotificationsMuted(false);
+    return true;
+  },
+
+  // There's no browser API to revoke a permission already granted — only
+  // the user can do that, from their own browser/site settings. "Disable"
+  // here is a local mute flag DB.notify() checks, so it still has a real
+  // effect without sending the user hunting through OS settings.
+  disableNotifications: () => { DB.setNotificationsMuted(true); },
+
+  // Core notify — called from store.js whenever a new order/dispatch is
+  // detected (either locally, right after the action, or from another
+  // device's Realtime update). Silently no-ops if unsupported/not
+  // permitted/muted, so every call site can fire-and-forget this.
+  notify: (title, body) => {
+    if (!DB.notificationsSupported()) return;
+    if (Notification.permission !== 'granted') return;
+    if (DB.isNotificationsMuted()) return;
+    navigator.serviceWorker.ready.then(reg => reg.showNotification(title, {
+      body, icon: 'icon-192.png', badge: 'icon-192.png', vibrate: [200, 100, 200], tag: body,
+    })).catch(() => {});
+  },
+
+  testNotification: async () => {
+    if (!DB.notificationsSupported()) throw new Error('Notifications aren\'t supported in this browser.');
+    if (Notification.permission !== 'granted') throw new Error('Enable notifications first.');
+    const reg = await navigator.serviceWorker.ready;
+    await reg.showNotification('Upkaran ERP', {
+      body: 'Test alert — if you heard/saw this, sound notifications are working on this device.',
+      icon: 'icon-192.png',
+      vibrate: [200, 100, 200],
+    });
+  },
 };

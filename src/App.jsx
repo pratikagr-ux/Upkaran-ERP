@@ -12,7 +12,7 @@ import * as XLSX from 'xlsx';
 import { C, fmt, fmtL, fmtD, today, uid, ROUTES, ACCOUNTS, ACC_MAP, TXN_CATEGORIES, HISTORICAL_EXPENSES, TAG_COLORS, APP_VERSION } from './constants.js';
 import { DB } from './db.js';
 import { supabase } from './supabaseClient.js';
-import { state, save, loadAll, updatePartyPhone, getBestRate, gPS, getPrevItems, parseQty, parseResponse, getAccBal, getSupplierBal, getCustomerBal, getPartyBills, getSupplierBills, getBestPurchRate, getAllCustomerMetrics, getAllVendorMetrics, getExpenseReport, setCategoryBiz, getCategorySubLedger, getAllItemRows, getItemMetrics, getAllItemMetrics, getExpectedStockMap, getFifoStockMap, getFifoSaleMarginMap, getFifoSaleCosts, getFifoProfitInRange, hideFromDashboardOOS, unhideFromDashboardOOS, getReorderItems, setReorderLevel, getSaleProfitAnalysis, getCustomerProfitSummary, getRecentModeSaleRate, getMonthlyBI, getMonthlyBIByCategory, getSalesProfitByCategory, getPnL, getBalanceSheet, getRepairExpenseTotal, splitPosNegItems, recordCityTransport, getTopTransportersForCity, getAllTransporterNames, subscribeLive, getItemCustomerName, setItemCustomerName, PARTY_INVOICES, PARTY_HISTORY, SUPPLIER_HISTORY, ACCOUNT_OB, ACCOUNT_HISTORY, applyTemplate, DEFAULT_TEMPLATES } from './store.js';
+import { state, save, loadAll, updatePartyPhone, getBestRate, gPS, getPrevItems, parseQty, parseResponse, getAccBal, getSupplierBal, getCustomerBal, getPartyBills, getSupplierBills, getBestPurchRate, getAllCustomerMetrics, getAllVendorMetrics, getExpenseReport, setCategoryBiz, getCategorySubLedger, getAllItemRows, getItemMetrics, getAllItemMetrics, getExpectedStockMap, getFifoStockMap, getItemLandingCost, getFifoSaleMarginMap, getFifoSaleCosts, getFifoProfitInRange, getExpensesInRange, hideFromDashboardOOS, unhideFromDashboardOOS, getReorderItems, setReorderLevel, getSaleProfitAnalysis, getProfitBreakdownInRange, getCustomerProfitSummary, getRecentModeSaleRate, getMonthlyBI, getMonthlyBIByCategory, getSalesProfitByCategory, getPnL, getBalanceSheet, getRepairExpenseTotal, splitPosNegItems, recordCityTransport, getTopTransportersForCity, getAllTransporterNames, subscribeLive, getItemCustomerName, setItemCustomerName, PARTY_INVOICES, PARTY_HISTORY, SUPPLIER_HISTORY, ACCOUNT_OB, ACCOUNT_HISTORY, applyTemplate, DEFAULT_TEMPLATES, describeOrder } from './store.js';
 
 // ── CONVENIENT ALIASES (same pattern as monolith) ─────────────────────────────
 const _p  = () => state.parties;
@@ -168,6 +168,33 @@ function moveItemStock(sourceId, targetId, qty, reason) {
   save.stockAdjustments();
 }
 
+// Physical-count reconciliation: the user counts actual shelf stock for an
+// item and enters it here against the book qty the app currently shows.
+// Any mismatch is logged with a profit/loss `value` (diff × purchase rate)
+// that flows straight into getPnL()'s netProfit — a shortfall (physical <
+// book) is a loss, an excess (physical > book) is a profit, exactly as
+// described: "lost items will lead to loss, and excess will lead to
+// profit." Unlike moveItemStock this touches only one item — there's no
+// second item on the other side of a reconciliation, just a correction
+// against reality.
+function reconcileItemStock(itemId, physicalQty, notes) {
+  const item = state.items.find(x => x.id === itemId);
+  if (!item || physicalQty == null || physicalQty < 0) return;
+  const bookQty = item.stock || 0;
+  const diff = physicalQty - bookQty;
+  if (diff === 0) return;
+  state.items = state.items.map(x => x.id === itemId ? { ...x, stock: physicalQty } : x);
+  save.items();
+  const rate = item.purchRaw ?? item.purch ?? 0;
+  const entry = {
+    id: uid('REC'), date: today(), itemId, itemName: item.internal||item.customer||item.name||'',
+    bookQty, physicalQty, diff, value: Math.round(diff * rate), notes: (notes||'').trim(),
+    createdAt: new Date().toISOString(),
+  };
+  state.stockReconciliations = [entry, ...state.stockReconciliations];
+  save.stockReconciliations();
+}
+
 // ── PURCHASE ORDER STATUS (Dashboard order-status board, linked backorder) ──
 // A purchase's `status` ('ordered'|'dispatched'|'received') is new, tracked
 // alongside the pre-existing `receivedDate` (kept exactly as-is — markReceived
@@ -184,13 +211,15 @@ function markPurchaseOrdered(id) {
   state.purchases = state.purchases.map(p => p.id===id ? { ...p, status:'ordered', expectedDate:null } : p);
   save.purchases();
 }
-// The moment this is called IS the dispatch — so the dispatch date is always
-// "now" (today()), auto-stamped, never typed in. The date the user types in
-// the "Mark Dispatched" flow is the separate, forward-looking "expected
-// (arrival)" date — previously the UI only had one date input and it got
-// conflated with/displayed as both, which is exactly the bug reported.
+// Dispatched date is the purchase's own booking date (p.bookedDate/p.date —
+// already entered when the purchase was recorded), not "today" — by the time
+// someone clicks "Mark Dispatched" in the app it's often days after the
+// supplier actually dispatched, and the booking date is the accurate record
+// of when that happened, not whenever this button got clicked. The date the
+// user types in the "Mark Dispatched" flow is the separate, forward-looking
+// "expected (arrival)" date.
 function markPurchaseDispatched(id, expectedDate) {
-  state.purchases = state.purchases.map(p => p.id===id ? { ...p, status:'dispatched', dispatchedOn: p.dispatchedOn||today(), expectedDate: expectedDate||p.expectedDate||'' } : p);
+  state.purchases = state.purchases.map(p => p.id===id ? { ...p, status:'dispatched', dispatchedOn: p.dispatchedOn||p.bookedDate||p.date||today(), expectedDate: expectedDate||p.expectedDate||'' } : p);
   save.purchases();
 }
 // Data-only — adjusts stock exactly like PurchLog's original local
@@ -225,6 +254,24 @@ function computeOrderLineStatus(line) {
 // manually (moveToDamaged) once a problem is actually found.
 const DAMAGE_TRACKED_CATS = new Set(['Infrared','Induction Cooker']);
 const WARRANTY_OPTIONS = ['1yr warranty','1yr glass warranty','6 months warranty','no warranty'];
+
+// One-shot filter hint for Dashboard "View all"/StatCard links that jump
+// into Inventory — without this, clicking "Out of Stock · 12" or "Reorder
+// List" on the Dashboard just lands on the full, unfiltered Item List,
+// forcing the user to re-find the same items by hand. Set right before
+// navigate('items'), consumed once by ItemMasters on mount (which clears it
+// immediately after reading), then cleared — a plain module-level variable
+// rather than a full routing-params system, since this is the only
+// cross-module filter hand-off anywhere in the app.
+let pendingItemsFilter = null;
+
+// A party can now be both a customer and a supplier (e.g. a vendor who also
+// buys from us) — `type==='both'` is a third value alongside the existing
+// 'customer'/'supplier'/'transporter', and every place that used to test
+// `p.type==='customer'` or `p.type==='supplier'` directly should go through
+// these two helpers instead so a 'both' party shows up in both pickers/lists.
+function isCustomerParty(p){ return p.type==='customer'||p.type==='both'; }
+function isSupplierParty(p){ return p.type==='supplier'||p.type==='both'; }
 
 // A Jaali line added alongside an Infrared line (see the "Include Jaali"
 // bundling in SaleEntry) is kept as its own line for stock/rate purposes, but
@@ -293,6 +340,21 @@ function repairStock(itemId, qty) {
   const move = Math.min(qty, it.damaged||0);
   if (move <= 0) return;
   state.items = state.items.map(x => x.id === itemId ? { ...x, damaged: (x.damaged||0)-move, repaired: (x.repaired||0)+move } : x);
+  save.items();
+}
+
+// Explicit, user-initiated promotion of repaired units into plain sellable
+// stock — repaired stock is kept separate by default (see repairStock above)
+// but the user still wants a way to merge a batch back into fresh stock once
+// they're satisfied it's as good as new, rather than it being stuck selling
+// only through the separate repaired-stock channel forever.
+function shiftRepairedToFresh(itemId, qty) {
+  if (!itemId || !qty || qty <= 0) return;
+  const it = state.items.find(x => x.id === itemId);
+  if (!it) return;
+  const move = Math.min(qty, it.repaired||0);
+  if (move <= 0) return;
+  state.items = state.items.map(x => x.id === itemId ? { ...x, repaired: (x.repaired||0)-move, stock: (x.stock||0)+move } : x);
   save.items();
 }
 
@@ -679,7 +741,12 @@ function OutstandingDetail({party,od,onClose}){
   const[repairs,setRepairs]=useState({});        // {billKey: amountStr} — repair-expenditure deduction per invoice
   const[repairExpOv,setRepairExpOv]=useState({}); // {billKey: amountStr} — expense-to-book override, defaults to repairs amount
   const{toast,TC}=useToast();
-  const lastFU=useMemo(()=>[...state.followups].filter(f=>f.partyId===party.id).sort((a,b)=>b.date.localeCompare(a.date))[0],[]);
+  // Full history, not just the latest — previously only a "Last: <tag> · <date>"
+  // pill was shown here with no way to see what was actually said on earlier
+  // follow-ups ("i find no place to see the notes made on payment follow ups").
+  const fuHistory=useMemo(()=>[...state.followups].filter(f=>f.partyId===party.id).sort((a,b)=>b.date.localeCompare(a.date)),[]);
+  const lastFU=fuHistory[0];
+  const[showFUHistory,setShowFUHistory]=useState(false);
   // getPartyBills covers opening balance + historical + NEW in-app sales via
   // FIFO — the raw PARTY_INVOICES map only has historical rows, which left the
   // WhatsApp reminder's invoice breakdown blank for any party whose outstanding
@@ -836,6 +903,23 @@ function OutstandingDetail({party,od,onClose}){
       </div>}
     </div>}
 
+    {fuHistory.length>0&&<div style={{marginBottom:16}}>
+      <button onClick={()=>setShowFUHistory(v=>!v)} style={{display:'flex',alignItems:'center',gap:6,background:'none',border:'none',cursor:'pointer',padding:0,fontFamily:'inherit'}}>
+        <span style={{fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5}}>Follow-up Notes ({fuHistory.length})</span>
+        <span style={{fontSize:11,color:C.muted}}>{showFUHistory?'▲ hide':'▼ show'}</span>
+      </button>
+      {showFUHistory&&<div style={{marginTop:8,display:'flex',flexDirection:'column',gap:6}}>
+        {fuHistory.map(f=><div key={f.id} style={{padding:'8px 11px',borderRadius:7,background:'#F6F8FA',border:`1px solid ${C.bdr}`}}>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8,marginBottom:3}}>
+            <span style={{fontSize:11,fontWeight:700,padding:'2px 8px',borderRadius:20,background:(TAG_COLORS[f.tags?.[0]]||C.blue)+'18',color:TAG_COLORS[f.tags?.[0]]||C.blue}}>{f.label}</span>
+            <span style={{fontSize:11,color:C.muted}}>{fmtD(f.date)}{f.status==='open'?' · open':''}</span>
+          </div>
+          <div style={{fontSize:12,color:C.txt,fontStyle:'italic'}}>"{f.response}"</div>
+          {f.followUpDate&&<div style={{fontSize:11,color:C.green,fontWeight:600,marginTop:3}}>📅 Reminder {fmtD(f.followUpDate)}</div>}
+        </div>)}
+      </div>}
+    </div>}
+
     <div style={{borderTop:`1px solid ${C.bdr}`,paddingTop:16}}>
       <div style={{fontSize:12,fontWeight:700,color:C.txt,marginBottom:8}}>Capture Response</div>
       {!saved
@@ -912,7 +996,7 @@ function Outstanding(){
 
   // All parties with OD (full unfiltered list for summary cards)
   const allOD=useMemo(()=>{
-    return state.parties.filter(p=>p.type==='customer').map(p=>{
+    return state.parties.filter(isCustomerParty).map(p=>{
       // getPartyBills does FIFO payment allocation against the oldest bill first
       // and computes overdue from the real current date — the old static
       // PARTY_INVOICES[3] day-count was frozen at whenever the historical data
@@ -1608,7 +1692,7 @@ function SaleEntry({onSaved,mode='sale'}){
     if(state.followups){const el=document.getElementById('isugg-'+si);if(el)el.scrollIntoView({block:'nearest'});}
   },[si]);
 
-  const custs=useMemo(()=>state.parties.filter(p=>p.type==='customer').sort((a,b)=>a.name.localeCompare(b.name)),[state.parties.length]);
+  const custs=useMemo(()=>state.parties.filter(isCustomerParty).sort((a,b)=>a.name.localeCompare(b.name)),[state.parties.length]);
   const sel=useMemo(()=>custs.find(p=>p.id===partyId),[custs,partyId]);
   const psugg=useMemo(()=>pq.length<1?[]:custs.filter(p=>p.name.toLowerCase().includes(pq.toLowerCase())||p.city?.toLowerCase().includes(pq.toLowerCase())).slice(0,8),[custs,pq]);
   const freightLine=useMemo(()=>fMode==='paid'&&fAddToInv&&Number(fAmt)>0?[{id:'__freight',itemName:'Freight',customerName:'Freight',peti:1,qty:1,rate:Number(fAmt)}]:[]  ,[fMode,fAddToInv,fAmt]);
@@ -1961,7 +2045,6 @@ function SaleEntry({onSaved,mode='sale'}){
 // ── DISPATCH PREVIEW ──────────────────────────────────────────────────────────
 function DispatchPreviewModal({order,onClose}){
   const{toast,TC}=useToast();
-  const[phone,setPhone]=useState(state.dispatchPhone||'');
   const[editableItems,setEditableItems]=useState(()=>(order.items||[]).map(l=>({...l})));
   const updateName=(idx,val)=>setEditableItems(items=>items.map((l,i)=>i===idx?{...l,dispatchName:val}:l));
   const commitName=idx=>{
@@ -1986,10 +2069,6 @@ function DispatchPreviewModal({order,onClose}){
     totalQty,totalAmount:fmt(totalAmount),
     transport:order.transport?'*Transport:* '+order.transport+(order.bilty?' | LR: '+order.bilty:''):'',
   });
-  const savePhone=()=>{
-    if(!phone||phone.length<10)return toast('Enter 10-digit number','error');
-    state.dispatchPhone=phone;save.dispatchPhone();toast('Saved ✓');
-  };
   const nameableIdx=editableItems.map((l,i)=>l.itemId&&!l.bundledJaali?i:-1).filter(i=>i>=0);
   return <Modal title="Send to Dispatch" onClose={onClose} width={500}>
     <TC/>
@@ -2007,18 +2086,11 @@ function DispatchPreviewModal({order,onClose}){
     </div>}
     <div style={{background:'#F6F8FA',borderRadius:9,border:`1px solid ${C.bdr}`,padding:14,marginBottom:16,
       fontFamily:'monospace',fontSize:12,lineHeight:1.9,whiteSpace:'pre-wrap',color:C.txt,maxHeight:260,overflowY:'auto'}}>{text()}</div>
-    {state.dispatchPhone
-      ?<a href={'https://wa.me/91'+state.dispatchPhone+'?text='+encodeURIComponent(text())} target="_blank" rel="noreferrer" onClick={onClose}
-        style={{display:'flex',alignItems:'center',justifyContent:'center',gap:10,padding:'13px 20px',
-          background:'#25D366',color:'#fff',borderRadius:9,textDecoration:'none',fontWeight:700,fontSize:14,marginBottom:16}}>📲 Send to Dispatch · {state.dispatchPhone}</a>
-      :<div style={{background:C.amberSoft,borderRadius:9,border:`1px solid ${C.amber}40`,padding:14,marginBottom:16}}>
-        <div style={{fontSize:12,fontWeight:600,color:C.amberBright,marginBottom:8}}>No dispatch number set — add once, reused every time</div>
-        <div style={{display:'flex',gap:8}}>
-          <input value={phone} onChange={e=>setPhone(e.target.value)} placeholder="Dispatch WhatsApp number" autoComplete="off"
-            style={{flex:1,padding:'8px 12px',borderRadius:7,border:`1.5px solid ${C.bdr}`,fontSize:13,outline:'none',fontFamily:'inherit'}}/>
-          <Btn onClick={savePhone} size="sm">Save</Btn>
-        </div>
-      </div>}
+    {/* wa.me with no phone number opens WhatsApp's own contact/group picker,
+        so the user picks the recipient fresh each time instead of a baked-in number */}
+    <a href={'https://wa.me/?text='+encodeURIComponent(text())} target="_blank" rel="noreferrer" onClick={onClose}
+      style={{display:'flex',alignItems:'center',justifyContent:'center',gap:10,padding:'13px 20px',
+        background:'#25D366',color:'#fff',borderRadius:9,textDecoration:'none',fontWeight:700,fontSize:14,marginBottom:16}}>📲 Send to Dispatch</a>
     <div style={{display:'flex',gap:8,justifyContent:'space-between',alignItems:'center'}}>
       <button onClick={()=>{navigator.clipboard?.writeText(text());toast('Copied');}}
         style={{padding:'6px 14px',borderRadius:7,border:`1px solid ${C.bdr}`,background:C.surf,fontSize:12,cursor:'pointer',fontFamily:'inherit',color:C.sub}}>📋 Copy</button>
@@ -2028,21 +2100,45 @@ function DispatchPreviewModal({order,onClose}){
 }
 
 // ── REVIEW ORDER → INVOICE ────────────────────────────────────────────────────
+// Partial dispatch: the order's own `qty` per line is kept as `orderedQty`
+// (untouched reference) while the editable `qty` is "dispatching now" — it
+// can be reduced below the ordered qty when only part of a line is actually
+// going out. Any shortfall (orderedQty - qty) stays on the order as its new
+// qty rather than being silently dropped, so the order only flips to
+// status:'invoiced' once every line's remaining qty has reached zero;
+// otherwise it goes back to 'pending' with just the undispatched remainder,
+// ready to be reviewed again next time the rest ships.
 function ReviewOrderModal({order,onClose,onSaved}){
-  const[lines,setLines]=useState(()=>(order.items||[]).map(l=>({...l})));
+  const[lines,setLines]=useState(()=>(order.items||[]).map(l=>({...l,orderedQty:l.qty})));
   const{toast,TC}=useToast();
-  const editLine=(i,k,v)=>setLines(p=>p.map((l,j)=>j!==i?l:{...l,[k]:Number(v)||0}));
+  const editLine=(i,k,v)=>setLines(p=>p.map((l,j)=>{
+    if(j!==i)return l;
+    if(k==='qty'){ const q=Math.max(0,Math.min(Number(v)||0,l.orderedQty)); return {...l,qty:q}; }
+    return {...l,[k]:Number(v)||0};
+  }));
   const total=lines.reduce((s,l)=>s+(l.qty*l.rate),0);
+  const anyPartial=lines.some(l=>l.qty<l.orderedQty);
   const doCreateInvoice=()=>{
-    if(!lines.length)return toast('No items','error');
+    const dispatchedLines=lines.filter(l=>(l.qty||0)>0);
+    if(!dispatchedLines.length)return toast('Enter a qty to dispatch for at least one item','error');
     const id=uid('SAL');
-    const allItems=lines.map(l=>({itemId:l.itemId,itemName:l.itemName,customerName:l.customerName,dispatchName:l.dispatchName,qty:l.qty,rate:l.rate,amount:l.qty*l.rate,warranty:l.warranty,bundledJaali:l.bundledJaali}));
+    const allItems=dispatchedLines.map(l=>({itemId:l.itemId,itemName:l.itemName,customerName:l.customerName,dispatchName:l.dispatchName,qty:l.qty,rate:l.rate,amount:l.qty*l.rate,warranty:l.warranty,bundledJaali:l.bundledJaali}));
+    const invTotal=allItems.reduce((s,l)=>s+l.amount,0);
     const sale={id,date:today(),partyId:order.partyId,partyName:order.partyName,transport:order.transport,bilty:order.bilty,
       freightMode:order.freightMode,freightAmt:order.freightAmt,freightAddToInv:order.freightAddToInv,creditDays:order.creditDays,
-      items:allItems,total,orderId:order.id,createdAt:new Date().toISOString()};
+      items:allItems,total:invTotal,orderId:order.id,createdAt:new Date().toISOString()};
     state.sales=[sale,...state.sales];save.sales();
-    lines.forEach(l=>adjustStock(l.itemId,-l.qty));
-    state.orders=state.orders.map(o=>o.id===order.id?{...o,status:'invoiced'}:o);
+    dispatchedLines.forEach(l=>adjustStock(l.itemId,-l.qty));
+    const remainingItems=lines.map(l=>({itemId:l.itemId,itemName:l.itemName,customerName:l.customerName,dispatchName:l.dispatchName,
+      qty:l.orderedQty-(l.qty||0),rate:l.rate,warranty:l.warranty,bundledJaali:l.bundledJaali,availability:l.availability,linkedPoId:l.linkedPoId}))
+      .filter(l=>l.qty>0);
+    const fullyDispatched=remainingItems.length===0;
+    state.orders=state.orders.map(o=>o.id===order.id?{
+      ...o,
+      items:fullyDispatched?o.items:remainingItems,
+      status:fullyDispatched?'invoiced':'pending',
+      total:fullyDispatched?o.total:remainingItems.reduce((s,l)=>s+l.qty*l.rate,0),
+    }:o);
     save.orders();
     onSaved?.(sale);
   };
@@ -2055,30 +2151,36 @@ function ReviewOrderModal({order,onClose,onSaved}){
     document.addEventListener('keydown',onKey);
     return()=>document.removeEventListener('keydown',onKey);
   },[lines]);
-  return <Modal title="Review Before Invoice" onClose={onClose} width={560}>
+  return <Modal title="Review Before Invoice" onClose={onClose} width={620}>
     <TC/>
-    <div style={{fontSize:12,color:C.sub,marginBottom:12}}>Confirm what was actually dispatched — adjust qty/rate if it differs from the order, then create the invoice.</div>
+    <div style={{fontSize:12,color:C.sub,marginBottom:12}}>Confirm what was actually dispatched — reduce the qty for any item that's only partly going out now. Whatever's left stays on this Sales Order to dispatch later.</div>
     <table style={{width:'100%',borderCollapse:'collapse',fontSize:13,marginBottom:14}}>
       <thead><tr style={{background:'#F6F8FA'}}>
-        {['Item','Qty','Rate ₹','Amount'].map((h,i)=><th key={i} style={{padding:'7px 12px',textAlign:i>0?'right':'left',fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,borderBottom:`1px solid ${C.bdr}`}}>{h}</th>)}
+        {['Item','Ordered','Dispatching Now','Rate ₹','Amount'].map((h,i)=><th key={i} style={{padding:'7px 12px',textAlign:i>0?'right':'left',fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,borderBottom:`1px solid ${C.bdr}`}}>{h}</th>)}
       </tr></thead>
       <tbody>
         {lines.map((l,i)=><tr key={l.id||i} style={{borderBottom:`1px solid ${C.bdr}`}}>
           <td style={{padding:'7px 12px',fontWeight:600,color:C.txt}}>{l.customerName||l.itemName}</td>
-          <td style={{padding:'7px 12px',textAlign:'right'}}><input value={l.qty} onChange={e=>editLine(i,'qty',e.target.value)} type="number" style={{width:60,padding:'3px 7px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:12,textAlign:'right',outline:'none',fontFamily:'inherit'}}/></td>
+          <td style={{padding:'7px 12px',textAlign:'right',color:C.sub}}>{l.orderedQty}</td>
+          <td style={{padding:'7px 12px',textAlign:'right'}}>
+            <input value={l.qty} onChange={e=>editLine(i,'qty',e.target.value)} type="number" min={0} max={l.orderedQty}
+              style={{width:60,padding:'3px 7px',borderRadius:5,border:`1px solid ${l.qty<l.orderedQty?C.amber:C.bdr}`,fontSize:12,textAlign:'right',outline:'none',fontFamily:'inherit'}}/>
+            {l.qty<l.orderedQty&&<div style={{fontSize:10,color:C.amber,marginTop:2}}>{l.orderedQty-l.qty} left on order</div>}
+          </td>
           <td style={{padding:'7px 12px',textAlign:'right'}}><input value={l.rate} onChange={e=>editLine(i,'rate',e.target.value)} type="number" style={{width:75,padding:'3px 7px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:12,textAlign:'right',outline:'none',fontFamily:'inherit'}}/></td>
           <td style={{padding:'7px 12px',textAlign:'right',fontWeight:700,color:C.blue}}>{fmt(l.qty*l.rate)}</td>
         </tr>)}
       </tbody>
       <tfoot><tr style={{background:'#F6F8FA'}}>
-        <td colSpan={3} style={{padding:'9px 12px',fontWeight:700,textAlign:'right',color:C.txt}}>TOTAL</td>
+        <td colSpan={4} style={{padding:'9px 12px',fontWeight:700,textAlign:'right',color:C.txt}}>TOTAL (dispatching now)</td>
         <td style={{padding:'9px 12px',textAlign:'right',fontSize:16,fontWeight:800,color:C.blue}}>{fmt(total)}</td>
       </tr></tfoot>
     </table>
+    {anyPartial&&<div style={{padding:'8px 12px',borderRadius:7,background:C.amberSoft,color:C.amber,fontSize:12,fontWeight:600,marginBottom:10}}>This is a partial dispatch — the undispatched remainder will stay on this Sales Order as "Pending" for next time.</div>}
     <div style={{fontSize:11,color:C.muted,marginBottom:10}}>Press Enter to create the invoice, Esc to cancel.</div>
     <div style={{display:'flex',justifyContent:'flex-end',gap:8}}>
       <Btn onClick={onClose} variant="secondary">Cancel (Esc)</Btn>
-      <Btn onClick={doCreateInvoice} icon="🧾">Create Invoice (Enter)</Btn>
+      <Btn onClick={doCreateInvoice} icon="🧾">{anyPartial?'Create Partial Invoice (Enter)':'Create Invoice (Enter)'}</Btn>
     </div>
   </Modal>;
 }
@@ -2088,6 +2190,7 @@ function OrdersModule({navigate}){
   const[dispatchOrder,setDispatchOrder]=useState(null);
   const[reviewOrder,setReviewOrder]=useState(null);
   const[doneSale,setDoneSale]=useState(null);
+  const[editOrder,setEditOrder]=useState(null);
   const[linkCtx,setLinkCtx]=useState(null); // {orderId,itemIdx,itemId,itemName}
   const[_fv,_setFv]=useState(0); const forceUpdate=()=>_setFv(v=>v+1);
   const{toast,TC}=useToast();
@@ -2095,7 +2198,7 @@ function OrdersModule({navigate}){
   const pending=useMemo(()=>state.orders.filter(o=>o.status!=='invoiced').sort((a,b)=>b.createdAt.localeCompare(a.createdAt)),[state.orders.length,_fv]);
 
   const openReview=o=>{
-    if(o.status!=='dispatched'){state.orders=state.orders.map(x=>x.id===o.id?{...x,status:'dispatched',dispatchedAt:new Date().toISOString()}:x);save.orders();forceUpdate();}
+    if(o.status!=='dispatched'){state.orders=state.orders.map(x=>x.id===o.id?{...x,status:'dispatched',dispatchedAt:new Date().toISOString()}:x);save.orders();forceUpdate();DB.notify('📦 Order Dispatched', describeOrder(o));}
     setReviewOrder(o);
   };
 
@@ -2113,7 +2216,7 @@ function OrdersModule({navigate}){
   return <div>
     <TC/>
     <SectionHead title="Sales Order" sub="Punch the order, send it to dispatch, then create the invoice once it's out the door"/>
-    <SaleEntry mode="order" onSaved={order=>{forceUpdate();setDispatchOrder(order);}}/>
+    <SaleEntry mode="order" onSaved={order=>{forceUpdate();setDispatchOrder(order);DB.notify('🆕 New Sales Order', describeOrder(order));}}/>
 
     {pending.length>0&&<div>
       <h3 style={{fontSize:14,fontWeight:700,color:C.txt,margin:'0 0 10px'}}>Sales Orders ({pending.length})</h3>
@@ -2137,7 +2240,13 @@ function OrdersModule({navigate}){
                 </div>)}
               </td>
               <td style={{padding:'9px 14px',textAlign:'right',fontWeight:700,color:C.blue,verticalAlign:'top'}}>{fmt(o.total)}</td>
-              <td style={{padding:'9px 14px',textAlign:'center',verticalAlign:'top'}}><Btn onClick={()=>openReview(o)} size="sm" variant="success">✅ Dispatched</Btn></td>
+              <td style={{padding:'9px 14px',textAlign:'center',verticalAlign:'top'}}>
+                <div style={{display:'flex',gap:4,alignItems:'center',justifyContent:'center',flexWrap:'wrap'}}>
+                  <IconBtn onClick={()=>setEditOrder(o)} title="Edit this order">✏️</IconBtn>
+                  <IconBtn onClick={()=>setDispatchOrder(o)} title="Send to Dispatch (WhatsApp)">📲</IconBtn>
+                  <Btn onClick={()=>openReview(o)} size="sm" variant="success">✅ Dispatched</Btn>
+                </div>
+              </td>
             </tr>)}
           </tbody>
         </table>
@@ -2145,6 +2254,7 @@ function OrdersModule({navigate}){
     </div>}
 
     {dispatchOrder&&<DispatchPreviewModal order={dispatchOrder} onClose={()=>{setDispatchOrder(null);forceUpdate();}}/>}
+    {editOrder&&<EditOrderModal order={editOrder} onClose={()=>setEditOrder(null)} onSaved={()=>{setEditOrder(null);forceUpdate();}}/>}
     {reviewOrder&&<ReviewOrderModal order={reviewOrder} onClose={()=>setReviewOrder(null)} onSaved={sale=>{setReviewOrder(null);forceUpdate();setDoneSale(sale);}}/>}
     {doneSale&&<InvoiceModal sale={doneSale} party={state.parties.find(p=>p.id===doneSale.partyId)||{name:doneSale.partyName,phone:''}} onClose={()=>setDoneSale(null)}/>}
     {linkCtx&&<LinkPurchaseOrderModal itemId={linkCtx.itemId} itemName={linkCtx.itemName}
@@ -2206,7 +2316,7 @@ function EditSaleModal({sale,onClose,onSaved}){
   const[swapQ,setSwapQ]=useState('');
   const[swapSi,setSwapSi]=useState(0);
   const{toast,TC}=useToast();
-  const custs=useMemo(()=>state.parties.filter(p=>p.type==='customer'),[state.parties.length]);
+  const custs=useMemo(()=>state.parties.filter(isCustomerParty),[state.parties.length]);
   const selParty=useMemo(()=>custs.find(p=>p.id===partyId),[custs,partyId]);
   const psugg=useMemo(()=>pq.length<1?[]:custs.filter(p=>p.name.toLowerCase().includes(pq.toLowerCase())).slice(0,6),[custs,pq]);
   const total=useMemo(()=>lines.reduce((s,l)=>s+(Number(l.qty)||0)*(Number(l.rate)||0),0),[lines]);
@@ -2332,6 +2442,162 @@ function EditSaleModal({sale,onClose,onSaved}){
   </Modal>;
 }
 
+// ── EDIT SALES ORDER (pending, not yet dispatched) ──────────────────────────
+// Same item-search/add/swap flow as EditSaleModal above, but on state.orders
+// instead of state.sales — and deliberately WITHOUT any stock-delta
+// reconciliation, because a pending order never deducted stock in the first
+// place (see SaleEntry's doSave for mode='order' — stock only actually moves
+// once ReviewOrderModal turns it into a real invoice). So editing here is
+// just a record update. availability/linkedPoId (the backorder-linkage
+// fields — see computeOrderLineStatus) are left untouched for a line whose
+// item doesn't change, so an existing PO link survives a qty/rate tweak;
+// only a line whose item is swapped, or a brand-new line, gets a fresh
+// availability computed from current stock and starts unlinked.
+function EditOrderModal({order,onClose,onSaved}){
+  const[date,setDate]=useState(order.date||today());
+  const[partyId,setPartyId]=useState(order.partyId||'');
+  const[pq,setPq]=useState('');
+  const[transport,setTransport]=useState(order.transport||'');
+  const[bilty,setBilty]=useState(order.bilty||'');
+  const[fMode,setFMode]=useState(order.freightMode||'');
+  const[fAmt,setFAmt]=useState(String(order.freightAmt||''));
+  const[credit,setCredit]=useState(order.creditDays||30);
+  const[lines,setLines]=useState((order.items||[]).map((it,i)=>({id:'EO'+i,itemId:it.itemId||'',itemName:it.itemName||'',customerName:it.customerName||it.itemName||'',dispatchName:it.dispatchName,qty:it.qty||0,rate:it.rate||0,bundledJaali:it.bundledJaali,availability:it.availability,linkedPoId:it.linkedPoId,changed:false})));
+  const[step,setStep]=useState('item');
+  const[input,setInput]=useState('');
+  const[si,setSi]=useState(0);
+  const[draft,setDraft]=useState({itemId:'',iName:'',cName:'',peti:1,qty:'',rate:''});
+  const[swapIdx,setSwapIdx]=useState(null);
+  const[swapQ,setSwapQ]=useState('');
+  const[swapSi,setSwapSi]=useState(0);
+  const{toast,TC}=useToast();
+  const custs=useMemo(()=>state.parties.filter(isCustomerParty),[state.parties.length]);
+  const selParty=useMemo(()=>custs.find(p=>p.id===partyId),[custs,partyId]);
+  const psugg=useMemo(()=>pq.length<1?[]:custs.filter(p=>p.name.toLowerCase().includes(pq.toLowerCase())).slice(0,6),[custs,pq]);
+  const total=useMemo(()=>lines.reduce((s,l)=>s+(Number(l.qty)||0)*(Number(l.rate)||0),0),[lines]);
+  useEffect(()=>{if(step!=='item'){setTimeout(()=>{const el=document.getElementById('editord-step-input');if(el)el.focus();},30);}else{setTimeout(()=>{const el=document.getElementById('editord-item-search');if(el)el.focus();},30);}  },[step,draft.iName]);
+  const searchItems=q=>{q=q.trim().toLowerCase();if(!q)return[];const words=q.split(/[\s,]+/).filter(Boolean);return state.items.filter(it=>it.active!==false).map(it=>{const cn=(it.customer||it.internal||'').toLowerCase();const hay=[cn,(it.internal||'').toLowerCase(),(it.cat||'').toLowerCase()].join(' ');let sc=0;for(const w of words){if(cn.includes(w))sc+=10;if(hay.includes(w))sc+=4;if(cn.startsWith(w))sc+=10;}if(cn.includes(q))sc+=15;return{it,sc};}).filter(x=>x.sc>0).sort((a,b)=>b.sc-a.sc).slice(0,8).map(x=>x.it);};
+  const isugg=useMemo(()=>step==='item'?searchItems(input):[],[input,step]);
+  const swapSugg=useMemo(()=>swapIdx===null?[]:searchItems(swapQ),[swapQ,swapIdx]);
+  const pickItem=it=>{const rate=selParty?getBestRate(selParty.name,it.internal||'',it.customer||'',it.sale):it.sale;setDraft({itemId:it.id,iName:it.internal||it.name||'',cName:it.customer||it.internal||'',peti:it.peti,qty:'',rate});setStep('qty');setInput('');setSi(0);};
+  const commit=()=>{const qty=parseQty(draft.qty,draft.peti);if(isNaN(qty)||qty<=0)return toast('Invalid qty','error');setLines(p=>[...p,{id:uid('EO'),itemId:draft.itemId,itemName:draft.iName,customerName:draft.cName,qty,rate:Number(draft.rate)||0,changed:true}]);setDraft({itemId:'',iName:'',cName:'',peti:1,qty:'',rate:''});setStep('item');setInput('');setSi(0);};
+  const swapItem=it=>{const i=swapIdx;if(i==null)return;const rate=selParty?getBestRate(selParty.name,it.internal||'',it.customer||'',it.sale):it.sale;setLines(p=>p.map((l,j)=>j!==i?l:{...l,itemId:it.id,itemName:it.internal||it.name||'',customerName:it.customer||it.internal||'',rate,changed:true}));setSwapIdx(null);setSwapQ('');setSwapSi(0);};
+  const onKey=e=>{if(step==='item'){if(e.key==='ArrowDown'){e.preventDefault();setSi(i=>Math.min(i+1,(isugg.length||1)-1));}if(e.key==='ArrowUp'){e.preventDefault();setSi(i=>Math.max(i-1,0));}if(e.key==='Enter'&&isugg.length){e.preventDefault();pickItem(isugg[si]||isugg[0]);}if(e.key==='Escape'){setInput('');setSi(0);}}else if(step==='qty'){if(e.key==='Enter'){e.preventDefault();if(!draft.qty)return;const q=parseQty(draft.qty,draft.peti);if(isNaN(q))return toast('Invalid qty','error');setDraft(d=>({...d,qty:String(q)}));setStep('rate');}if(e.key==='Escape'){setStep('item');setInput('');}}else if(step==='rate'){if(e.key==='Enter'){e.preventDefault();commit();}if(e.key==='Escape'){setStep('qty');}}};
+  const editLine=(i,k,v)=>setLines(p=>p.map((l,j)=>j!==i?l:{...l,[k]:k==='qty'||k==='rate'?Number(v)||0:v}));
+  const doSave=()=>{
+    if(!lines.length)return toast('Add at least one item','error');
+    const finalItems=lines.map(l=>{
+      if(!l.changed)return{itemId:l.itemId,itemName:l.itemName,customerName:l.customerName,dispatchName:l.dispatchName,qty:l.qty,rate:l.rate,amount:l.qty*l.rate,bundledJaali:l.bundledJaali,availability:l.availability,linkedPoId:l.linkedPoId};
+      const it=state.items.find(x=>x.id===l.itemId);
+      const outOfStock=l.itemId&&(it?.stock||0)<l.qty;
+      return{itemId:l.itemId,itemName:l.itemName,customerName:l.customerName,dispatchName:l.dispatchName,qty:l.qty,rate:l.rate,amount:l.qty*l.rate,bundledJaali:l.bundledJaali,availability:outOfStock?'outOfStock':'available',linkedPoId:null};
+    });
+    const updated={...order,date,partyId,partyName:selParty?.name||order.partyName,transport,bilty,freightMode:fMode,freightAmt:Number(fAmt)||0,creditDays:credit,items:finalItems,total,updatedAt:new Date().toISOString()};
+    state.orders=state.orders.map(o=>o.id===order.id?updated:o);save.orders();
+    toast('Order updated ✓');onSaved?.();onClose();
+  };
+  const SC={item:C.blue,qty:C.green,rate:C.amber};const SL={item:'Type item name to add…',qty:'Qty or "1 peti"',rate:'Rate ₹/pc'};
+  return <Modal title={'Edit Sales Order — '+(order.partyName||'?')} onClose={onClose} width={680}>
+    <TC/>
+    <Grid2>
+      <Inp label="Date" value={date} onChange={setDate} type="date" required/>
+      <Inp label="Credit Days" value={credit} onChange={v=>setCredit(Number(v)||30)} type="number"/>
+      <div style={{gridColumn:'1/-1'}}>
+        <label style={{fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,display:'block',marginBottom:3}}>Party</label>
+        {selParty
+          ?<div style={{display:'flex',alignItems:'center',gap:10,padding:'7px 12px',borderRadius:7,border:`1.5px solid ${C.blue}`,background:C.blueSoft}}>
+            <span style={{fontWeight:700,flex:1,color:C.txt}}>{selParty.name}</span>
+            <Btn onClick={()=>{setPartyId('');setPq('');}} variant="ghost" size="sm">Change</Btn>
+          </div>
+          :<div style={{position:'relative'}}>
+            <input value={pq} autoComplete="off" onChange={e=>setPq(e.target.value)} placeholder="Type party name…"
+              style={{width:'100%',padding:'8px 12px',borderRadius:7,border:`1.5px solid ${C.bdr}`,fontSize:13,color:C.txt,outline:'none',fontFamily:'inherit',boxSizing:'border-box'}}
+              onFocus={e=>e.target.style.borderColor=C.blue} onBlur={e=>e.target.style.borderColor=C.bdr}/>
+            {psugg.length>0&&<div style={{position:'absolute',top:'100%',left:0,right:0,background:C.surf,border:`1px solid ${C.bdr}`,borderRadius:'0 0 8px 8px',zIndex:100,boxShadow:'0 8px 24px rgba(0,0,0,0.12)',overflow:'hidden'}}>
+              {psugg.map(p=><div key={p.id} onMouseDown={()=>{setPartyId(p.id);setPq('');}} style={{padding:'9px 14px',cursor:'pointer',fontSize:13,borderBottom:`1px solid ${C.bdr}`}} onMouseEnter={e=>e.currentTarget.style.background='#F9FAFB'} onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
+                <span style={{fontWeight:600,color:C.txt}}>{p.name}</span></div>)}
+            </div>}
+          </div>}
+      </div>
+      <Inp label="Transport" value={transport} onChange={setTransport} placeholder="Garage name" autoComplete="off"/>
+      <Inp label="Bilty / LR" value={bilty} onChange={setBilty} placeholder="LR number" autoComplete="off"/>
+    </Grid2>
+    <div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,overflow:'hidden',margin:'14px 0'}}>
+      <div style={{padding:'10px 14px',background:SC[step]+'18',borderBottom:`1px solid ${C.bdr}`,position:'relative'}}>
+        <div style={{display:'flex',gap:8,alignItems:'center'}}>
+          {step!=='item'&&<span style={{fontSize:12,fontWeight:600,color:C.txt,whiteSpace:'nowrap',maxWidth:130,overflow:'hidden',textOverflow:'ellipsis'}}>{step==='rate'?`${draft.cName} × ${draft.qty}pc`:draft.cName}</span>}
+          <input id={step==='item'?'editord-item-search':'editord-step-input'} key={step+draft.iName} autoComplete="off"
+            value={step==='item'?input:step==='qty'?draft.qty:String(draft.rate||'')}
+            onChange={e=>{const v=e.target.value;if(step==='item'){setInput(v);setSi(0);}else if(step==='qty')setDraft(d=>({...d,qty:v}));else setDraft(d=>({...d,rate:v}));}}
+            onKeyDown={onKey} placeholder={SL[step]}
+            style={{flex:1,padding:'7px 12px',borderRadius:7,border:`1.5px solid ${SC[step]}`,fontSize:13,color:C.txt,outline:'none',fontFamily:'inherit'}}/>
+          {step!=='item'&&<><Btn onClick={commit} size="sm" variant="success">Add ↵</Btn><Btn onClick={()=>{setStep('item');setInput('');}} size="sm" variant="ghost">✕</Btn></>}
+        </div>
+        {step==='item'&&isugg.length>0&&<div style={{position:'absolute',top:'calc(100% - 2px)',left:14,right:14,background:C.surf,border:`1px solid ${C.bdr}`,borderRadius:'0 0 9px 9px',zIndex:100,boxShadow:'0 8px 24px rgba(0,0,0,0.12)',overflow:'hidden',maxHeight:180,display:'flex',flexDirection:'column'}}>
+          <div style={{overflowY:'auto',flex:1}}>
+            {isugg.map((it,i)=><div key={it.id} id={'eosugg-'+i} onMouseDown={()=>{setSi(i);pickItem(it);}} onMouseEnter={()=>setSi(i)}
+              style={{display:'flex',alignItems:'center',padding:'8px 14px',cursor:'pointer',background:i===si?C.blueSoft:'transparent',borderBottom:i<isugg.length-1?`1px solid ${C.bdr}`:'none'}}>
+              <div style={{flex:1}}><span style={{fontWeight:600,color:C.txt,fontSize:13}}>{it.internal||it.name}</span><span style={{fontSize:11,color:C.sub,marginLeft:6}}>{it.cat}</span></div>
+              <span style={{fontSize:13,fontWeight:700,color:C.blue}}>₹{selParty?getBestRate(selParty.name,it.internal||'',it.customer||'',it.sale):it.sale}/pc</span>
+            </div>)}
+          </div>
+        </div>}
+      </div>
+      <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}>
+        <thead><tr style={{background:'#F6F8FA'}}>{['#','Item','Qty','Rate ₹','Amount',''].map((h,i)=><th key={i} style={{padding:'7px 12px',textAlign:i>1&&i<5?'right':'left',fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,borderBottom:`1px solid ${C.bdr}`}}>{h}</th>)}</tr></thead>
+        <tbody>
+          {!lines.length&&<tr><td colSpan={6} style={{padding:'20px',textAlign:'center',color:C.muted}}>No items</td></tr>}
+          {lines.map((l,i)=><tr key={l.id} style={{borderBottom:`1px solid ${C.bdr}`}}>
+            <td style={{padding:'7px 12px',color:C.muted,fontSize:11}}>{i+1}</td>
+            <td style={{padding:'7px 12px',fontWeight:600,color:C.txt,position:'relative'}}>
+              {swapIdx===i
+                ?<div style={{position:'relative'}}>
+                  <input autoFocus value={swapQ} autoComplete="off"
+                    onChange={e=>{setSwapQ(e.target.value);setSwapSi(0);}}
+                    onKeyDown={e=>{if(e.key==='ArrowDown'){e.preventDefault();setSwapSi(s=>Math.min(s+1,(swapSugg.length||1)-1));}if(e.key==='ArrowUp'){e.preventDefault();setSwapSi(s=>Math.max(s-1,0));}if(e.key==='Enter'&&swapSugg.length){e.preventDefault();swapItem(swapSugg[swapSi]||swapSugg[0]);}if(e.key==='Escape'){setSwapIdx(null);setSwapQ('');}}}
+                    placeholder="Search item to switch to…"
+                    style={{width:'100%',padding:'3px 6px',borderRadius:5,border:`1.5px solid ${C.blue}`,fontSize:12,fontWeight:600,color:C.txt,outline:'none',fontFamily:'inherit',boxSizing:'border-box'}}/>
+                  {swapSugg.length>0&&<div style={{position:'absolute',top:'100%',left:0,right:0,background:C.surf,border:`1px solid ${C.bdr}`,borderRadius:'0 0 8px 8px',zIndex:200,boxShadow:'0 8px 24px rgba(0,0,0,0.12)',overflow:'hidden',maxHeight:180,overflowY:'auto'}}>
+                    {swapSugg.map((it,si2)=><div key={it.id} onMouseDown={()=>swapItem(it)} onMouseEnter={()=>setSwapSi(si2)}
+                      style={{display:'flex',alignItems:'center',padding:'7px 12px',cursor:'pointer',fontSize:12,background:si2===swapSi?C.blueSoft:'transparent',borderBottom:si2<swapSugg.length-1?`1px solid ${C.bdr}`:'none'}}>
+                      <div style={{flex:1}}><span style={{fontWeight:600,color:C.txt}}>{it.internal||it.name}</span><span style={{fontSize:10,color:C.sub,marginLeft:6}}>{it.cat}</span></div>
+                    </div>)}
+                  </div>}
+                  <button onClick={()=>{setSwapIdx(null);setSwapQ('');}} style={{position:'absolute',right:-2,top:-22,background:'none',border:'none',cursor:'pointer',color:C.muted,fontSize:11}}>cancel</button>
+                </div>
+                :<div style={{display:'flex',alignItems:'center',gap:6}}>
+                  <span style={{flex:1}}>{l.customerName||l.itemName||''}</span>
+                  <button onClick={()=>{setSwapIdx(i);setSwapQ('');setSwapSi(0);}} title="Swap this line to a different item" style={{background:'none',border:`1px solid ${C.bdr}`,borderRadius:5,cursor:'pointer',color:C.sub,fontSize:11,padding:'2px 6px',whiteSpace:'nowrap'}}>⇄ Change</button>
+                </div>}
+            </td>
+            <td style={{padding:'7px 12px',textAlign:'right'}}><input value={l.qty} onChange={e=>setLines(p=>p.map((x,j)=>j!==i?x:{...x,qty:Number(e.target.value)||0,changed:true}))} type="number" style={{width:60,padding:'3px 7px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:12,textAlign:'right',outline:'none',fontFamily:'inherit'}}/></td>
+            <td style={{padding:'7px 12px',textAlign:'right'}}><input value={l.rate} onChange={e=>editLine(i,'rate',e.target.value)} type="number" style={{width:75,padding:'3px 7px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:12,textAlign:'right',outline:'none',fontFamily:'inherit'}}/></td>
+            <td style={{padding:'7px 12px',textAlign:'right',fontWeight:700,color:C.blue,fontVariantNumeric:'tabular-nums'}}>{fmt(l.qty*l.rate)}</td>
+            <td style={{padding:'7px 12px',textAlign:'center'}}><button onClick={()=>setLines(p=>p.filter((_,j)=>j!==i))} style={{background:'none',border:'none',cursor:'pointer',color:C.muted,fontSize:15}}>×</button></td>
+          </tr>)}
+        </tbody>
+        {lines.length>0&&<tfoot><tr style={{background:'#F6F8FA'}}><td colSpan={4} style={{padding:'9px 12px',fontWeight:700,textAlign:'right',color:C.txt}}>TOTAL</td><td style={{padding:'9px 12px',textAlign:'right',fontSize:16,fontWeight:800,color:C.blue,fontVariantNumeric:'tabular-nums'}}>{fmt(total)}</td><td/></tr></tfoot>}
+      </table>
+    </div>
+    <div style={{marginBottom:14}}>
+      <label style={{fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,display:'block',marginBottom:6}}>Freight</label>
+      <div style={{display:'flex',gap:6,alignItems:'center',flexWrap:'wrap'}}>
+        {[['topay','To Pay by party'],['','Not applicable'],['paid','Paid by us']].map(([val,lbl])=>(
+          <button key={val} onClick={()=>setFMode(val)} style={{padding:'5px 13px',borderRadius:20,fontSize:12,fontWeight:600,cursor:'pointer',fontFamily:'inherit',border:`1.5px solid ${fMode===val?C.blue:C.bdr}`,background:fMode===val?C.blueSoft:'transparent',color:fMode===val?C.blue:C.sub}}>{lbl}</button>
+        ))}
+        {fMode==='paid'&&<input value={fAmt} onChange={e=>setFAmt(e.target.value)} type="number" placeholder="Rs amount" style={{width:90,padding:'5px 10px',borderRadius:7,border:`1.5px solid ${C.bdr}`,fontSize:12,outline:'none',fontFamily:'inherit'}}/>}
+      </div>
+    </div>
+    <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+      <button onClick={()=>{if(!requireOwner(toast))return;if(window.confirm('Cancel this Sales Order?')){state.orders=state.orders.filter(o=>o.id!==order.id);save.orders();onSaved?.();onClose();toast('Order cancelled');}}} style={{padding:'7px 14px',borderRadius:7,border:`1px solid ${C.red}`,background:C.redSoft,color:C.red,cursor:'pointer',fontSize:12,fontWeight:600,fontFamily:'inherit'}}>🗑 Cancel Order</button>
+      <div style={{display:'flex',gap:8}}>
+        <Btn onClick={onClose} variant="secondary">Cancel</Btn>
+        <Btn onClick={doSave} disabled={!lines.length} icon="💾">Save Changes</Btn>
+      </div>
+    </div>
+  </Modal>;
+}
+
 // ── SALES RETURN MODAL ────────────────────────────────────────────────────────
 
 function SalesReturnModal({sale,initialParty,initialDate,onClose,onSaved}){
@@ -2364,7 +2630,7 @@ function SalesReturnModal({sale,initialParty,initialDate,onClose,onSaved}){
   const[pq,setPq]=useState('');
   const[selInv,setSelInv]=useState(null);
   const{toast,TC}=useToast();
-  const custs=useMemo(()=>state.parties.filter(p=>p.type==='customer'),[state.parties.length]);
+  const custs=useMemo(()=>state.parties.filter(isCustomerParty),[state.parties.length]);
   const psugg=useMemo(()=>pq.length<1?[]:custs.filter(p=>p.name.toLowerCase().includes(pq.toLowerCase())).slice(0,6),[custs,pq]);
   // Merges the static pre-ERP history with sales created in-app this session
   // (state.sales) — mirroring getPartyBills()'s merge in store.js. Without
@@ -2743,7 +3009,14 @@ function PartyProfile({party,onClose}){
 
 function PartyLedger({party,onClose}){
   const mobile=useIsMobile();
-  const isSupplier=party.type==='supplier';
+  // A 'both' party has independent customer-side and supplier-side activity
+  // that this component's single isSupplier-branches-everything structure
+  // can't show merged into one view — so for a 'both' party the user picks
+  // which side to view via a toggle, defaulting to customer, and every
+  // existing isSupplier-gated calculation below is unaffected (still just
+  // reads one boolean, same as a plain 'customer'/'supplier' party).
+  const[viewAs,setViewAs]=useState('customer');
+  const isSupplier=party.type==='both'?viewAs==='supplier':party.type==='supplier';
   const isTransporterParty=party.type==='transporter';
   const PAGE=20;
   const[actPage,setActPage]=useState(0);
@@ -2751,6 +3024,9 @@ function PartyLedger({party,onClose}){
   const[viewSale,setViewSale]=useState(null);
   const[viewPurchase,setViewPurchase]=useState(null);
   const[showRepairModal,setShowRepairModal]=useState(false);
+  // Profit/Margin tile drill-down (request #23) — opens a separate page
+  // instead of cramming per-sale profit/interest figures onto this ledger.
+  const[showProfit,setShowProfit]=useState(false);
   const[exFrom,setExFrom]=useState('');
   const[exTo,setExTo]=useState(today());
   const{toast,TC}=useToast();
@@ -3025,6 +3301,11 @@ function PartyLedger({party,onClose}){
     {viewSale&&<SaleBillModal sale={viewSale} onClose={()=>setViewSale(null)}/>}
     {viewPurchase&&<PurchaseViewModal purchase={viewPurchase} onClose={()=>setViewPurchase(null)}/>}
     {showRepairModal&&<RepairExpenseModal party={party} onClose={()=>setShowRepairModal(false)} onSaved={()=>setShowRepairModal(false)}/>}
+    {showProfit&&<PartySaleProfitModal party={party} onClose={()=>setShowProfit(false)}/>}
+    {party.type==='both'&&<div style={{display:'flex',gap:8,marginBottom:14}}>
+      <Chip v="View as Customer" active={viewAs==='customer'} onClick={()=>setViewAs('customer')}/>
+      <Chip v="View as Supplier" active={viewAs==='supplier'} onClick={()=>setViewAs('supplier')}/>
+    </div>}
     <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}}>
       <div>
         <div style={{fontSize:11,color:C.sub,textTransform:'uppercase',letterSpacing:.5}}>{currentOD<0?'In Credit':(isSupplier||isTransporterParty)?'Current Payable':'Current Outstanding'}</div>
@@ -3057,12 +3338,16 @@ function PartyLedger({party,onClose}){
     </div>
 
     {metrics&&<div style={{display:'grid',gridTemplateColumns:mobile?'repeat(2,1fr)':isSupplier?'repeat(3,1fr)':'repeat(4,1fr)',gap:8,marginBottom:16}}>
-      {!isSupplier&&<div style={{background:'#F9FAFB',borderRadius:7,padding:'8px 10px',border:`1px solid ${C.bdr}`}}>
-        <div style={{fontSize:9,color:C.sub,textTransform:'uppercase',letterSpacing:.4}}>Profit</div>
+      {/* Profit/Margin tiles (request #23) open the per-sale profit+interest
+          drill-down page instead of showing the breakdown inline here. */}
+      {!isSupplier&&<div onClick={()=>setShowProfit(true)} title="View per-sale profit & interest breakdown"
+        style={{background:'#F9FAFB',borderRadius:7,padding:'8px 10px',border:`1px solid ${C.bdr}`,cursor:'pointer'}}>
+        <div style={{fontSize:9,color:C.sub,textTransform:'uppercase',letterSpacing:.4}}>Profit <span style={{textDecoration:'underline'}}>›</span></div>
         <div style={{fontSize:14,fontWeight:800,color:metrics.profit>=0?C.blue:C.red}}>{fmt(metrics.profit)}</div>
       </div>}
-      {!isSupplier&&<div style={{background:'#F9FAFB',borderRadius:7,padding:'8px 10px',border:`1px solid ${C.bdr}`}}>
-        <div style={{fontSize:9,color:C.sub,textTransform:'uppercase',letterSpacing:.4}}>Margin</div>
+      {!isSupplier&&<div onClick={()=>setShowProfit(true)} title="View per-sale profit & interest breakdown"
+        style={{background:'#F9FAFB',borderRadius:7,padding:'8px 10px',border:`1px solid ${C.bdr}`,cursor:'pointer'}}>
+        <div style={{fontSize:9,color:C.sub,textTransform:'uppercase',letterSpacing:.4}}>Margin <span style={{textDecoration:'underline'}}>›</span></div>
         <div style={{fontSize:14,fontWeight:800,color:C.txt}}>{metrics.avgMarginPct.toFixed(1)}%</div>
       </div>}
       <div style={{background:'#F9FAFB',borderRadius:7,padding:'8px 10px',border:`1px solid ${C.bdr}`}}>
@@ -3145,6 +3430,69 @@ function PartyLedger({party,onClose}){
         <span style={{fontSize:12,color:C.sub}}>Page {histPage+1} of {histTotalPages}</span>
         <Btn onClick={()=>setHistPage(p=>Math.min(histTotalPages-1,p+1))} disabled={histPage>=histTotalPages-1} variant="secondary" size="sm">Next →</Btn>
       </div>}
+    </div>}
+  </Modal>;
+}
+
+// ── Party Ledger: per-sale profit/interest drill-down (request #23) ────────
+// Clicking the Profit or Margin tile on a customer's ledger opens this
+// instead of cramming the breakdown onto the ledger itself: margin earned
+// per sale, margin lost to interest (capital tied up from purchase-paid date
+// to payment-received date), the resulting true margin, days from sale date
+// to payment-received date, and the same three totals over the whole party
+// relationship — each in both ₹ and %. Reuses getSaleProfitAnalysis(), the
+// exact FIFO+interest engine the owner-only Profit Analysis module (requests
+// #52-55) already runs app-wide, just filtered down to this one party —
+// no parallel calculation, no new engine.
+function PartySaleProfitModal({party,onClose}){
+  const mobile=useIsMobile();
+  const[viewSale,setViewSale]=useState(null);
+  const rows=useMemo(()=>getSaleProfitAnalysis().filter(r=>r.partyId===party.id),
+    [party.id,state.sales.length,state.payments.length,state.purchases.length,state.supplierPayments.length]);
+
+  const totals=rows.reduce((a,r)=>({
+    revenue:a.revenue+r.revenue, grossProfit:a.grossProfit+r.grossProfit,
+    interestLoad:a.interestLoad+r.interestLoad, netProfit:a.netProfit+r.netProfit,
+  }),{revenue:0,grossProfit:0,interestLoad:0,netProfit:0});
+  const grossPct=totals.revenue>0?Math.round(totals.grossProfit/totals.revenue*1000)/10:0;
+  const intPct=totals.revenue>0?Math.round(totals.interestLoad/totals.revenue*1000)/10:0;
+  const netPct=totals.revenue>0?Math.round(totals.netProfit/totals.revenue*1000)/10:0;
+  const hasUntraceable=rows.some(r=>r.traceableCost<r.cost-1);
+
+  return <Modal title={party.name+' — Profit & Interest Breakdown'} onClose={onClose} width={780}>
+    {viewSale&&<SaleBillModal sale={viewSale} onClose={()=>setViewSale(null)}/>}
+    <div style={{display:'grid',gridTemplateColumns:mobile?'1fr':'repeat(3,1fr)',gap:10,marginBottom:18}}>
+      <div style={{background:'#EFF6FF',borderRadius:8,border:`1px solid ${C.blue}30`,padding:'10px 14px'}}>
+        <div style={{fontSize:10,fontWeight:700,color:C.blue,textTransform:'uppercase',letterSpacing:.5}}>Margin Earned (Gross)</div>
+        <div style={{fontSize:20,fontWeight:800,color:C.blue}}>{fmt(totals.grossProfit)}</div>
+        <div style={{fontSize:11,color:C.sub}}>{grossPct}% of revenue</div>
+      </div>
+      <div style={{background:'#FEF2F2',borderRadius:8,border:`1px solid ${C.red}30`,padding:'10px 14px'}}>
+        <div style={{fontSize:10,fontWeight:700,color:C.red,textTransform:'uppercase',letterSpacing:.5}}>Margin Lost on Interest</div>
+        <div style={{fontSize:20,fontWeight:800,color:C.red}}>{fmt(totals.interestLoad)}</div>
+        <div style={{fontSize:11,color:C.sub}}>{intPct}% of revenue</div>
+      </div>
+      <div style={{background:'#F0FDF4',borderRadius:8,border:`1px solid ${C.green}30`,padding:'10px 14px'}}>
+        <div style={{fontSize:10,fontWeight:700,color:C.green,textTransform:'uppercase',letterSpacing:.5}}>True Margin Earned</div>
+        <div style={{fontSize:20,fontWeight:800,color:totals.netProfit>=0?C.green:C.red}}>{fmt(totals.netProfit)}</div>
+        <div style={{fontSize:11,color:C.sub}}>{netPct}% of revenue</div>
+      </div>
+    </div>
+    <div style={{fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,marginBottom:8}}>Per-Sale Breakdown ({rows.length})</div>
+    <div style={{border:`1px solid ${C.bdr}`,borderRadius:8,overflow:'hidden',background:mobile?'transparent':undefined,padding:mobile?8:0,marginBottom:8}}>
+      <CardTable mobile={mobile} rows={rows} keyFn={r=>r.saleId} emptyLabel="No sales recorded yet"
+        onRowClick={r=>{const found=state.sales.find(x=>x.id===r.saleId);if(found)setViewSale(found);}}
+        columns={[
+          {key:'date',label:'Date',render:r=><span style={{color:C.sub,whiteSpace:'nowrap'}}>{fmtD(r.date)}</span>},
+          {key:'revenue',label:'Revenue',align:'right',render:r=><span style={{fontWeight:600}}>{fmt(r.revenue)}</span>},
+          {key:'gross',label:'Gross Margin',align:'right',render:r=><span style={{fontWeight:700,color:C.blue}}>{fmt(r.grossProfit)}<span style={{fontSize:10,color:C.sub,fontWeight:400}}> ({r.grossMarginPct}%)</span></span>},
+          {key:'days',label:'Days to Payment',align:'right',render:r=><span style={{color:C.sub}}>{r.daysToPayment}d</span>},
+          {key:'interest',label:'Interest Lost',align:'right',render:r=><span style={{fontWeight:700,color:r.interestLoad>0?C.red:r.interestLoad<0?C.green:C.sub}}>{r.interestLoad>0?'−':r.interestLoad<0?'+':''}{fmt(Math.abs(r.interestLoad))}</span>},
+          {key:'net',label:'True Margin',align:'right',render:r=><span style={{fontWeight:700,color:r.netProfit>=0?C.green:C.red}}>{fmt(r.netProfit)}<span style={{fontSize:10,color:C.sub,fontWeight:400}}> ({r.netMarginPct}%)</span></span>},
+        ]}/>
+    </div>
+    {hasUntraceable&&<div style={{fontSize:11,color:C.muted}}>
+      * A sale drawing from stock with no traceable purchase date (opening stock, or a sales return put back at cost) has its interest load computed only on the traceable portion of its cost.
     </div>}
   </Modal>;
 }
@@ -3523,8 +3871,13 @@ function AccountsModule() {
   const categoryTypeahead = useCategoryTypeahead(allCats, chooseCategory);
   const catFilterTypeahead = useCategoryTypeahead(allCats, id=>{setCatFilter(id);setPage(0);});
 
-  const custs    = useMemo(()=>state.parties.filter(p=>p.type==='customer'),[state.parties.length]);
-  const supps    = useMemo(()=>state.parties.filter(p=>p.type==='supplier'),[state.parties.length]);
+  // Inlined rather than calling the module-level isCustomerParty/isSupplierParty
+  // helpers — this component has its own *local* `isCustomerParty` const
+  // (partyKind==='customer', below) that shadows the outer function name
+  // throughout this scope, so calling the helper by name here would actually
+  // invoke that local boolean instead.
+  const custs    = useMemo(()=>state.parties.filter(p=>p.type==='customer'||p.type==='both'),[state.parties.length]);
+  const supps    = useMemo(()=>state.parties.filter(p=>p.type==='supplier'||p.type==='both'),[state.parties.length]);
   const transporters = useMemo(()=>state.parties.filter(p=>p.type==='transporter'),[state.parties.length]);
   const partyList = isSupplier?supps:isTransporter?transporters:custs;
   const selParty = useMemo(()=>partyList.find(p=>p.id===partyId),[partyList,partyId]);
@@ -3872,7 +4225,12 @@ function AccountsModule() {
                     style={{padding:'9px 14px',cursor:'pointer',background:i===pIdx?C.blueSoft:'transparent',borderBottom:`1px solid ${C.bdr}`,fontSize:13}}>
                     <span style={{fontWeight:600,color:C.txt}}>{p.name}</span>
                     <span style={{fontSize:11,color:C.sub,marginLeft:8}}>{p.city}</span>
-                    {(()=>{const _od=p.type==='supplier'||p.type==='transporter'?getSupplierBal(p.id):getCustomerBal(p.id);return _od!==0&&<span style={{fontSize:11,color:_od>0?C.red:C.green,marginLeft:8,fontWeight:600}}>{_od>0?'OD '+fmt(_od):'Credit '+fmt(-_od)}</span>;})()}
+                    {/* p comes from partyList, which is already picked by the
+                        form's own mode (isSupplier/isTransporter) above — use
+                        that mode rather than p.type directly, since a 'both'
+                        party's p.type alone wouldn't tell us which balance
+                        the user is currently entering a payment against. */}
+                    {(()=>{const _od=(isSupplier||isTransporter)?getSupplierBal(p.id):getCustomerBal(p.id);return _od!==0&&<span style={{fontSize:11,color:_od>0?C.red:C.green,marginLeft:8,fontWeight:600}}>{_od>0?'OD '+fmt(_od):'Credit '+fmt(-_od)}</span>;})()}
                   </div>
                 ))}
                 {showAdd&&<div onMouseDown={()=>setQuickAdd(pq)}
@@ -4357,7 +4715,7 @@ function CategoryLedger({catId,onClose}) {
 function Dashboard({navigate}){
   const mobile=useIsMobile();
   const role=useRole();
-  const customers=state.parties.filter(p=>p.type==='customer');
+  const customers=state.parties.filter(isCustomerParty);
   const salesByParty=state.sales.reduce((m,s)=>{m[s.partyId]=(m[s.partyId]||0)+(s.total||0);return m;},{});
   const paymentsByParty=state.payments.reduce((m,p)=>{m[p.partyId]=(m[p.partyId]||0)+(p.amount||0);return m;},{});
   const odParties=customers
@@ -4366,7 +4724,12 @@ function Dashboard({navigate}){
     // Outstanding list — they're bad debt, not a "due to collect" figure.
     .filter(p=>p.od>0&&!p.notRecoverable).sort((a,b)=>b.od-a.od);
   const totalOD=odParties.reduce((s,p)=>s+p.od,0);
-  const allOutOfStock=state.items.filter(it=>it.active!==false&&(it.stock||0)<=0);
+  // An item already has a Purchase Order in flight (status ordered/dispatched,
+  // i.e. not yet received — see getExpectedStockMap) shouldn't also nag as
+  // "Out of Stock": the restock is already in motion, so it's excluded here
+  // rather than shown redundantly alongside the Pending Purchase Orders board.
+  const expectedStockMap=getExpectedStockMap();
+  const allOutOfStock=state.items.filter(it=>it.active!==false&&(it.stock||0)<=0&&!(expectedStockMap[it.id]>0));
   const hiddenSet=new Set(state.dashboardHiddenOOS||[]);
   const outOfStock=allOutOfStock.filter(it=>!hiddenSet.has(it.id));
   const hiddenOutOfStock=allOutOfStock.filter(it=>hiddenSet.has(it.id));
@@ -4394,6 +4757,12 @@ function Dashboard({navigate}){
   // sales dated in the current calendar month, not the flat item.purch
   // proxy used by the plain "Sales This Month" card above.
   const monthProfit=useMemo(()=>getFifoProfitInRange(today().slice(0,7)+'-01',today()),[state.sales.length,state.purchases.length,_fvD]);
+  // "Profit Net of Business Expenses" tile (request #25) — monthProfit above
+  // is pure trading margin (revenue − FIFO landed cost); this nets out the
+  // same month's business-tagged operating spend (rent, salary, etc. — see
+  // getExpensesInRange in store.js) to show what's actually left.
+  const monthBizExpenses=useMemo(()=>getExpensesInRange(today().slice(0,7)+'-01',today()).business,[state.txns.length,state.customCategories.length,_fvD]);
+  const netOfExpenses=monthProfit.profit-monthBizExpenses;
   const hideOOS=id=>{hideFromDashboardOOS(id);forceUpdate();};
   const unhideOOS=id=>{unhideFromDashboardOOS(id);forceUpdate();};
   const followupsDue=state.followups.filter(f=>f.status==='open'&&f.followUpDate&&f.followUpDate<=t).sort((a,b)=>a.followUpDate.localeCompare(b.followUpDate));
@@ -4401,20 +4770,23 @@ function Dashboard({navigate}){
   const markDone=id=>{state.followups=state.followups.map(f=>f.id===id?{...f,status:'done'}:f);save.followups();forceUpdate(n=>n+1);};
 
   // ── Order-status board (linked backorder-style, Feature #6) ─────────────
-  // Sales-order lines still waiting on stock (availability==='outOfStock'),
-  // across every non-invoiced Sales Order — status per line is always
-  // recomputed live from the linked PO (computeOrderLineStatus), never
-  // stored, so a PO update here or in OrdersModule/PurchLog shows up
-  // instantly with no separate sync step.
+  // Every line of every non-invoiced Sales Order — not just lines waiting on
+  // stock. Originally this board only surfaced out-of-stock lines, which
+  // meant a fully in-stock order needing nothing but dispatch never showed
+  // up here at all; now every pending line appears, with its status badge
+  // computed live from computeOrderLineStatus (which already returns
+  // "Available" for an in-stock line, so a ready-to-ship order reads as
+  // ready rather than silently missing).
   const pendingOrderLines=useMemo(()=>{
     const rows=[];
     state.orders.filter(o=>o.status!=='invoiced').forEach(o=>{
       (o.items||[]).forEach((l,idx)=>{
-        if(l.availability==='outOfStock')rows.push({order:o,line:l,idx});
+        rows.push({order:o,line:l,idx});
       });
     });
     return rows;
   },[state.orders.length,_fvD]);
+  const pendingOrdersCount=useMemo(()=>state.orders.filter(o=>o.status!=='invoiced').length,[state.orders.length,_fvD]);
   // Open (not-yet-received) Purchase Orders — the other half of the board.
   const pendingPurchases=useMemo(()=>state.purchases.filter(p=>getPurchaseStatus(p)!=='received')
     .sort((a,b)=>(b.createdAt||'').localeCompare(a.createdAt||'')),[state.purchases.length,_fvD]);
@@ -4432,11 +4804,11 @@ function Dashboard({navigate}){
 
   const pendingOrdersBlock=<div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,overflow:'hidden'}}>
     <div style={{padding:'12px 16px',borderBottom:`1px solid ${C.bdr}`,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-      <h3 style={{margin:0,fontSize:14,fontWeight:700,color:C.txt}}>📲 Pending Sales Orders · {pendingOrderLines.length} waiting on stock</h3>
+      <h3 style={{margin:0,fontSize:14,fontWeight:700,color:C.txt}}>📲 Pending Sales Orders · {pendingOrdersCount} pending dispatch</h3>
       <button onClick={()=>navigate('orders')} style={{background:'none',border:'none',cursor:'pointer',fontSize:12,color:C.blue,fontWeight:600}}>All →</button>
     </div>
     {pendingOrderLines.length===0
-      ?<div style={{padding:'20px',textAlign:'center',color:C.muted,fontSize:13}}>No sales orders waiting on stock ✓</div>
+      ?<div style={{padding:'20px',textAlign:'center',color:C.muted,fontSize:13}}>No pending sales orders ✓</div>
       :pendingOrderLines.slice(0,8).map(({order,line},i)=>{
         const st=computeOrderLineStatus(line);
         return <div key={order.id+'_'+i} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'8px 16px',borderBottom:`1px solid ${C.bdr}`,gap:10}}>
@@ -4488,7 +4860,7 @@ function Dashboard({navigate}){
   const outOfStockBlock=<div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,overflow:'hidden'}}>
     <div style={{padding:'12px 16px',borderBottom:`1px solid ${C.bdr}`,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
       <h3 style={{margin:0,fontSize:14,fontWeight:700,color:C.txt}}>🚫 Out of Stock · {outOfStock.length}</h3>
-      <button onClick={()=>navigate('items')} style={{background:'none',border:'none',cursor:'pointer',fontSize:12,color:C.blue,fontWeight:600}}>All →</button>
+      <button onClick={()=>{pendingItemsFilter='oos';navigate('items');}} style={{background:'none',border:'none',cursor:'pointer',fontSize:12,color:C.blue,fontWeight:600}}>All →</button>
     </div>
     {outOfStock.length===0
       ?<div style={{padding:'20px',textAlign:'center',color:C.muted,fontSize:13}}>All items stocked ✓</div>
@@ -4515,7 +4887,10 @@ function Dashboard({navigate}){
   const reorderBlock=<div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,overflow:'hidden'}}>
     <div style={{padding:'12px 16px',borderBottom:`1px solid ${C.bdr}`,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
       <h3 style={{margin:0,fontSize:14,fontWeight:700,color:C.txt}}>🔁 Reorder List · {reorderItems.length}</h3>
-      <button onClick={()=>setReorderEditorOpen(true)} style={{background:'none',border:'none',cursor:'pointer',fontSize:12,color:C.blue,fontWeight:600}}>Set levels →</button>
+      <div style={{display:'flex',gap:10}}>
+        {reorderItems.length>0&&<button onClick={()=>{pendingItemsFilter='reorder';navigate('items');}} style={{background:'none',border:'none',cursor:'pointer',fontSize:12,color:C.blue,fontWeight:600}}>View all →</button>}
+        <button onClick={()=>setReorderEditorOpen(true)} style={{background:'none',border:'none',cursor:'pointer',fontSize:12,color:C.blue,fontWeight:600}}>Set levels →</button>
+      </div>
     </div>
     {reorderItems.length===0
       ?<div style={{padding:'20px',textAlign:'center',color:C.muted,fontSize:13}}>{state.items.some(it=>it.reorderLevel>0)?'Nothing below its reorder level ✓':'No reorder levels set yet'}</div>
@@ -4609,9 +4984,10 @@ function Dashboard({navigate}){
         <div style={{marginTop:2}}>Lighter {fmtL(monthCatSplit.lighter)} · Appliances {fmtL(monthCatSplit.appliances)}</div>
       </>:'No sales'} color={C.green} icon="🧾"/>
       <StatCard label="Follow-ups Due" value={String(followupsDue.length||0)} sub={followupsDue.length?'Action needed':'All clear'} color={followupsDue.length>0?C.amber:C.green} icon="📋" onClick={()=>navigate('outstanding')}/>
-      <StatCard label="Parties" value={String(customers.length)} sub={`${state.parties.filter(p=>p.type==='supplier').length} suppliers`} color={C.blue} icon="🏪" onClick={()=>navigate('parties')}/>
-      <StatCard label="Out of Stock" value={String(outOfStock.length)} sub={outOfStock.length?'Items need reorder':'All stocked'} color={outOfStock.length>0?C.red:C.green} icon="📦" onClick={()=>navigate('items')}/>
+      <StatCard label="Parties" value={String(customers.length)} sub={`${state.parties.filter(isSupplierParty).length} suppliers`} color={C.blue} icon="🏪" onClick={()=>navigate('parties')}/>
+      <StatCard label="Out of Stock" value={String(outOfStock.length)} sub={outOfStock.length?'Items need reorder':'All stocked'} color={outOfStock.length>0?C.red:C.green} icon="📦" onClick={()=>{pendingItemsFilter='oos';navigate('items');}}/>
       {role==='owner'&&<StatCard label="Profit This Month" value={fmtL(monthProfit.profit)} sub={monthProfit.qty?`${monthProfit.qty} pcs · FIFO landed cost`:'No sales yet'} color={monthProfit.profit>=0?C.green:C.red} icon="💰"/>}
+      {role==='owner'&&<StatCard label="Net of Business Expenses" value={fmtL(netOfExpenses)} sub={monthBizExpenses?`− ${fmtL(monthBizExpenses)} business expenses`:'No expenses booked'} color={netOfExpenses>=0?C.green:C.red} icon="🧮" onClick={()=>navigate('profit')}/>}
     </div>
     {reorderEditorOpen&&<ReorderLevelEditorModal onClose={()=>{setReorderEditorOpen(false);forceUpdate();}}/>}
     {mobile
@@ -4866,10 +5242,89 @@ function ItemLog(){
   </div>;
 }
 
+// Sells off a batch straight from a non-plain-stock bucket (damaged/repaired)
+// or from a discontinued item — none of which the normal multi-line SaleEntry
+// flow can reach (it only searches active items and only sells from `stock`).
+// Deliberately a standalone one-line sale, not routed through SaleEntry's
+// qty/rate wizard — this is a clearance/one-off action, not a regular sale.
+// Known limitation: if this sale is later edited via EditSaleModal, its
+// qty-delta reconciliation restores/deducts the item's plain `stock` field
+// (the same as any other sale line) rather than the original bucket — editing
+// a bucket-sourced quick-sale after the fact is an edge case left unhandled.
+function QuickSellModal({item,source,onClose,onSold}){
+  const{toast,TC}=useToast();
+  const mobile=useIsMobile();
+  const buckets=[
+    {key:'stock',label:'Fresh stock',qty:item.stock||0},
+    {key:'damaged',label:'Damaged stock',qty:item.damaged||0},
+    {key:'repaired',label:'Repaired stock',qty:item.repaired||0},
+  ].filter(b=>b.qty>0);
+  const[bucket,setBucket]=useState(source||buckets[0]?.key||'stock');
+  const[date,setDate]=useState(today());
+  const[pq,setPq]=useState('');
+  const[partyId,setPartyId]=useState('');
+  const[qty,setQty]=useState('');
+  const[rate,setRate]=useState(item.sale||0);
+  const custs=useMemo(()=>state.parties.filter(isCustomerParty).sort((a,b)=>a.name.localeCompare(b.name)),[]);
+  const sel=custs.find(p=>p.id===partyId);
+  const psugg=useMemo(()=>pq.length<1?[]:custs.filter(p=>p.name.toLowerCase().includes(pq.toLowerCase())).slice(0,8),[pq,custs]);
+  const avail=buckets.find(b=>b.key===bucket)?.qty||0;
+  const doSave=()=>{
+    const q=Number(qty);
+    if(!partyId)return toast('Select a party','error');
+    if(!q||q<=0||q>avail)return toast('Enter a valid qty (≤ '+avail+' available)','error');
+    const r=Number(rate)||0;
+    const line={itemId:item.id,itemName:item.internal||item.name||'',customerName:item.customer||item.internal||'',dispatchName:item.dispatchName||item.internal||'',qty:q,rate:r,amount:q*r,stockSource:bucket!=='stock'?bucket:undefined};
+    const sale={id:uid('SAL'),date,partyId,partyName:sel?.name||'',transport:'',bilty:'',freightMode:'topay',freightAmt:0,freightAddToInv:false,creditDays:sel?.credit||30,items:[line],total:q*r,createdAt:new Date().toISOString()};
+    state.sales=[sale,...state.sales];save.sales();
+    state.items=state.items.map(x=>x.id===item.id?{...x,[bucket]:(x[bucket]||0)-q}:x);
+    save.items();
+    toast('Sale recorded ✓');
+    onSold?.();
+    onClose();
+  };
+  return <Modal title={'Sell "'+(item.internal||item.name)+'"'} onClose={onClose} width={440}>
+    <TC/>
+    {buckets.length>1&&<div style={{marginBottom:12}}>
+      <div style={{fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,marginBottom:6}}>Sell from</div>
+      <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
+        {buckets.map(b=><Chip key={b.key} v={b.label+' ('+b.qty+')'} active={bucket===b.key} onClick={()=>setBucket(b.key)}/>)}
+      </div>
+    </div>}
+    {buckets.length===0&&<div style={{padding:'10px 14px',background:C.redSoft,borderRadius:8,color:C.red,fontSize:12,marginBottom:12}}>No stock left in any bucket for this item.</div>}
+    <Grid2>
+      <Inp label="Date" value={date} onChange={setDate} type="date"/>
+      <Inp label={'Qty (pcs) · '+avail+' available'} value={qty} onChange={setQty} type="number"/>
+      <Inp label="Rate ₹/pc" value={rate} onChange={setRate} type="number"/>
+      <div style={{fontSize:12,color:C.sub,alignSelf:'end',paddingBottom:8}}>Amount: <strong style={{color:C.txt}}>{fmt((Number(qty)||0)*(Number(rate)||0))}</strong></div>
+    </Grid2>
+    <div style={{marginTop:10}}>
+      <div style={{fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,marginBottom:6}}>Party</div>
+      {sel
+        ?<div style={{padding:'8px 12px',borderRadius:7,border:`1.5px solid ${C.blue}`,background:C.blueSoft,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+          <span style={{fontWeight:600,color:C.txt,fontSize:13}}>{sel.name}</span>
+          <button onClick={()=>setPartyId('')} style={{background:'none',border:'none',color:C.blue,cursor:'pointer',fontSize:11,textDecoration:'underline',fontFamily:'inherit'}}>Change</button>
+        </div>
+        :<>
+          <input value={pq} onChange={e=>setPq(e.target.value)} placeholder="Search customer…" autoFocus
+            style={{width:'100%',padding:'8px 12px',borderRadius:7,border:`1.5px solid ${C.bdr}`,fontSize:13,outline:'none',fontFamily:'inherit',boxSizing:'border-box'}}/>
+          {psugg.length>0&&<div style={{marginTop:6,border:`1px solid ${C.bdr}`,borderRadius:7,overflow:'hidden'}}>
+            {psugg.map(p=><div key={p.id} onClick={()=>{setPartyId(p.id);setPq('');}} style={{padding:'7px 12px',cursor:'pointer',borderBottom:`1px solid ${C.bdr}`,fontSize:13}}>{p.name}</div>)}
+          </div>}
+        </>}
+    </div>
+    <div style={{display:'flex',justifyContent:'flex-end',gap:8,marginTop:18}}>
+      <Btn onClick={onClose} variant="secondary">Cancel</Btn>
+      <Btn onClick={doSave} disabled={buckets.length===0}>Record Sale</Btn>
+    </div>
+  </Modal>;
+}
+
 function DamagedInventory(){
   const[items,setItems]=useState(()=>state.items.filter(it=>(it.damaged||0)>0));
   const[repairQty,setRepairQty]=useState({});
   const[fixQty,setFixQty]=useState({});
+  const[sellItem,setSellItem]=useState(null);
   const{toast,TC}=useToast();
   const refresh=()=>setItems(state.items.filter(it=>(it.damaged||0)>0));
   // A returned-goods trail (a sales return that touched this item) means the
@@ -4940,6 +5395,7 @@ function DamagedInventory(){
           style={{width:55,padding:'4px 6px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:12,textAlign:'right',fontFamily:'inherit'}}/>
         <Btn onClick={()=>doCorrect(it)} size="sm" variant="secondary">→ Stock</Btn>
       </div>},
+    {key:'sell',label:'Sell off',align:'right',render:it=><Btn onClick={()=>setSellItem(it)} size="sm" variant="amber">Sell</Btn>},
   ];
   const renderSubRow=it=>{
     const sources=damageSources[it.id]||[];
@@ -4955,6 +5411,7 @@ function DamagedInventory(){
   };
   return <div>
     <TC/>
+    {sellItem&&<QuickSellModal item={sellItem} source="damaged" onClose={()=>setSellItem(null)} onSold={refresh}/>}
     <SectionHead title="Damaged Inventory" sub={`${items.length} items · ${totalDamaged} pcs · ${fmt(totalValue)} value`}/>
     <div style={{background:mobile?'transparent':C.surf,borderRadius:8,border:mobile?'none':`1px solid ${C.bdr}`,overflow:'hidden'}}>
       <CardTable mobile={mobile} columns={columns} rows={items} keyFn={it=>it.id} emptyLabel="No damaged stock ✓"
@@ -4967,8 +5424,20 @@ function DamagedInventory(){
 function RepairedInventory(){
   const[items,setItems]=useState(()=>state.items.filter(it=>(it.repaired||0)>0));
   const[editVal,setEditVal]=useState({});
+  const[shiftVal,setShiftVal]=useState({});
+  const[sellItem,setSellItem]=useState(null);
   const{toast,TC}=useToast();
   const refresh=()=>setItems(state.items.filter(it=>(it.repaired||0)>0));
+  const doShift=it=>{
+    const v=shiftVal[it.id];
+    const n=Number(v);
+    if(!v||isNaN(n)||n<=0)return toast('Enter a valid quantity','error');
+    if(n>(it.repaired||0))return toast('Only '+(it.repaired||0)+' repaired in stock','error');
+    shiftRepairedToFresh(it.id,n);
+    setShiftVal(s=>({...s,[it.id]:''}));
+    refresh();
+    toast('Shifted '+n+' pcs to fresh stock ✓');
+  };
   // Repaired stock is a direct override here rather than a transfer action —
   // unlike damaged/stock, there's no "move" counterpart to it yet (no sale
   // flow draws from repaired), so correcting a wrong count just means
@@ -4999,11 +5468,20 @@ function RepairedInventory(){
           style={{width:60,padding:'4px 6px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:12,textAlign:'right',fontFamily:'inherit'}}/>
         <Btn onClick={()=>doSet(it)} size="sm" variant="secondary">Set</Btn>
       </div>},
+    {key:'shift',label:'Shift to fresh',align:'right',render:it=>
+      <div style={{display:'flex',gap:4,justifyContent:'flex-end',alignItems:'center'}}>
+        <input type="number" value={shiftVal[it.id]??''} onChange={e=>setShiftVal(v=>({...v,[it.id]:e.target.value}))}
+          placeholder="qty" onKeyDown={e=>{if(e.key==='Enter')doShift(it);}}
+          style={{width:60,padding:'4px 6px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:12,textAlign:'right',fontFamily:'inherit'}}/>
+        <Btn onClick={()=>doShift(it)} size="sm" variant="success">Shift</Btn>
+      </div>},
+    {key:'sell',label:'Sell off',align:'right',render:it=><Btn onClick={()=>setSellItem(it)} size="sm" variant="amber">Sell</Btn>},
   ];
   return <div>
     <TC/>
+    {sellItem&&<QuickSellModal item={sellItem} source="repaired" onClose={()=>setSellItem(null)} onSold={refresh}/>}
     <SectionHead title="Repaired Inventory" sub={`${items.length} items · ${totalRepaired} pcs · ${fmt(totalValue)} value`}/>
-    <div style={{fontSize:12,color:C.sub,marginBottom:12}}>Kept separate from fresh stock — repaired units are for selling on their own (often at a discount), never mixed into a regular sale's available quantity.</div>
+    <div style={{fontSize:12,color:C.sub,marginBottom:12}}>Kept separate from fresh stock by default — repaired units are usually sold on their own (often at a discount). Use "Shift to fresh" to merge a batch back into regular sellable stock, or "Sell" to sell it directly from the repaired bucket.</div>
     <div style={{background:mobile?'transparent':C.surf,borderRadius:8,border:mobile?'none':`1px solid ${C.bdr}`,overflow:'hidden'}}>
       <CardTable mobile={mobile} columns={columns} rows={items} keyFn={it=>it.id} emptyLabel="No repaired stock"/>
     </div>
@@ -5130,7 +5608,7 @@ function SubHeadManager(){
             const prevSubHead=i>0?sorted[i-1].subHead:undefined;
             const showHeader=normSubHeadDisplay(it.subHead)!==normSubHeadDisplay(prevSubHead);
             return <Fragment key={it.id}>
-              {showHeader&&<tr><td colSpan={4} style={{padding:'6px 12px',background:'#EEF2F6',fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5}}>{it.subHead||'Ungrouped'}</td></tr>}
+              {showHeader&&<tr><td colSpan={4} style={{padding:'6px 12px',background:C.amberSoft,fontSize:11,fontWeight:800,color:C.amberBright,borderLeft:`3px solid ${C.amber}`,textTransform:'uppercase',letterSpacing:.5}}>{it.subHead||'Ungrouped'}</td></tr>}
               <tr style={{borderBottom:`1px solid ${C.bdr}`}}>
                 <td style={{padding:'6px 12px',color:C.sub,whiteSpace:'nowrap'}}>{it.cat||'Other'}</td>
                 <td style={{padding:'6px 12px',fontWeight:600,color:C.txt}}>{it.internal||it.name}</td>
@@ -5187,10 +5665,48 @@ function ItemDetail({item,onClose}){
   // restriction as getFifoStockMap/getFifoSaleMarginMap: historical,
   // pre-app sale rows have no dated layer to cost against).
   const fifoSaleCosts=useMemo(()=>getFifoSaleCosts(item.id),[item.id,state.purchases.length,state.sales.length,state.repairExpenses.length,state.items.length]);
-  const rows=useMemo(()=>metrics.rows
+  // Landing cost of the stock still sitting on the shelf — base FIFO rate +
+  // a value-weighted share of that purchase's transport/loading/packing
+  // extra charges + the 1%/month interest burden accrued from the time we
+  // paid the supplier for it up to today (it hasn't sold yet, so the
+  // interest clock on that money is still running). See getItemLandingCost
+  // in store.js for the full replay logic. Owner-only, same gating as every
+  // other cost/margin figure in this component.
+  const landing=useMemo(()=>role==='owner'?getItemLandingCost(item.id):null,[item.id,role,state.purchases.length,state.sales.length,state.repairExpenses.length,state.items.length]);
+  // Item-to-item stock adjustments (moveItemStock/MoveStockModal, logged to
+  // state.stockAdjustments with a required reason — see that function's
+  // comment) touch this item's stock exactly like a sale or purchase does,
+  // but previously never showed up in the item ledger at all, making a
+  // transfer invisible here even though it changed the stock number. Each
+  // adjustment that names this item as source or target becomes its own
+  // ledger row, dir 'transfer_out'/'transfer_in' so it's clearly distinct
+  // from a sale/purchase but still flows through the same running-balance
+  // walk below.
+  const transferRows=useMemo(()=>state.stockAdjustments
+    .filter(a=>a.fromItemId===item.id||a.toItemId===item.id)
+    .map(a=>a.fromItemId===item.id
+      ?{d:a.date,item:item.internal,qty:a.qty,rate:0,amount:0,dir:'transfer_out',party:'→ '+(a.toItemName||'?')+(a.reason?' · '+a.reason:''),isTransfer:true,adjId:a.id}
+      :{d:a.date,item:item.internal,qty:a.qty,rate:0,amount:0,dir:'transfer_in',party:'← '+(a.fromItemName||'?')+(a.reason?' · '+a.reason:''),isTransfer:true,adjId:a.id}),
+    [item.id,item.internal,state.stockAdjustments.length]);
+  // Running balance: walk every row (sales/returns/purchases/transfers) for
+  // this item chronologically, computing each row's stock balance AFTER it.
+  // The current `stock` is the one known-accurate anchor, so — mirroring the
+  // obGap reconciliation PartyLedger uses for party.ob — the walk's starting
+  // point is derived by subtracting the full net delta of every row from the
+  // current stock, rather than assumed to start at 0 (manual stock
+  // corrections/seed data mean the rows alone don't always net to the
+  // current figure).
+  const rowDelta=r=>r.dir==='in'||r.dir==='transfer_in'?Number(r.qty||0):-Number(r.qty||0);
+  const allRowsWithBalance=useMemo(()=>{
+    const combined=[...metrics.rows,...transferRows].sort((a,b)=>a.d.localeCompare(b.d));
+    const net=combined.reduce((s,r)=>s+rowDelta(r),0);
+    let bal=stock-net;
+    return combined.map(r=>{ bal+=rowDelta(r); return {...r,balance:bal}; });
+  },[metrics,transferRows,stock]);
+  const rows=useMemo(()=>allRowsWithBalance
     .filter(r=>!search||(r.party||'').toLowerCase().includes(search.toLowerCase()))
-    .filter(r=>typeF==='all'||(typeF==='sale'?r.dir==='out':r.dir==='in'))
-    .sort((a,b)=>b.d.localeCompare(a.d)),[metrics,search,typeF]);
+    .filter(r=>typeF==='all'||(typeF==='sale'?r.dir==='out':typeF==='purch'?r.dir==='in':(r.dir==='transfer_out'||r.dir==='transfer_in')))
+    .sort((a,b)=>b.d.localeCompare(a.d)),[allRowsWithBalance,search,typeF]);
   const pageRows=rows.slice(page*PAGE,(page+1)*PAGE);
   const totalPages=Math.ceil(rows.length/PAGE);
   const doRepair=()=>{
@@ -5284,10 +5800,22 @@ function ItemDetail({item,onClose}){
           {(item.specs||[]).filter(s=>s.label||s.value).map((s,i)=><span key={i} style={{fontSize:11,color:C.sub}}><b style={{color:C.txt}}>{s.label}:</b> {s.value}</span>)}
         </div>
       </div>}
+    {role==='owner'&&landing&&landing.qty>0&&
+      <div style={{background:'#F9FAFB',borderRadius:8,border:`1px solid ${C.bdr}`,padding:'10px 12px',marginBottom:16}}>
+        <div style={{fontSize:9,color:C.sub,textTransform:'uppercase',letterSpacing:.4,marginBottom:8}}>Landing Cost of Stock on Hand — per piece{landing.hasUntraceable?' (approx.)':''}</div>
+        <div style={{display:'grid',gridTemplateColumns:mobile?'repeat(2,1fr)':'repeat(4,1fr)',gap:8}}>
+          <Card label="Base Rate" value={fmt(landing.baseRate)}/>
+          <Card label="Transport/pc" value={fmt(landing.transportPerPc)}/>
+          <Card label="Interest/pc" value={fmt(landing.interestPerPc)} color={C.amber}/>
+          <Card label="Landing Cost/pc" value={fmt(landing.landingCostPerPc)} color={C.blue}/>
+        </div>
+        {landing.hasUntraceable&&<div style={{fontSize:10,color:C.muted,marginTop:8}}>Some of the stock on hand couldn't be traced to a specific purchase (pre-app opening stock) — transport/interest shown is computed only over the traceable portion and spread across all {landing.qty} pcs.</div>}
+      </div>}
     <div style={{display:'flex',gap:8,marginBottom:10,flexWrap:'wrap'}}>
       <Chip v="All" active={typeF==='all'} onClick={()=>{setTypeF('all');setPage(0);}}/>
       <Chip v="Sales only" active={typeF==='sale'} onClick={()=>{setTypeF('sale');setPage(0);}}/>
       <Chip v="Purchases only" active={typeF==='purch'} onClick={()=>{setTypeF('purch');setPage(0);}}/>
+      <Chip v="Transfers only" active={typeF==='transfer'} onClick={()=>{setTypeF('transfer');setPage(0);}}/>
     </div>
     <div style={{background:C.surf,borderRadius:7,border:`1px solid ${C.bdr}`,padding:'7px 11px',marginBottom:12}}>
       <input value={search} onChange={e=>{setSearch(e.target.value);setPage(0);}} placeholder="Search by party…" style={{width:'100%',border:'none',outline:'none',fontSize:13,color:C.txt,fontFamily:'inherit',background:'transparent'}}/>
@@ -5298,8 +5826,8 @@ function ItemDetail({item,onClose}){
           {key:'date',label:'Date',render:r=><span style={{whiteSpace:'nowrap',color:C.sub}}>{fmtD(r.d)}</span>},
           {key:'party',label:'Party',render:r=><span style={{fontWeight:500,color:C.txt}}>{r.party||'—'}</span>},
           {key:'qty',label:'Qty',align:'right',render:r=>Math.abs(r.qty||0)},
-          {key:'rate',label:'Rate',align:'right',render:r=><span style={{color:C.sub}}>{fmt(r.rate)}</span>},
-          {key:'amount',label:'Amount',align:'right',render:r=><span style={{fontWeight:700,color:C.blue}}>{fmt(Math.abs(r.amount||0))}</span>},
+          {key:'rate',label:'Rate',align:'right',render:r=>r.isTransfer?<span style={{color:C.muted}}>—</span>:<span style={{color:C.sub}}>{fmt(r.rate)}</span>},
+          {key:'amount',label:'Amount',align:'right',render:r=>r.isTransfer?<span style={{color:C.muted}}>—</span>:<span style={{fontWeight:700,color:C.blue}}>{fmt(Math.abs(r.amount||0))}</span>},
           {key:'margin',label:'Margin',align:'right',render:r=>{
             if(r.dir!=='out'||r.isReturn)return<span style={{color:C.muted}}>—</span>;
             const m=r.saleId&&fifoSaleCosts[r.saleId];
@@ -5309,7 +5837,11 @@ function ItemDetail({item,onClose}){
               <span style={{fontSize:11,color:C.sub,marginLeft:4}}>{fmt(m.marginPerPc)}/pc</span>
             </span>;
           }},
-          {key:'type',label:'Type',align:'center',render:r=><Badge v={r.isReturn?'Return':r.dir==='in'?'Purchased':'Sold'} color={r.isReturn?'amber':r.dir==='in'?'green':'blue'}/>},
+          {key:'type',label:'Type',align:'center',render:r=>
+            r.dir==='transfer_out'?<Badge v="Transferred Out" color="amber"/>
+            :r.dir==='transfer_in'?<Badge v="Transferred In" color="green"/>
+            :<Badge v={r.isReturn?'Return':r.dir==='in'?'Purchased':'Sold'} color={r.isReturn?'amber':r.dir==='in'?'green':'blue'}/>},
+          {key:'balance',label:'Balance',align:'right',render:r=><span style={{fontWeight:700,color:r.balance<=0?C.red:C.txt,fontVariantNumeric:'tabular-nums'}}>{r.balance}</span>},
         ].filter(c=>role==='owner'||c.key!=='margin')}/>
     </div>
     {totalPages>1&&<div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:8,marginTop:12}}>
@@ -5328,7 +5860,24 @@ function ItemDetail({item,onClose}){
 // whole row's job is "tap to expand" — opens the full item ledger
 // (ItemDetail), mirroring "clicking the item can expand... clicking further
 // on the item name can show the item ledger" from the request verbatim.
-function MobileInventoryList({items,catF,saleOf,purchOf,marginOf,expectedMap,onOpenLedger,onMove,onMerge,onEdit,onShare,role}){
+// Stock display: petis+pcs for items that actually sell by the peti, plain
+// pcs for items that don't. qty/peti===1 normally means "this item is sold
+// in pcs, not petis" (a peti breakdown would just repeat the pcs count) —
+// except Lighter-category items, where a peti size of 1 is still a real
+// peti, not a "no peti" marker (same cat==='Lighter' special-case already
+// used for the Home/Lighter BI split in store.js).
+function formatStockQty(stock,item){
+  const n=stock||0;
+  const peti=item.peti||1;
+  const usesPeti=item.cat==='Lighter'||peti>1;
+  if(!usesPeti)return n+' pc'+(n===1?'':'s');
+  const petis=Math.floor(n/peti),pcs=n%peti;
+  const parts=[];
+  if(petis>0)parts.push(petis+' peti'+(petis===1?'':'s'));
+  if(pcs>0||petis===0)parts.push(pcs+' pc'+(pcs===1?'':'s'));
+  return parts.join(' ')+' ('+n+' pcs)';
+}
+function MobileInventoryList({items,catF,saleOf,purchOf,marginOf,expectedMap,onOpenLedger,onMove,onMerge,onEdit,onShare,onSell,role}){
   const[expandedId,setExpandedId]=useState(null);
   if(!items.length)return <div style={{padding:'30px 10px',textAlign:'center',color:C.sub,fontSize:13}}>No items match</div>;
   return <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}>
@@ -5339,18 +5888,17 @@ function MobileInventoryList({items,catF,saleOf,purchOf,marginOf,expectedMap,onO
         const showSub=it.subHead&&normSubHeadDisplay(it.subHead)!==normSubHeadDisplay(prev?prev.subHead:undefined);
         const expanded=expandedId===it.id;
         const sale=saleOf(it),purch=purchOf(it),{pct:marginPct,perPc:marginPerPc,isReal}=marginOf(it);
-        const stock=it.stock||0,expected=expectedMap[it.id]||0,damaged=it.damaged||0;
+        const stock=it.stock||0,expected=expectedMap[it.id]||0,damaged=it.damaged||0,repaired=it.repaired||0;
         return <Fragment key={it.id}>
           {showCat&&<tr><td colSpan={2} style={{padding:'10px 12px',background:C.blueSoft,fontSize:13,fontWeight:800,color:C.blue,borderTop:prev?`2px solid ${C.blue}`:'none'}}>{it.cat||'Other'}</td></tr>}
-          {showSub&&<tr><td colSpan={2} style={{padding:'6px 12px',background:'#EEF2F6',fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5}}>{it.subHead}</td></tr>}
+          {showSub&&<tr><td colSpan={2} style={{padding:'6px 12px',background:C.amberSoft,fontSize:11,fontWeight:800,color:C.amberBright,borderLeft:`3px solid ${C.amber}`,textTransform:'uppercase',letterSpacing:.5}}>{it.subHead}</td></tr>}
           <tr onClick={()=>setExpandedId(expanded?null:it.id)} style={{borderBottom:expanded?'none':`1px solid ${C.bdr}`,cursor:'pointer',background:expanded?'#F9FAFB':'transparent'}}>
             <td style={{padding:'10px 12px',fontWeight:600,color:C.txt}}>{it.dispatchName||it.internal||it.name}</td>
-            <td style={{padding:'10px 12px',textAlign:'right'}}><Badge v={stock+' pc'+(stock===1?'':'s')} color={stock<=0?'red':'gray'}/></td>
+            <td style={{padding:'10px 12px',textAlign:'right'}}><Badge v={formatStockQty(stock,it)} color={stock<=0?'red':'gray'}/></td>
           </tr>
           {expanded&&<tr style={{borderBottom:`1px solid ${C.bdr}`}}><td colSpan={2} style={{padding:'4px 12px 12px'}}>
             <div style={{background:C.surf,border:`1px solid ${C.bdr}`,borderRadius:9,padding:12,display:'flex',flexDirection:'column',gap:8}} onClick={e=>e.stopPropagation()}>
               <span onClick={()=>onOpenLedger(it)} style={{fontWeight:700,color:C.blue,cursor:'pointer',textDecoration:'underline',textDecorationStyle:'dotted',fontSize:14}}>{it.dispatchName||it.internal||it.name} — View Ledger →</span>
-              {it.customer&&<Row label="Customer Name" value={it.customer}/>}
               <Row label="Category" value={<Badge v={it.cat||'Other'} color="blue"/>}/>
               <Row label="Peti Size" value={it.peti+' pcs'}/>
               <Row label="Selling Rate" value={fmt(sale)}/>
@@ -5360,8 +5908,11 @@ function MobileInventoryList({items,catF,saleOf,purchOf,marginOf,expectedMap,onO
                 <span style={{fontSize:11,color:C.sub,marginLeft:4}}>{fmt(marginPerPc)}/pc{!isReal?' (est.)':''}</span>
               </span>}/>}
               {damaged>0&&<Row label="Damaged" value={<Badge v={damaged+' pcs'} color="amber"/>}/>}
+              {repaired>0&&<Row label="Repaired" value={<Badge v={repaired+' pcs'} color="green"/>}/>}
               {expected>0&&<Row label="Expected" value={<span style={{color:C.amber,fontWeight:700}}>+{expected}</span>}/>}
               <div style={{display:'flex',gap:6,justifyContent:'flex-end',flexWrap:'wrap',marginTop:4}}>
+                {(it.active===false||damaged>0||repaired>0)&&(stock+damaged+repaired)>0&&
+                  <IconBtn onClick={()=>onSell(it)} title="Sell off this item's stock (incl. damaged/repaired/discontinued)">💸</IconBtn>}
                 <IconBtn onClick={()=>onShare(it)} title="Share">📤</IconBtn>
                 <IconBtn onClick={()=>onMove(it)} title="Move stock">🔀</IconBtn>
                 <IconBtn onClick={()=>onMerge(it)} title="Merge">🔗</IconBtn>
@@ -5382,10 +5933,15 @@ function Row({label,value}){
 }
 
 function ItemMasters(){
+  // One-shot filter hint from a Dashboard "View all"/StatCard link (see
+  // pendingItemsFilter above) — read once on mount, then cleared immediately
+  // so navigating here again normally (nav menu, etc.) doesn't re-apply it.
+  const[quickFilter,setQuickFilter]=useState(()=>{const f=pendingItemsFilter;pendingItemsFilter=null;return f;});
   const[items,setItems]=useState(state.items);
   const[search,setSearch]=useState('');
   const[catF,setCatF]=useState('');
   const[statusF,setStatusF]=useState('active');
+  const[discInStockOnly,setDiscInStockOnly]=useState(false); // Discontinued view: only items with any fresh/damaged/repaired stock left to sell off
   const[page,setPage]=useState(0);
   const[modal,setModal]=useState(null);
   const[form,setForm]=useState({});
@@ -5393,8 +5949,10 @@ function ItemMasters(){
   const[detailItem,setDetailItem]=useState(null);
   const[mergeSrc,setMergeSrc]=useState(null);
   const[moveSrc,setMoveSrc]=useState(null);
+  const[reconcileSrc,setReconcileSrc]=useState(null); // null=closed, true=blank picker, or an item object
   const[shareItem,setShareItem]=useState(null);
   const[shareCatalogue,setShareCatalogue]=useState(false);
+  const[sellItem,setSellItem]=useState(null);
   const[editSaleId,setEditSaleId]=useState(null);
   const[editSaleVal,setEditSaleVal]=useState('');
   const{toast,TC}=useToast();
@@ -5435,8 +5993,15 @@ function ItemMasters(){
   };
   const filtered=items.filter(it=>
     (statusF==='active'?it.active!==false:it.active===false)&&
+    (statusF!=='discontinued'||!discInStockOnly||(it.stock||0)+(it.damaged||0)+(it.repaired||0)>0)&&
     (!catF||it.cat===catF)&&
-    (!search||(it.customer||it.internal||'').toLowerCase().includes(search.toLowerCase()))
+    (!search||(it.customer||it.internal||'').toLowerCase().includes(search.toLowerCase()))&&
+    // Dashboard "View all" hand-off (see quickFilter above) — 'oos' mirrors
+    // Dashboard's own Out of Stock definition exactly (zero stock AND no
+    // incoming PO already covering it), 'reorder' mirrors getReorderItems'
+    // at-or-below-reorder-level definition.
+    (quickFilter!=='oos'||((it.stock||0)<=0&&!(expectedMap[it.id]>0)))&&
+    (quickFilter!=='reorder'||((it.reorderLevel||0)>0&&(it.stock||0)<=it.reorderLevel))
   ).sort((a,b)=>(a.cat||'').localeCompare(b.cat||'')||(a.sortOrder??Infinity)-(b.sortOrder??Infinity)||(a.internal||'').localeCompare(b.internal||''));
   const pageData=filtered.slice(page*PAGE,(page+1)*PAGE);
   const totalPages=Math.ceil(filtered.length/PAGE);
@@ -5529,9 +6094,11 @@ function ItemMasters(){
     {detailItem&&<ItemDetail item={detailItem} onClose={()=>setDetailItem(null)}/>}
     {mergeSrc&&<MergeItemModal source={mergeSrc} onClose={()=>setMergeSrc(null)} onMerged={()=>{setItems([...state.items]);setMergeSrc(null);}}/>}
     {moveSrc&&<MoveStockModal source={moveSrc} onClose={()=>setMoveSrc(null)} onMoved={()=>{setItems([...state.items]);setMoveSrc(null);}}/>}
+    {reconcileSrc&&<StockReconciliationModal item={reconcileSrc===true?null:reconcileSrc} onClose={()=>setReconcileSrc(null)} onDone={()=>{setItems([...state.items]);setReconcileSrc(null);}}/>}
     {shareItem&&<ShareItemModal item={shareItem} onClose={()=>setShareItem(null)}/>}
     {shareCatalogue&&<CatalogueShareModal onClose={()=>setShareCatalogue(false)}/>}
-    <SectionHead title="Inventory" sub={`${items.filter(it=>it.active!==false).length} active items`} action={view==='list'?<div style={{display:'flex',gap:8,flexWrap:'wrap'}}><Btn onClick={()=>setShareCatalogue(true)} variant="secondary" icon="📲">Share Catalogue</Btn><Btn onClick={downloadReport} variant="secondary" icon="⬇">CSV</Btn><Btn onClick={downloadReportPDF} variant="secondary" icon="⬇">PDF</Btn><Btn onClick={()=>{setForm({cat:'Other',peti:1,sale:0,purch:0,active:true,id:uid('ITM'),photos:[],specs:[],dimensions:''});setModal('add');}}>+ Add Item</Btn></div>:null}/>
+    {sellItem&&<QuickSellModal item={sellItem} onClose={()=>setSellItem(null)} onSold={()=>setItems([...state.items])}/>}
+    <SectionHead title="Inventory" sub={`${items.filter(it=>it.active!==false).length} active items`} action={view==='list'?<div style={{display:'flex',gap:8,flexWrap:'wrap'}}><Btn onClick={()=>setReconcileSrc(true)} variant="secondary" icon="🔢">Reconcile Stock</Btn><Btn onClick={()=>setShareCatalogue(true)} variant="secondary" icon="📲">Share Catalogue</Btn><Btn onClick={downloadReport} variant="secondary" icon="⬇">CSV</Btn><Btn onClick={downloadReportPDF} variant="secondary" icon="⬇">PDF</Btn><Btn onClick={()=>{setForm({cat:'Other',peti:1,sale:0,purch:0,active:true,id:uid('ITM'),photos:[],specs:[],dimensions:''});setModal('add');}}>+ Add Item</Btn></div>:null}/>
     <div style={{display:'flex',gap:8,marginBottom:16,flexWrap:'wrap'}}>
       <Chip v="Item List" active={view==='list'} onClick={()=>setView('list')}/>
       <Chip v="Category Analytics" active={view==='analytics'} onClick={()=>setView('analytics')}/>
@@ -5541,8 +6108,9 @@ function ItemMasters(){
       <Chip v="Damaged Inventory" active={view==='damaged'} onClick={()=>setView('damaged')}/>
       <Chip v="Repaired Inventory" active={view==='repaired'} onClick={()=>setView('repaired')}/>
       <Chip v="Stock Adjustments" active={view==='adjustments'} onClick={()=>setView('adjustments')}/>
+      <Chip v="Stock Reconciliations" active={view==='reconciliations'} onClick={()=>setView('reconciliations')}/>
     </div>
-    {view==='analytics'?<CategoryAnalytics/>:view==='log'?<ItemLog/>:view==='naming'?<ItemNamingEditor/>:view==='subheads'?<SubHeadManager/>:view==='damaged'?<DamagedInventory/>:view==='repaired'?<RepairedInventory/>:view==='adjustments'?<StockAdjustmentLog/>:<>
+    {view==='analytics'?<CategoryAnalytics/>:view==='log'?<ItemLog/>:view==='naming'?<ItemNamingEditor/>:view==='subheads'?<SubHeadManager/>:view==='damaged'?<DamagedInventory/>:view==='repaired'?<RepairedInventory/>:view==='adjustments'?<StockAdjustmentLog/>:view==='reconciliations'?<StockReconciliationLog/>:<>
     {modal&&<Modal title={modal==='add'?'Add Item':'Edit Item'} onClose={()=>setModal(null)}>
       <Grid2>
         <div style={{gridColumn:'1/-1'}}><Inp label="Internal Name (Sales Sheet)" value={form.internal||''} onChange={v=>setForm(f=>({...f,internal:v,name:v}))} required hint="How it appears in your Excel/bills"/></div>
@@ -5612,9 +6180,17 @@ function ItemMasters(){
         <Btn onClick={doSave}>{modal==='add'?'Add Item':'Save Changes'}</Btn>
       </div>
     </Modal>}
-    <div style={{display:'flex',gap:8,marginBottom:10,flexWrap:'wrap'}}>
+    {quickFilter&&<div style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'8px 14px',borderRadius:7,background:C.blueSoft,border:`1px solid ${C.blue}30`,marginBottom:10,fontSize:12}}>
+      <span style={{color:C.blue,fontWeight:600}}>{quickFilter==='oos'?'🚫 Showing Out of Stock items only (from Dashboard)':'🔁 Showing items at/below reorder level only (from Dashboard)'}</span>
+      <button onClick={()=>setQuickFilter(null)} style={{background:'none',border:'none',color:C.blue,cursor:'pointer',fontSize:12,fontWeight:600,textDecoration:'underline',fontFamily:'inherit'}}>Clear</button>
+    </div>}
+    <div style={{display:'flex',gap:8,marginBottom:10,flexWrap:'wrap',alignItems:'center'}}>
       <Chip v="Active" active={statusF==='active'} onClick={()=>{setStatusF('active');setPage(0);}}/>
       <Chip v="Discontinued" active={statusF==='discontinued'} onClick={()=>{setStatusF('discontinued');setPage(0);}}/>
+      {statusF==='discontinued'&&<label style={{display:'flex',alignItems:'center',gap:6,fontSize:12,color:C.sub,cursor:'pointer',marginLeft:4}}>
+        <input type="checkbox" checked={discInStockOnly} onChange={e=>{setDiscInStockOnly(e.target.checked);setPage(0);}}/>
+        Only items with stock left (fresh, damaged or repaired)
+      </label>}
     </div>
     <div style={{display:'flex',gap:8,marginBottom:14,flexWrap:'wrap'}}>
       <Chip v="All" active={!catF} onClick={()=>{setCatF('');setPage(0);}}/>
@@ -5625,7 +6201,7 @@ function ItemMasters(){
     </div>
     <div style={{background:mobile?'transparent':C.surf,borderRadius:8,border:mobile?'none':`1px solid ${C.bdr}`,overflow:'hidden'}}>
       {mobile?<MobileInventoryList items={pageData} catF={catF} saleOf={saleOf} purchOf={purchOf} marginOf={marginOf} expectedMap={expectedMap}
-        onOpenLedger={setDetailItem} onMove={setMoveSrc} onMerge={setMergeSrc} onEdit={openEdit} onShare={setShareItem} role={role}/>:
+        onOpenLedger={setDetailItem} onMove={setMoveSrc} onMerge={setMergeSrc} onEdit={openEdit} onShare={setShareItem} onSell={setSellItem} role={role}/>:
       <CardTable mobile={mobile} rows={pageData} keyFn={(it,i)=>it.id||i} emptyLabel="No items match"
         groupHeader={(it,prev)=>{
           const prevCat=prev?prev.cat:(page>0?'__prevpage__':null);
@@ -5639,14 +6215,13 @@ function ItemMasters(){
           return <>
             {showCatHeader&&<div style={{padding:'10px 12px',background:C.blueSoft,fontSize:13,fontWeight:800,color:C.blue,
               borderTop:prev?`2px solid ${C.blue}`:'none',borderRadius:mobile?7:0,marginTop:mobile&&prev?10:0}}>{it.cat||'Other'}</div>}
-            {showSubHead&&<div style={{padding:'6px 12px',background:'#EEF2F6',fontSize:11,fontWeight:700,color:C.sub,
+            {showSubHead&&<div style={{padding:'6px 12px',background:C.amberSoft,fontSize:11,fontWeight:800,color:C.amberBright,borderLeft:`3px solid ${C.amber}`,
               textTransform:'uppercase',letterSpacing:.5,borderRadius:mobile?7:0,marginTop:mobile?6:0}}>{it.subHead}</div>}
           </>;
         }}
         columns={[
           {key:'internal',label:'Item Name',render:it=><span onClick={()=>setDetailItem(it)}
             style={{fontWeight:600,color:C.blue,cursor:'pointer',textDecoration:'underline',textDecorationStyle:'dotted'}}>{it.dispatchName||it.internal||it.name}</span>},
-          {key:'customer',label:'Customer Name',cardLabel:'Customer',render:it=><span style={{fontSize:12,color:C.sub}}>{it.customer||'—'}</span>},
           {key:'cat',label:'Category',render:it=><Badge v={it.cat||'Other'} color="blue"/>},
           {key:'peti',label:'Peti',align:'right',render:it=><span style={{color:C.sub}}>{it.peti}</span>},
           {key:'sale',label:'Sale ₹',align:'right',render:it=>{
@@ -5675,17 +6250,21 @@ function ItemMasters(){
           }},
           {key:'stock',label:'Stock',align:'right',render:it=>{
             const stock=it.stock||0;
-            return <Badge v={stock+' pc'+(stock===1?'':'s')} color={stock<=0?'red':'gray'}/>;
+            return <Badge v={formatStockQty(stock,it)} color={stock<=0?'red':'gray'}/>;
           }},
           {key:'damaged',label:'Damaged',align:'right',render:it=>(it.damaged||0)>0?<Badge v={it.damaged+' pc'+(it.damaged===1?'':'s')} color="amber"/>:<span style={{color:C.muted}}>—</span>},
+          {key:'repaired',label:'Repaired',align:'right',render:it=>(it.repaired||0)>0?<Badge v={it.repaired+' pc'+(it.repaired===1?'':'s')} color="green"/>:<span style={{color:C.muted}}>—</span>},
           {key:'expected',label:'Expected',align:'right',render:it=>{
             const expected=expectedMap[it.id]||0;
             return <span style={{color:expected>0?C.amber:C.muted,fontWeight:expected>0?700:400}}>{expected>0?'+'+expected:'—'}</span>;
           }},
           {key:'actions',label:'',cardLabel:'Actions',render:it=>
             <div style={{display:'flex',gap:6,justifyContent:'flex-end',flexWrap:'wrap'}}>
+              {(it.active===false||(it.damaged||0)>0||(it.repaired||0)>0)&&((it.stock||0)+(it.damaged||0)+(it.repaired||0))>0&&
+                <IconBtn onClick={()=>setSellItem(it)} title="Sell off this item's stock (incl. damaged/repaired/discontinued)">💸</IconBtn>}
               <IconBtn onClick={()=>setShareItem(it)} title="Share">📤</IconBtn>
               <IconBtn onClick={()=>setMoveSrc(it)} title="Move stock">🔀</IconBtn>
+              <IconBtn onClick={()=>setReconcileSrc(it)} title="Reconcile stock (physical count)">🔢</IconBtn>
               <IconBtn onClick={()=>setMergeSrc(it)} title="Merge">🔗</IconBtn>
               <IconBtn onClick={()=>openEdit(it)} title="Edit">✏️</IconBtn>
             </div>},
@@ -5966,6 +6545,95 @@ function MoveStockModal({source,onClose,onMoved}){
   </Modal>;
 }
 
+// Physical stock count vs book qty — see reconcileItemStock() above. Can be
+// opened either pre-scoped to one item (from Inventory's row actions) or
+// blank (item picker shown first, mirrors MoveStockModal's own search-first
+// pattern) so a general "Reconcile Stock" entry point works too.
+function StockReconciliationModal({item:preItem,onClose,onDone}){
+  const[pq,setPq]=useState('');
+  const[itemId,setItemId]=useState(preItem?.id||'');
+  const[physQty,setPhysQty]=useState('');
+  const[notes,setNotes]=useState('');
+  const mobile=useIsMobile();
+  const{toast,TC}=useToast();
+  const candidates=useMemo(()=>state.items.filter(it=>it.active!==false&&(!pq||(it.internal||it.name||'').toLowerCase().includes(pq.toLowerCase()))).slice(0,8),[pq]);
+  const item=state.items.find(it=>it.id===itemId);
+  const bookQty=item?.stock||0;
+  const pqNum=physQty===''?null:Number(physQty);
+  const diff=pqNum==null?0:pqNum-bookQty;
+  const rate=item?.purchRaw??item?.purch??0;
+  const value=Math.round(diff*rate);
+  const doSave=()=>{
+    if(!item)return toast('Pick an item to reconcile','error');
+    if(pqNum==null||pqNum<0)return toast('Enter the physical count','error');
+    if(diff===0)return toast('No mismatch — physical count already matches book qty','error');
+    reconcileItemStock(item.id,pqNum,notes);
+    toast((diff>0?'Excess of '+diff:'Shortfall of '+(-diff))+' pcs logged for "'+(item.internal||item.name)+'" ✓');
+    onDone?.();
+  };
+  return <Modal title="Reconcile Stock" onClose={onClose} width={440}>
+    <TC/>
+    <div style={{fontSize:12,color:C.sub,marginBottom:12}}>Enter the physically counted quantity for an item. Any mismatch against the book qty is logged as an adjustment — a shortfall posts as a loss, an excess as a profit.</div>
+    {!item
+      ?<>
+        <input value={pq} onChange={e=>setPq(e.target.value)} placeholder="Search item to reconcile…" autoFocus
+          style={{width:'100%',padding:'8px 12px',borderRadius:7,border:`1.5px solid ${C.bdr}`,fontSize:13,outline:'none',fontFamily:'inherit',marginBottom:8,boxSizing:'border-box'}}/>
+        {pq.length>0&&candidates.map(it=><div key={it.id} onClick={()=>setItemId(it.id)} style={{padding:'8px 12px',borderRadius:7,cursor:'pointer',border:`1px solid ${C.bdr}`,marginBottom:6}}
+          {...(mobile?{}:{onMouseEnter:e=>e.currentTarget.style.background='#F6F8FA',onMouseLeave:e=>e.currentTarget.style.background='transparent'})}>
+          <div style={{fontWeight:600,color:C.txt,fontSize:13}}>{it.internal||it.name}</div>
+          <div style={{fontSize:11,color:C.sub}}>{it.cat||'—'} · {it.stock||0} pcs (book)</div>
+        </div>)}
+      </>
+      :<div style={{padding:'10px 14px',borderRadius:8,border:`1.5px solid ${C.blue}`,background:C.blueSoft,marginBottom:14}}>
+        <div style={{fontSize:11,color:C.sub}}>Reconciling</div>
+        <div style={{fontWeight:700,color:C.txt,fontSize:14}}>{item.internal||item.name}</div>
+        <div style={{fontSize:11,color:C.sub,marginTop:2}}>Book qty: {bookQty} pcs</div>
+        {!preItem&&<button onClick={()=>{setItemId('');setPq('');}} style={{marginTop:4,background:'none',border:'none',color:C.blue,cursor:'pointer',fontSize:11,textDecoration:'underline',fontFamily:'inherit'}}>Change</button>}
+      </div>}
+    {item&&<div style={{marginTop:4}}>
+      <label style={{fontSize:11,color:C.sub,fontWeight:600}}>Physical count (actual pcs on shelf)</label>
+      <input type="number" value={physQty} onChange={e=>setPhysQty(e.target.value)} placeholder={String(bookQty)}
+        style={{width:'100%',padding:'8px 12px',borderRadius:7,border:`1.5px solid ${C.bdr}`,fontSize:13,outline:'none',fontFamily:'inherit',marginTop:4,boxSizing:'border-box'}}/>
+    </div>}
+    {item&&pqNum!=null&&diff!==0&&<div style={{marginTop:10,padding:'8px 12px',borderRadius:7,background:diff>0?C.greenSoft:C.redSoft}}>
+      <div style={{fontSize:12,fontWeight:700,color:diff>0?C.green:C.red}}>{diff>0?'Excess':'Shortfall'} of {Math.abs(diff)} pcs → {diff>0?'profit':'loss'} of {fmt(Math.abs(value))}</div>
+    </div>}
+    {item&&<div style={{marginTop:12}}>
+      <label style={{fontSize:11,color:C.sub,fontWeight:600}}>Notes (optional)</label>
+      <input value={notes} onChange={e=>setNotes(e.target.value)} placeholder="e.g. Annual stock count, Diwali count"
+        style={{width:'100%',padding:'8px 12px',borderRadius:7,border:`1.5px solid ${C.bdr}`,fontSize:13,outline:'none',fontFamily:'inherit',marginTop:4,boxSizing:'border-box'}}/>
+    </div>}
+    <div style={{display:'flex',justifyContent:'flex-end',gap:8,marginTop:10}}>
+      <Btn onClick={onClose} variant="secondary">Cancel</Btn>
+      <Btn onClick={doSave} disabled={!item||pqNum==null||diff===0} variant="primary">Log Reconciliation</Btn>
+    </div>
+  </Modal>;
+}
+
+// Read-only audit trail of every reconcileItemStock() physical count — see
+// StockReconciliationModal above. Mirrors StockAdjustmentLog's structure.
+function StockReconciliationLog(){
+  const mobile=useIsMobile();
+  const rows=[...state.stockReconciliations].sort((a,b)=>(b.createdAt||'').localeCompare(a.createdAt||''));
+  const totalValue=rows.reduce((s,r)=>s+(r.value||0),0);
+  const columns=[
+    {key:'date',label:'Date',render:r=>fmtD(r.date)},
+    {key:'item',label:'Item',render:r=><span style={{fontWeight:600,color:C.txt}}>{r.itemName||'—'}</span>},
+    {key:'book',label:'Book Qty',align:'right',render:r=><span style={{color:C.sub}}>{r.bookQty}</span>},
+    {key:'phys',label:'Physical Qty',align:'right',render:r=><span style={{color:C.sub}}>{r.physicalQty}</span>},
+    {key:'diff',label:'Diff',align:'right',render:r=><span style={{fontWeight:700,color:r.diff>0?C.green:C.red}}>{r.diff>0?'+':''}{r.diff}</span>},
+    {key:'value',label:'P&L Impact',align:'right',render:r=><span style={{fontWeight:700,color:r.value>=0?C.green:C.red}}>{r.value>=0?'+':''}{fmt(r.value)}</span>},
+    {key:'notes',label:'Notes',render:r=><span style={{color:C.sub}}>{r.notes||'—'}</span>},
+  ];
+  return <div>
+    <SectionHead title="Stock Reconciliations" sub={`${rows.length} count${rows.length===1?'':'s'} logged · net ${totalValue>=0?'profit':'loss'} ${fmt(Math.abs(totalValue))}`}/>
+    <div style={{fontSize:12,color:C.sub,marginBottom:12}}>Every physical stock count reconciled against book qty (via "Reconcile Stock" in Inventory) is logged here — a shortfall posts as a loss, an excess as a profit, both folded into Net Profit.</div>
+    <div style={{background:mobile?'transparent':C.surf,borderRadius:8,border:mobile?'none':`1px solid ${C.bdr}`,overflow:'hidden'}}>
+      <CardTable mobile={mobile} columns={columns} rows={rows} keyFn={r=>r.id} emptyLabel="No stock reconciliations yet"/>
+    </div>
+  </div>;
+}
+
 // ── PARTY MASTERS ─────────────────────────────────────────────────────────────
 function PartyMasters(){
   const mobile=useIsMobile();
@@ -5980,7 +6648,9 @@ function PartyMasters(){
   const[ledgerParty,setLedgerParty]=useState(null);
   const[mergeSrc,setMergeSrc]=useState(null);
   const{toast,TC}=useToast();
-  const filtered=parties.filter(p=>p.type===typeF&&(!routeF||p.route===routeF)&&(!search||p.name.toLowerCase().includes(search.toLowerCase())||p.city?.toLowerCase().includes(search.toLowerCase())));
+  // A 'both' party shows up under either the Customers or Suppliers chip
+  // filter (it's genuinely both), not just a literal p.type===typeF match.
+  const filtered=parties.filter(p=>(typeF==='customer'?isCustomerParty(p):typeF==='supplier'?isSupplierParty(p):p.type===typeF)&&(!routeF||p.route===routeF)&&(!search||p.name.toLowerCase().includes(search.toLowerCase())||p.city?.toLowerCase().includes(search.toLowerCase())));
   const openEdit=p=>{setForm({...p});setModal('edit');};
   const doSave=()=>{
     if(!form.name?.trim())return toast('Name required','error');
@@ -5991,13 +6661,13 @@ function PartyMasters(){
   };
   return <div>
     <TC/>
-    <SectionHead title="Party Masters" sub={`${parties.filter(p=>p.type==='customer').length} customers`} action={<Btn onClick={()=>{setForm({type:'customer',credit:30,ob:0,active:true});setModal('add');}}>+ Add Party</Btn>}/>
+    <SectionHead title="Party Masters" sub={`${parties.filter(isCustomerParty).length} customers`} action={<Btn onClick={()=>{setForm({type:'customer',credit:30,ob:0,active:true});setModal('add');}}>+ Add Party</Btn>}/>
     {ledgerParty&&<PartyLedger party={ledgerParty} onClose={()=>setLedgerParty(null)}/>}
     {mergeSrc&&<MergePartyModal source={mergeSrc} onClose={()=>setMergeSrc(null)} onMerged={()=>{setParties([...state.parties]);setMergeSrc(null);}}/>}
     {modal&&<Modal title={modal==='add'?'Add Party':'Edit Party'} onClose={()=>setModal(null)}>
       <Grid2>
         <div style={{gridColumn:'1/-1'}}><Inp label="Name" value={form.name||''} onChange={v=>setForm(f=>({...f,name:v}))} required/></div>
-        <Sel label="Type" value={form.type||'customer'} onChange={v=>setForm(f=>({...f,type:v}))} options={[{value:'customer',label:'Customer'},{value:'supplier',label:'Supplier'},{value:'transporter',label:'Transporter'}]}/>
+        <Sel label="Type" value={form.type||'customer'} onChange={v=>setForm(f=>({...f,type:v}))} options={[{value:'customer',label:'Customer'},{value:'supplier',label:'Supplier'},{value:'both',label:'Both (Customer + Supplier)'},{value:'transporter',label:'Transporter'}]}/>
         <Sel label="Route" value={form.route||''} onChange={v=>setForm(f=>({...f,route:v}))} placeholder="Select route" options={[...ROUTES,'Other']}/>
         <Inp label="City" value={form.city||''} onChange={v=>setForm(f=>({...f,city:v}))}/>
         <Inp label="Phone" value={form.phone||''} onChange={v=>setForm(f=>({...f,phone:v}))} hint="WhatsApp number"/>
@@ -6022,7 +6692,7 @@ function PartyMasters(){
     <div style={{background:mobile?'transparent':C.surf,borderRadius:8,border:mobile?'none':`1px solid ${C.bdr}`,overflow:'hidden'}}>
       <CardTable mobile={mobile} rows={filtered.slice(0,100)} keyFn={(p,i)=>p.id||i}
         columns={[
-          {key:'name',label:'Name',render:p=><span onClick={()=>setLedgerParty(p)} style={{fontWeight:600,color:C.blue,cursor:'pointer',textDecoration:'underline',textDecorationStyle:'dotted'}}>{p.name}</span>},
+          {key:'name',label:'Name',render:p=><span onClick={()=>setLedgerParty(p)} style={{fontWeight:600,color:C.blue,cursor:'pointer',textDecoration:'underline',textDecorationStyle:'dotted'}}>{p.name}{p.type==='both'&&<span style={{marginLeft:6,fontSize:10,fontWeight:700,color:C.purple,background:C.purple+'15',padding:'2px 6px',borderRadius:4,textDecoration:'none',display:'inline-block'}}>BOTH</span>}</span>},
           {key:'city',label:'City',render:p=><span style={{color:C.sub,fontSize:12}}>{p.city||'—'}</span>},
           {key:'route',label:'Route',render:p=><Badge v={p.route||'—'} color={p.route==='CG North'?'blue':p.route==='CG South'?'green':p.route==='Odisha'?'amber':'gray'}/>},
           {key:'od',label:(typeF==='supplier'||typeF==='transporter')?'Payable ₹':'OD ₹',align:'right',render:p=>{
@@ -6292,7 +6962,7 @@ function PurchaseEntry({onSaved}){
     if(step!=='item'){setTimeout(()=>{const el=document.getElementById(stepInputId);if(el)el.focus();},30);}
   },[step,draft.iName]);
 
-  const supps=useMemo(()=>state.parties.filter(p=>p.type==='supplier').sort((a,b)=>a.name.localeCompare(b.name)),[state.parties.length]);
+  const supps=useMemo(()=>state.parties.filter(isSupplierParty).sort((a,b)=>a.name.localeCompare(b.name)),[state.parties.length]);
   const sel=useMemo(()=>supps.find(p=>p.id===partyId),[supps,partyId]);
   const psugg=useMemo(()=>pq.length<1?[]:supps.filter(p=>p.name.toLowerCase().includes(pq.toLowerCase())||p.city?.toLowerCase().includes(pq.toLowerCase())).slice(0,8),[supps,pq]);
   const total=useMemo(()=>lines.reduce((s,l)=>s+(l.qty*l.rate),0),[lines]);
@@ -6656,7 +7326,7 @@ function EditPurchaseModal({purchase,onClose,onSaved}){
   const[si,setSi]=useState(0);
   const[draft,setDraft]=useState({itemId:'',iName:'',sName:'',peti:1,qty:'',rate:'',freightPerPeti:''});
   const{toast,TC}=useToast();
-  const supps=useMemo(()=>state.parties.filter(p=>p.type==='supplier'),[state.parties.length]);
+  const supps=useMemo(()=>state.parties.filter(isSupplierParty),[state.parties.length]);
   const selParty=useMemo(()=>supps.find(p=>p.id===partyId),[supps,partyId]);
   const psugg=useMemo(()=>pq.length<1?[]:supps.filter(p=>p.name.toLowerCase().includes(pq.toLowerCase())).slice(0,6),[supps,pq]);
   const transporters=useMemo(()=>state.parties.filter(p=>p.type==='transporter'),[state.parties.length]);
@@ -6833,7 +7503,7 @@ function PurchaseReturnModal({purchase,onClose,onSaved}){
   const[pq,setPq]=useState('');
   const[selInv,setSelInv]=useState(null);
   const{toast,TC}=useToast();
-  const supps=useMemo(()=>state.parties.filter(p=>p.type==='supplier'),[state.parties.length]);
+  const supps=useMemo(()=>state.parties.filter(isSupplierParty),[state.parties.length]);
   const psugg=useMemo(()=>pq.length<1?[]:supps.filter(p=>p.name.toLowerCase().includes(pq.toLowerCase())).slice(0,6),[supps,pq]);
   const partyHistory=useMemo(()=>{if(!party)return[];const hist=SUPPLIER_HISTORY[party.name]||{};return(hist.s||[]).map((s,i)=>({idx:i,date:s[0],total:s[1],items:s[2]||[]}));},[party]);
   const loadInvoice=inv=>{setSelInv(inv);setReturnLines(inv.items.map((x,i)=>({id:'RL'+i,itemId:'',itemName:Array.isArray(x)?x[0]:x,supplierName:Array.isArray(x)?x[0]:x,qty:Array.isArray(x)?x[1]:1,rate:Array.isArray(x)?x[2]:0,returnQty:Array.isArray(x)?x[1]:1,returning:true})));};
@@ -7265,10 +7935,61 @@ function CloudSyncPanel(){
 }
 
 // ── SETTINGS ──────────────────────────────────────────────────────────────────
+// Sound alert on "new Sales Order" / "new Dispatch recorded" — the actual
+// detection + Web Push send happens server-side (Supabase Edge Function
+// `notify-order-events`, triggered by a Database Webhook on kv_store); this
+// panel only handles the client half: ask the browser for permission and
+// register this device's push endpoint so the server has somewhere to send
+// to. Every signed-in device that turns this on gets the sound, including
+// the device that created the order itself (by design — see chat).
+function NotificationsPanel(){
+  const{toast,TC}=useToast();
+  const[perm,setPerm]=useState(()=>DB.getNotificationPermission());
+  const[busy,setBusy]=useState(false);
+  const supported=DB.notificationsSupported();
+  const enabled=supported && perm==='granted' && !DB.isNotificationsMuted();
+  const enable=async()=>{
+    setBusy(true);
+    try{ await DB.enableNotifications(); setPerm(DB.getNotificationPermission()); toast('Sound alerts enabled on this device ✓'); }
+    catch(e){ toast(e.message||'Could not enable notifications','error'); setPerm(DB.getNotificationPermission()); }
+    finally{ setBusy(false); }
+  };
+  const disable=()=>{
+    DB.disableNotifications(); setPerm(DB.getNotificationPermission()); toast('Sound alerts turned off on this device');
+  };
+  const test=async()=>{
+    try{ await DB.testNotification(); }
+    catch(e){ toast(e.message||'Test failed','error'); }
+  };
+  return <div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,padding:20,marginBottom:20}}>
+    <TC/>
+    <h3 style={{margin:'0 0 4px',fontSize:14,fontWeight:700,color:C.txt}}>🔔 Sound Notifications</h3>
+    <p style={{margin:'0 0 12px',fontSize:12,color:C.sub}}>Plays a sound/alert on this device when a new Sales Order is punched or an order is marked Dispatched — on any signed-in device, not just the one that did it. Works while this tab is open (foreground or background); not with the browser fully closed.</p>
+    {!supported
+      ?<div style={{fontSize:12,color:C.sub,background:'#F6F8FA',borderRadius:7,padding:'10px 12px'}}>
+        Not available on this device/browser yet. On iPhone, open this site in Safari, use Share → <strong>Add to Home Screen</strong>, then open it from the home-screen icon and try again — iOS only allows notifications for installed apps, not a regular browser tab.
+      </div>
+      :perm==='denied'
+      ?<div style={{fontSize:12,color:C.red,background:C.redSoft,borderRadius:7,padding:'10px 12px'}}>
+        Notifications are blocked for this site in your browser/phone settings. Re-enable them from your browser's site settings, then reload this page.
+      </div>
+      :enabled
+      ?<div>
+        <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:10}}>
+          <span style={{fontSize:12,fontWeight:700,color:C.green}}>✓ Enabled on this device</span>
+        </div>
+        <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+          <Btn onClick={test} size="sm" variant="secondary">Send test alert</Btn>
+          <button onClick={disable} disabled={busy} style={{fontSize:12,color:C.sub,background:'none',border:`1px solid ${C.bdr}`,cursor:'pointer',fontFamily:'inherit',padding:'6px 12px',borderRadius:6}}>Turn off on this device</button>
+        </div>
+      </div>
+      :<Btn onClick={enable} disabled={busy} size="sm">{busy?'Enabling…':'Enable sound alerts on this device'}</Btn>}
+  </div>;
+}
+
 function Settings(){
   const[tpls,setTpls]=useState({...state.templates});
   const[active,setActive]=useState('invoice');
-  const[dispatchPhone,setDispatchPhone]=useState(state.dispatchPhone||'');
   const{toast,TC}=useToast();
   const VARS={invoice:['{date}','{partyName}','{transport}','{freight}','{items}','{total}','{credit}'],payment:['{partyName}','{amount}','{invoiceDetails}'],followup:['{partyName}','{lastItem}','{lastDate}'],delivery:['{partyName}','{items}','{lr}'],dispatch:['{date}','{partyName}','{city}','{items}','{totalQty}','{transport}']};
   const LABELS={invoice:'📄 Invoice',payment:'💰 Payment reminder',followup:'🔁 Follow-up',delivery:'🚚 Delivery confirmation',dispatch:'📦 Dispatch order'};
@@ -7307,15 +8028,6 @@ function Settings(){
         <Btn onClick={doSave}>Save Templates</Btn>
       </div>
     </div>
-    <div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,padding:20,marginBottom:20}}>
-      <h3 style={{margin:'0 0 4px',fontSize:14,fontWeight:700,color:C.txt}}>Dispatch WhatsApp Number</h3>
-      <p style={{margin:'0 0 12px',fontSize:12,color:C.sub}}>Used by Sales Order's "Send to Dispatch" step — your warehouse/dispatch team's number.</p>
-      <div style={{display:'flex',gap:8}}>
-        <input value={dispatchPhone} onChange={e=>setDispatchPhone(e.target.value)} placeholder="10-digit WhatsApp number" autoComplete="off"
-          style={{flex:1,padding:'8px 12px',borderRadius:7,border:`1.5px solid ${C.bdr}`,fontSize:13,outline:'none',fontFamily:'inherit'}}/>
-        <Btn onClick={()=>{if(!dispatchPhone||dispatchPhone.length<10)return toast('Enter 10-digit number','error');state.dispatchPhone=dispatchPhone;save.dispatchPhone();toast('Saved ✓');}} size="sm">Save</Btn>
-      </div>
-    </div>
     <div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,padding:20}}>
       <h3 style={{margin:'0 0 12px',fontSize:14,fontWeight:700,color:C.txt}}>About</h3>
       <div style={{fontSize:13,color:C.sub,lineHeight:1.9}}>
@@ -7323,13 +8035,14 @@ function Settings(){
         <div>Owner: <strong style={{color:C.txt}}>Pratik Agrawal</strong></div>
         <div>Data cut-off: <strong style={{color:C.txt}}>Jul 11, 2026</strong></div>
         <div>App version: <strong style={{color:C.txt}}>{APP_VERSION}</strong></div>
-        <div>Parties: <strong style={{color:C.txt}}>{state.parties.filter(p=>p.type==='customer').length} customers</strong></div>
+        <div>Parties: <strong style={{color:C.txt}}>{state.parties.filter(isCustomerParty).length} customers</strong></div>
         <div>Items: <strong style={{color:C.txt}}>{state.items.length} products</strong></div>
       </div>
     </div>
 
     <div style={{height:16}}/>
     <CloudSyncPanel/>
+    <NotificationsPanel/>
     <BackupRestore/>
   </div>;
 }
@@ -7697,6 +8410,15 @@ function BusinessIntelligence(){
 // and a negative load is a real float-benefit result, not an error).
 function ProfitAnalysisModule(){
   const mobile=useIsMobile();
+  // Whole-business gross/net/true profit breakdown for a chosen date range
+  // (request #26) — defaults to the current calendar month. Recomputed from
+  // getProfitBreakdownInRange in store.js, which layers landed-cost gross
+  // profit → net of business expenses → true profit net of interest burden,
+  // the same three-step refinement spelled out in the request.
+  const[brFrom,setBrFrom]=useState(today().slice(0,7)+'-01');
+  const[brTo,setBrTo]=useState(today());
+  const breakdown=useMemo(()=>getProfitBreakdownInRange(brFrom,brTo),
+    [brFrom,brTo,state.sales.length,state.purchases.length,state.payments.length,state.supplierPayments.length,state.items.length,state.repairExpenses.length,state.txns.length,state.customCategories.length]);
   const sales=useMemo(()=>getSaleProfitAnalysis(),
     [state.sales.length,state.purchases.length,state.payments.length,state.supplierPayments.length,state.items.length,state.repairExpenses.length]);
   const customers=useMemo(()=>getCustomerProfitSummary(),[sales]);
@@ -7734,6 +8456,47 @@ function ProfitAnalysisModule(){
 
   return <div>
     <SectionHead title="Profit Analysis" sub="Per-sale FIFO profit, adjusted for the financing cost of payment timing"/>
+
+    <div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,padding:'16px 18px',marginBottom:16}}>
+      <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-end',flexWrap:'wrap',gap:10,marginBottom:14}}>
+        <div style={{fontSize:14,fontWeight:800,color:C.txt}}>Profit Breakdown — {fmtD(brFrom)} to {fmtD(brTo)}</div>
+        <div style={{display:'flex',gap:8,alignItems:'flex-end',flexWrap:'wrap'}}>
+          <div>
+            <label style={{fontSize:10,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,display:'block',marginBottom:3}}>From</label>
+            <input type="date" value={brFrom} onChange={e=>setBrFrom(e.target.value)} max={brTo||undefined}
+              style={{padding:'6px 8px',borderRadius:6,border:`1.5px solid ${C.bdr}`,fontSize:12,fontFamily:'inherit'}}/>
+          </div>
+          <div>
+            <label style={{fontSize:10,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,display:'block',marginBottom:3}}>To</label>
+            <input type="date" value={brTo} onChange={e=>setBrTo(e.target.value)} min={brFrom||undefined}
+              style={{padding:'6px 8px',borderRadius:6,border:`1.5px solid ${C.bdr}`,fontSize:12,fontFamily:'inherit'}}/>
+          </div>
+          <Btn onClick={()=>{setBrFrom(today().slice(0,7)+'-01');setBrTo(today());}} variant="secondary" size="sm">This Month</Btn>
+        </div>
+      </div>
+      <div style={{display:'grid',gridTemplateColumns:mobile?'1fr 1fr':'repeat(3,1fr)',gap:10,marginBottom:10}}>
+        <div style={{background:'#F9FAFB',borderRadius:7,padding:'10px 12px',border:`1px solid ${C.bdr}`}}>
+          <div style={{fontSize:9,color:C.sub,textTransform:'uppercase',letterSpacing:.4}}>Gross Profit <span style={{fontWeight:400}}>(landing cost)</span></div>
+          <div style={{fontSize:16,fontWeight:800,color:breakdown.grossProfit>=0?C.green:C.red}}>{fmtL(breakdown.grossProfit)}</div>
+          <div style={{fontSize:11,color:C.sub,marginTop:1}}>{breakdown.grossMarginPct}% of revenue</div>
+        </div>
+        <div style={{background:'#F9FAFB',borderRadius:7,padding:'10px 12px',border:`1px solid ${C.bdr}`}}>
+          <div style={{fontSize:9,color:C.sub,textTransform:'uppercase',letterSpacing:.4}}>Net Profit <span style={{fontWeight:400}}>(− business expenses)</span></div>
+          <div style={{fontSize:16,fontWeight:800,color:breakdown.netProfit>=0?C.green:C.red}}>{fmtL(breakdown.netProfit)}</div>
+          <div style={{fontSize:11,color:C.sub,marginTop:1}}>{breakdown.netMarginPct}% · − {fmtL(breakdown.businessExpenses)} expenses</div>
+        </div>
+        <div style={{background:'#F9FAFB',borderRadius:7,padding:'10px 12px',border:`1px solid ${C.bdr}`}}>
+          <div style={{fontSize:9,color:C.sub,textTransform:'uppercase',letterSpacing:.4}}>True Profit <span style={{fontWeight:400}}>(− interest burden)</span></div>
+          <div style={{fontSize:16,fontWeight:800,color:breakdown.trueProfit>=0?C.green:C.red}}>{fmtL(breakdown.trueProfit)}</div>
+          <div style={{fontSize:11,color:C.sub,marginTop:1}}>{breakdown.trueMarginPct}% · − {fmtL(breakdown.interestLoad)} interest</div>
+        </div>
+      </div>
+      <div style={{fontSize:11,color:C.sub}}>
+        Revenue {fmtL(breakdown.revenue)} over {breakdown.orderCount} sale{breakdown.orderCount===1?'':'s'}, landed cost {fmtL(breakdown.landedCost)} (purchase rate + apportioned transport/loading share).
+        Non-business spend in this range: <b style={{color:C.txt}}>{fmtL(breakdown.nonBusinessExpenses)}</b> (personal/Ghar Kharch — not netted against business profit above).
+      </div>
+    </div>
+
     <div style={{display:'grid',gridTemplateColumns:mobile?'1fr 1fr':'repeat(4,1fr)',gap:10,marginBottom:12}}>
       <StatCard label="Revenue (all sales)" value={fmtL(totals.revenue)} color={C.blue}/>
       <StatCard label="Gross Profit" value={fmtL(totals.grossProfit)} color={totals.grossProfit>=0?C.green:C.red}/>
