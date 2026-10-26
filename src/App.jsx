@@ -12,7 +12,7 @@ import * as XLSX from 'xlsx';
 import { C, fmt, fmtL, fmtD, today, uid, ROUTES, ACCOUNTS, ACC_MAP, TXN_CATEGORIES, HISTORICAL_EXPENSES, TAG_COLORS, APP_VERSION } from './constants.js';
 import { DB } from './db.js';
 import { supabase } from './supabaseClient.js';
-import { state, save, loadAll, updatePartyPhone, getBestRate, gPS, getPrevItems, parseQty, parseResponse, getAccBal, getSupplierBal, getCustomerBal, getPartyBills, getSupplierBills, getBestPurchRate, getAllCustomerMetrics, getAllVendorMetrics, getExpenseReport, setCategoryBiz, getCategorySubLedger, getAllItemRows, getItemMetrics, getAllItemMetrics, getExpectedStockMap, getFifoStockMap, getFifoSaleMarginMap, getFifoSaleCosts, getRecentModeSaleRate, getMonthlyBI, getMonthlyBIByCategory, getSalesProfitByCategory, getPnL, getBalanceSheet, getRepairExpenseTotal, splitPosNegItems, recordCityTransport, getTopTransportersForCity, getAllTransporterNames, subscribeLive, getItemCustomerName, setItemCustomerName, PARTY_INVOICES, PARTY_HISTORY, SUPPLIER_HISTORY, ACCOUNT_OB, ACCOUNT_HISTORY, applyTemplate, DEFAULT_TEMPLATES } from './store.js';
+import { state, save, loadAll, updatePartyPhone, getBestRate, gPS, getPrevItems, parseQty, parseResponse, getAccBal, getSupplierBal, getCustomerBal, getPartyBills, getSupplierBills, getBestPurchRate, getAllCustomerMetrics, getAllVendorMetrics, getExpenseReport, setCategoryBiz, getCategorySubLedger, getAllItemRows, getItemMetrics, getAllItemMetrics, getExpectedStockMap, getFifoStockMap, getFifoSaleMarginMap, getFifoSaleCosts, getFifoProfitInRange, hideFromDashboardOOS, unhideFromDashboardOOS, getReorderItems, setReorderLevel, getSaleProfitAnalysis, getCustomerProfitSummary, getRecentModeSaleRate, getMonthlyBI, getMonthlyBIByCategory, getSalesProfitByCategory, getPnL, getBalanceSheet, getRepairExpenseTotal, splitPosNegItems, recordCityTransport, getTopTransportersForCity, getAllTransporterNames, subscribeLive, getItemCustomerName, setItemCustomerName, PARTY_INVOICES, PARTY_HISTORY, SUPPLIER_HISTORY, ACCOUNT_OB, ACCOUNT_HISTORY, applyTemplate, DEFAULT_TEMPLATES } from './store.js';
 
 // ── CONVENIENT ALIASES (same pattern as monolith) ─────────────────────────────
 const _p  = () => state.parties;
@@ -184,8 +184,13 @@ function markPurchaseOrdered(id) {
   state.purchases = state.purchases.map(p => p.id===id ? { ...p, status:'ordered', expectedDate:null } : p);
   save.purchases();
 }
+// The moment this is called IS the dispatch — so the dispatch date is always
+// "now" (today()), auto-stamped, never typed in. The date the user types in
+// the "Mark Dispatched" flow is the separate, forward-looking "expected
+// (arrival)" date — previously the UI only had one date input and it got
+// conflated with/displayed as both, which is exactly the bug reported.
 function markPurchaseDispatched(id, expectedDate) {
-  state.purchases = state.purchases.map(p => p.id===id ? { ...p, status:'dispatched', expectedDate: expectedDate||p.expectedDate||'' } : p);
+  state.purchases = state.purchases.map(p => p.id===id ? { ...p, status:'dispatched', dispatchedOn: p.dispatchedOn||today(), expectedDate: expectedDate||p.expectedDate||'' } : p);
   save.purchases();
 }
 // Data-only — adjusts stock exactly like PurchLog's original local
@@ -209,7 +214,7 @@ function computeOrderLineStatus(line) {
   if (!po) return { label:'Out of Stock', color:'red' };
   const st = getPurchaseStatus(po);
   if (st === 'received') return { label:'Available', color:'green' };
-  if (st === 'dispatched') return { label:'Dispatched'+(po.expectedDate?(' · exp '+fmtD(po.expectedDate)):''), color:'amber' };
+  if (st === 'dispatched') return { label:(po.dispatchedOn?('Dispatched '+fmtD(po.dispatchedOn)):'Dispatched')+(po.expectedDate?(' · exp '+fmtD(po.expectedDate)):''), color:'amber' };
   return { label:'Ordered', color:'blue' };
 }
 
@@ -393,6 +398,7 @@ const NAV = [
   {id:'accounts',   label:'Accounts',    icon:<SvgIcon d="M3 10h18M7 15h1m4 0h1m-7 4h12a3 3 0 003-3V8a3 3 0 00-3-3H6a3 3 0 00-3 3v8a3 3 0 003 3z"/>},
   {id:'reports',    label:'Reports',     icon:<SvgIcon d="M18 20V10M12 20V4M6 20v-6"/>},
   {id:'insights',   label:'Insights',    icon:<SvgIcon d="M3 3v18h18" d2="M18 9l-5 5-3-3-5 5"/>},
+  {id:'profit',     label:'Profit Analysis', icon:<SvgIcon d="M12 1v22" d2="M17 5H9.5a3.5 3.5 0 000 7h5a3.5 3.5 0 010 7H6"/>},
   {id:'sales-log',  label:'Sales Log',   icon:<SvgIcon d="M4 6h16M4 10h16M4 14h10"/>},
   {id:'deliveries', label:'Deliveries',  icon:<SvgIcon d="M1 3h15v13H1zM16 8h4l3 3v5h-7V8z" d2="M5.5 21a2.5 2.5 0 100-5 2.5 2.5 0 000 5zM18.5 21a2.5 2.5 0 100-5 2.5 2.5 0 000 5z"/>},
   {id:'purch-log',  label:'Purchases',   icon:<SvgIcon d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" stroke={false}/>},
@@ -403,7 +409,7 @@ const NAV = [
 // Modules that expose cost/margin/profit figures or team management — hidden
 // from the nav and blocked (restricted-access message instead of content)
 // for the 'staff' role. See useRole()/computeRole() above.
-const OWNER_ONLY_NAV = new Set(['accounts','reports','insights','team']);
+const OWNER_ONLY_NAV = new Set(['accounts','reports','insights','team','profit']);
 
 // Curated 4-tab set for the mobile bottom tab bar — a deliberate subset of
 // NAV (not NAV.slice(0,5)), in a fixed order chosen for what's reached most
@@ -2169,7 +2175,7 @@ function LinkPurchaseOrderModal({itemId,itemName,onPick,onClose,onCreateNew}){
           return <div key={p.id} style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'9px 12px',borderRadius:7,border:`1px solid ${C.bdr}`}}>
             <div>
               <div style={{fontWeight:600,color:C.txt,fontSize:13}}>{p.partyName} · {fmtD(p.date)}</div>
-              <div style={{fontSize:11,color:C.sub}}>Qty {line?.qty||0} · <Badge v={st==='dispatched'?'Dispatched':st==='ordered'?'Ordered':st} color={st==='dispatched'?'amber':'blue'}/>{p.expectedDate?' · exp '+fmtD(p.expectedDate):''}</div>
+              <div style={{fontSize:11,color:C.sub}}>Qty {line?.qty||0} · <Badge v={st==='dispatched'?(p.dispatchedOn?'Dispatched '+fmtD(p.dispatchedOn):'Dispatched'):st==='ordered'?'Ordered':st} color={st==='dispatched'?'amber':'blue'}/>{p.expectedDate?' · exp '+fmtD(p.expectedDate):''}</div>
             </div>
             <Btn onClick={()=>onPick(p.id)} size="sm">Link</Btn>
           </div>;
@@ -4344,6 +4350,7 @@ function CategoryLedger({catId,onClose}) {
 
 function Dashboard({navigate}){
   const mobile=useIsMobile();
+  const role=useRole();
   const customers=state.parties.filter(p=>p.type==='customer');
   const salesByParty=state.sales.reduce((m,s)=>{m[s.partyId]=(m[s.partyId]||0)+(s.total||0);return m;},{});
   const paymentsByParty=state.payments.reduce((m,p)=>{m[p.partyId]=(m[p.partyId]||0)+(p.amount||0);return m;},{});
@@ -4353,7 +4360,10 @@ function Dashboard({navigate}){
     // Outstanding list — they're bad debt, not a "due to collect" figure.
     .filter(p=>p.od>0&&!p.notRecoverable).sort((a,b)=>b.od-a.od);
   const totalOD=odParties.reduce((s,p)=>s+p.od,0);
-  const outOfStock=state.items.filter(it=>it.active!==false&&(it.stock||0)<=0);
+  const allOutOfStock=state.items.filter(it=>it.active!==false&&(it.stock||0)<=0);
+  const hiddenSet=new Set(state.dashboardHiddenOOS||[]);
+  const outOfStock=allOutOfStock.filter(it=>!hiddenSet.has(it.id));
+  const hiddenOutOfStock=allOutOfStock.filter(it=>hiddenSet.has(it.id));
   const monthPrefix=today().slice(0,7);
   const monthSales=state.sales.filter(s=>s.date&&s.date.startsWith(monthPrefix));
   const monthAmt=monthSales.reduce((s,t)=>s+t.total,0);
@@ -4371,6 +4381,15 @@ function Dashboard({navigate}){
   const t=today();
   const[_fvD,_setFvD]=useState(0); const forceUpdate=()=>_setFvD(v=>v+1);
   const[ledgerParty,setLedgerParty]=useState(null);
+  const[showHiddenOOS,setShowHiddenOOS]=useState(false);
+  const[reorderEditorOpen,setReorderEditorOpen]=useState(false);
+  const reorderItems=useMemo(()=>getReorderItems(),[state.items.length,_fvD]);
+  // "Profit This Month" tile (request #7) — true FIFO landed-cost margin for
+  // sales dated in the current calendar month, not the flat item.purch
+  // proxy used by the plain "Sales This Month" card above.
+  const monthProfit=useMemo(()=>getFifoProfitInRange(today().slice(0,7)+'-01',today()),[state.sales.length,state.purchases.length,_fvD]);
+  const hideOOS=id=>{hideFromDashboardOOS(id);forceUpdate();};
+  const unhideOOS=id=>{unhideFromDashboardOOS(id);forceUpdate();};
   const followupsDue=state.followups.filter(f=>f.status==='open'&&f.followUpDate&&f.followUpDate<=t).sort((a,b)=>a.followUpDate.localeCompare(b.followUpDate));
   const followupsUpcoming=state.followups.filter(f=>f.status==='open'&&f.followUpDate&&f.followUpDate>t).sort((a,b)=>a.followUpDate.localeCompare(b.followUpDate)).slice(0,5);
   const markDone=id=>{state.followups=state.followups.map(f=>f.id===id?{...f,status:'done'}:f);save.followups();forceUpdate(n=>n+1);};
@@ -4439,11 +4458,12 @@ function Dashboard({navigate}){
               <div style={{fontWeight:600,color:C.txt,fontSize:12}}>{p.partyName}</div>
               <div style={{fontSize:11,color:C.sub,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{(p.items||[]).slice(0,2).map(l=>l.customerName||l.itemName).join(', ')}{(p.items||[]).length>2?' +'+(p.items.length-2):''}</div>
             </div>
-            <Badge v={st==='dispatched'?'Dispatched'+(p.expectedDate?' · exp '+fmtD(p.expectedDate):''):'Ordered'} color={st==='dispatched'?'amber':'blue'}/>
+            <Badge v={st==='dispatched'?(p.dispatchedOn?'Dispatched '+fmtD(p.dispatchedOn):'Dispatched')+(p.expectedDate?' · exp '+fmtD(p.expectedDate):''):'Ordered'} color={st==='dispatched'?'amber':'blue'}/>
           </div>
-          <div style={{display:'flex',gap:6,marginTop:6,flexWrap:'wrap'}}>
+          <div style={{display:'flex',gap:6,marginTop:6,flexWrap:'wrap',alignItems:'center'}}>
             {st==='ordered'&&(dispatchingId===p.id
               ?<>
+                <span style={{fontSize:10,color:C.sub}}>Expected arrival:</span>
                 <input type="date" value={expectedDraft} onChange={e=>setExpectedDraft(e.target.value)} style={{padding:'3px 6px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:11,fontFamily:'inherit'}}/>
                 <Btn onClick={()=>confirmDispatch(p.id)} size="sm" variant="amber">Confirm Dispatched</Btn>
                 <Btn onClick={()=>{setDispatchingId(null);setExpectedDraft('');}} size="sm" variant="ghost">Cancel</Btn>
@@ -4453,6 +4473,51 @@ function Dashboard({navigate}){
           </div>
         </div>;
       })}
+  </div>;
+
+  // Out of Stock list with per-item hide/unhide (request #4) — hiding is a
+  // soft dismissal (state.dashboardHiddenOOS), never a data change; a
+  // "Hidden (n)" toggle at the bottom reveals the hidden ones again with an
+  // Unhide action, so nothing is ever permanently lost from view.
+  const outOfStockBlock=<div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,overflow:'hidden'}}>
+    <div style={{padding:'12px 16px',borderBottom:`1px solid ${C.bdr}`,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+      <h3 style={{margin:0,fontSize:14,fontWeight:700,color:C.txt}}>🚫 Out of Stock · {outOfStock.length}</h3>
+      <button onClick={()=>navigate('items')} style={{background:'none',border:'none',cursor:'pointer',fontSize:12,color:C.blue,fontWeight:600}}>All →</button>
+    </div>
+    {outOfStock.length===0
+      ?<div style={{padding:'20px',textAlign:'center',color:C.muted,fontSize:13}}>All items stocked ✓</div>
+      :outOfStock.slice(0,8).map(it=>
+        <div key={it.id} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'8px 16px',borderBottom:`1px solid ${C.bdr}`,gap:10}}>
+          <div style={{minWidth:0,fontSize:12,fontWeight:600,color:C.txt,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{it.dispatchName||it.internal||it.name}</div>
+          <IconBtn onClick={()=>hideOOS(it.id)} title="Hide from this list">🙈</IconBtn>
+        </div>)}
+    {hiddenOutOfStock.length>0&&<div style={{borderTop:`1px solid ${C.bdr}`}}>
+      <button onClick={()=>setShowHiddenOOS(v=>!v)} style={{width:'100%',textAlign:'left',padding:'8px 16px',background:'none',border:'none',cursor:'pointer',fontSize:11,color:C.sub,fontWeight:600,fontFamily:'inherit'}}>
+        {showHiddenOOS?'▾':'▸'} Hidden ({hiddenOutOfStock.length})
+      </button>
+      {showHiddenOOS&&hiddenOutOfStock.map(it=>
+        <div key={it.id} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'8px 16px',borderTop:`1px solid ${C.bdr}`,gap:10}}>
+          <div style={{minWidth:0,fontSize:12,color:C.muted,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{it.dispatchName||it.internal||it.name}</div>
+          <IconBtn onClick={()=>unhideOOS(it.id)} title="Unhide">👁️</IconBtn>
+        </div>)}
+    </div>}
+  </div>;
+
+  // Reorder list (requests #5/#6 — one feature: a list of items at/below
+  // their set reorder level, plus a bulk editor to set levels for all
+  // items). getReorderItems() (store.js) reads item.reorderLevel.
+  const reorderBlock=<div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,overflow:'hidden'}}>
+    <div style={{padding:'12px 16px',borderBottom:`1px solid ${C.bdr}`,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+      <h3 style={{margin:0,fontSize:14,fontWeight:700,color:C.txt}}>🔁 Reorder List · {reorderItems.length}</h3>
+      <button onClick={()=>setReorderEditorOpen(true)} style={{background:'none',border:'none',cursor:'pointer',fontSize:12,color:C.blue,fontWeight:600}}>Set levels →</button>
+    </div>
+    {reorderItems.length===0
+      ?<div style={{padding:'20px',textAlign:'center',color:C.muted,fontSize:13}}>{state.items.some(it=>it.reorderLevel>0)?'Nothing below its reorder level ✓':'No reorder levels set yet'}</div>
+      :reorderItems.slice(0,8).map(it=>
+        <div key={it.id} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'8px 16px',borderBottom:`1px solid ${C.bdr}`,gap:10}}>
+          <div style={{minWidth:0,fontSize:12,fontWeight:600,color:C.txt,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{it.dispatchName||it.internal||it.name}</div>
+          <Badge v={(it.stock||0)+' / '+it.reorderLevel} color={(it.stock||0)<=0?'red':'amber'}/>
+        </div>)}
   </div>;
 
   const followupsBlock=<div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,overflow:'hidden'}}>
@@ -4496,26 +4561,40 @@ function Dashboard({navigate}){
         <span style={{fontWeight:700,color:C.red,fontVariantNumeric:'tabular-nums',fontSize:13}}>{fmt(p.od)}</span>
       </div>)}
   </div>;
-  const quickActionsBlock=<div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,padding:'14px 16px'}}>
-    <h3 style={{margin:'0 0 10px',fontSize:14,fontWeight:700,color:C.txt}}>Quick Actions</h3>
-    <div style={{display:'grid',gridTemplateColumns:mobile?'repeat(4,1fr)':'1fr 1fr',gap:8}}>
-      {[{l:'New Sale',i:'🧾',m:'sale',c:C.blue},{l:'New Sale Order',i:'📲',m:'orders',c:C.amber},{l:'Outstanding',i:'⏰',m:'outstanding',c:C.red},{l:'Parties',i:'🏪',m:'parties',c:C.green},{l:'Inventory',i:'📦',m:'items',c:C.purple}].map(a=>(
-        mobile
-          ?<button key={a.m} onClick={()=>navigate(a.m)} style={{display:'flex',flexDirection:'column',alignItems:'center',gap:4,padding:'10px 4px',borderRadius:7,border:`1px solid ${a.c}20`,background:a.c+'08',cursor:'pointer',fontSize:10,fontWeight:600,color:a.c,fontFamily:'inherit'}}>
+  // Previously its own full-width "Quick Actions" card below the stat row;
+  // moved to sit top-right of the greeting header on desktop (mirroring the
+  // existing "+ New Sale" top-bar button's position) — a compact single row
+  // of pill buttons rather than a bordered card with a title. Still renders
+  // as the original card grid on mobile, where there's no header real-estate
+  // to dock onto.
+  const quickActions=[{l:'New Sale',i:'🧾',m:'sale',c:C.blue},{l:'New Sale Order',i:'📲',m:'orders',c:C.amber},{l:'Outstanding',i:'⏰',m:'outstanding',c:C.red},{l:'Parties',i:'🏪',m:'parties',c:C.green},{l:'Inventory',i:'📦',m:'items',c:C.purple}];
+  const quickActionsBlock=mobile
+    ?<div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,padding:'14px 16px'}}>
+      <h3 style={{margin:'0 0 10px',fontSize:14,fontWeight:700,color:C.txt}}>Quick Actions</h3>
+      <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:8}}>
+        {quickActions.map(a=>(
+          <button key={a.m} onClick={()=>navigate(a.m)} style={{display:'flex',flexDirection:'column',alignItems:'center',gap:4,padding:'10px 4px',borderRadius:7,border:`1px solid ${a.c}20`,background:a.c+'08',cursor:'pointer',fontSize:10,fontWeight:600,color:a.c,fontFamily:'inherit'}}>
             <span style={{fontSize:19}}>{a.i}</span>{a.l}
           </button>
-          :<button key={a.m} onClick={()=>navigate(a.m)} style={{display:'flex',alignItems:'center',gap:8,padding:'9px 12px',borderRadius:7,border:`1px solid ${a.c}20`,background:a.c+'08',cursor:'pointer',fontSize:12,fontWeight:600,color:a.c,fontFamily:'inherit'}}>
-            <span style={{fontSize:17}}>{a.i}</span>{a.l}
-          </button>
-      ))}
+        ))}
+      </div>
     </div>
-  </div>;
+    :<div style={{display:'flex',gap:6,flexWrap:'wrap',justifyContent:'flex-end'}}>
+      {quickActions.map(a=>(
+        <button key={a.m} onClick={()=>navigate(a.m)} title={a.l} style={{display:'flex',alignItems:'center',gap:6,padding:'6px 12px',borderRadius:7,border:'none',background:a.c,color:'#fff',cursor:'pointer',fontSize:12,fontWeight:700,fontFamily:'inherit',whiteSpace:'nowrap'}}>
+          <span style={{fontSize:14}}>{a.i}</span>{a.l}
+        </button>
+      ))}
+    </div>;
 
   return <div>
     {ledgerParty&&<PartyLedger party={ledgerParty} onClose={()=>setLedgerParty(null)}/>}
-    <div style={{marginBottom:18}}>
-      <h1 style={{margin:0,fontSize:mobile?19:22,fontWeight:800,color:C.txt,letterSpacing:-.5}}>{new Date().getHours()<12?'Good morning':'Good afternoon'}, Pratik 👋</h1>
-      <p style={{margin:'3px 0 0',fontSize:13,color:C.sub}}>{new Date().toLocaleDateString('en-IN',{weekday:'long',day:'numeric',month:'long'})}</p>
+    <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',gap:12,marginBottom:18,flexWrap:'wrap'}}>
+      <div>
+        <h1 style={{margin:0,fontSize:mobile?19:22,fontWeight:800,color:C.txt,letterSpacing:-.5}}>{new Date().getHours()<12?'Good morning':'Good afternoon'}, Pratik 👋</h1>
+        <p style={{margin:'3px 0 0',fontSize:13,color:C.sub}}>{new Date().toLocaleDateString('en-IN',{weekday:'long',day:'numeric',month:'long'})}</p>
+      </div>
+      {!mobile&&quickActionsBlock}
     </div>
     <div style={{display:'grid',gridTemplateColumns:mobile?'repeat(2,1fr)':'repeat(auto-fit,minmax(175px,1fr))',gap:mobile?10:12,marginBottom:18}}>
       <StatCard label="Total Outstanding" value={fmtL(totalOD)} sub={`${odParties.length} parties`} color={C.red} icon="⏰" onClick={()=>navigate('outstanding')}/>
@@ -4526,7 +4605,9 @@ function Dashboard({navigate}){
       <StatCard label="Follow-ups Due" value={String(followupsDue.length||0)} sub={followupsDue.length?'Action needed':'All clear'} color={followupsDue.length>0?C.amber:C.green} icon="📋" onClick={()=>navigate('outstanding')}/>
       <StatCard label="Parties" value={String(customers.length)} sub={`${state.parties.filter(p=>p.type==='supplier').length} suppliers`} color={C.blue} icon="🏪" onClick={()=>navigate('parties')}/>
       <StatCard label="Out of Stock" value={String(outOfStock.length)} sub={outOfStock.length?'Items need reorder':'All stocked'} color={outOfStock.length>0?C.red:C.green} icon="📦" onClick={()=>navigate('items')}/>
+      {role==='owner'&&<StatCard label="Profit This Month" value={fmtL(monthProfit.profit)} sub={monthProfit.qty?`${monthProfit.qty} pcs · FIFO landed cost`:'No sales yet'} color={monthProfit.profit>=0?C.green:C.red} icon="💰"/>}
     </div>
+    {reorderEditorOpen&&<ReorderLevelEditorModal onClose={()=>{setReorderEditorOpen(false);forceUpdate();}}/>}
     {mobile
       ?<div style={{display:'flex',flexDirection:'column',gap:12}}>
         {quickActionsBlock}
@@ -4534,19 +4615,61 @@ function Dashboard({navigate}){
         {topOutstandingBlock}
         {pendingOrdersBlock}
         {pendingPurchasesBlock}
+        {outOfStockBlock}
+        {reorderBlock}
       </div>
       :<div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:14,alignItems:'start'}}>
         <div style={{display:'flex',flexDirection:'column',gap:12}}>
           {followupsBlock}
-          {pendingOrdersBlock}
+          {topOutstandingBlock}
+          {outOfStockBlock}
         </div>
         <div style={{display:'flex',flexDirection:'column',gap:12}}>
-          {topOutstandingBlock}
-          {quickActionsBlock}
+          {pendingOrdersBlock}
           {pendingPurchasesBlock}
+          {reorderBlock}
         </div>
       </div>}
   </div>;
+}
+
+// Bulk editor for request #5/#6 — "give option to set reorder levels for
+// all items" — one screen listing every active item with an editable
+// reorder-level number input, following the same inline-edit/blur-to-save
+// pattern as ItemNamingEditor above (no separate save button per row).
+function ReorderLevelEditorModal({onClose}){
+  const[search,setSearch]=useState('');
+  const[items,setItems]=useState(()=>state.items.filter(it=>it.active!==false).sort((a,b)=>(a.cat||'').localeCompare(b.cat||'')||(a.internal||a.name||'').localeCompare(b.internal||b.name||'')));
+  const filtered=items.filter(it=>!search||(it.internal||it.customer||it.name||'').toLowerCase().includes(search.toLowerCase()));
+  const update=(id,val)=>{
+    setItems(list=>list.map(it=>it.id===id?{...it,reorderLevel:val}:it));
+    setReorderLevel(id,val);
+  };
+  return <Modal title="Reorder Levels" onClose={onClose} width={640}>
+    <p style={{margin:'0 0 12px',fontSize:12,color:C.sub}}>Set a reorder level (pcs) per item — items at or below this level show up in the Dashboard's Reorder list. Leave at 0 to exclude an item.</p>
+    <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search items…"
+      style={{width:'100%',marginBottom:12,padding:'8px 12px',borderRadius:7,border:`1.5px solid ${C.bdr}`,fontSize:13,outline:'none',fontFamily:'inherit'}}/>
+    <div style={{maxHeight:420,overflow:'auto',border:`1px solid ${C.bdr}`,borderRadius:8}}>
+      <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}>
+        <thead><tr style={{background:'#F6F8FA',position:'sticky',top:0}}>
+          <th style={{padding:'8px 12px',textAlign:'left',fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase'}}>Item</th>
+          <th style={{padding:'8px 12px',textAlign:'right',fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase'}}>Stock</th>
+          <th style={{padding:'8px 12px',textAlign:'right',fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase'}}>Reorder Level</th>
+        </tr></thead>
+        <tbody>
+          {filtered.length===0&&<tr><td colSpan={3} style={{padding:30,textAlign:'center',color:C.muted}}>No items match</td></tr>}
+          {filtered.map(it=><tr key={it.id} style={{borderBottom:`1px solid ${C.bdr}`}}>
+            <td style={{padding:'6px 12px',fontWeight:600,color:C.txt}}>{it.internal||it.name}</td>
+            <td style={{padding:'6px 12px',textAlign:'right',color:C.sub}}>{it.stock||0}</td>
+            <td style={{padding:'4px 6px',textAlign:'right'}}>
+              <input type="number" min={0} value={it.reorderLevel||0} onChange={e=>update(it.id,Math.max(0,Number(e.target.value)||0))}
+                style={{width:80,padding:'5px 8px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:12.5,textAlign:'right',outline:'none',fontFamily:'inherit'}}/>
+            </td>
+          </tr>)}
+        </tbody>
+      </table>
+    </div>
+  </Modal>;
 }
 
 // ── ITEM MASTERS ──────────────────────────────────────────────────────────────
@@ -4907,7 +5030,8 @@ function ItemNamingEditor(){
   const[items,setItems]=useState(()=>[...state.items].sort((a,b)=>(a.cat||'').localeCompare(b.cat||'')||(a.internal||a.name||'').localeCompare(b.internal||b.name||'')));
   const[search,setSearch]=useState('');
   const{toast,TC}=useToast();
-  const filtered=items.filter(it=>!search||[it.internal,it.customer,it.supplier,it.dispatchName].some(v=>(v||'').toLowerCase().includes(search.toLowerCase())));
+  const active=items.filter(it=>it.active!==false);
+  const filtered=active.filter(it=>!search||[it.internal,it.customer,it.supplier,it.dispatchName].some(v=>(v||'').toLowerCase().includes(search.toLowerCase())));
   const update=(id,field,val)=>setItems(list=>list.map(it=>it.id===id?{...it,[field]:val}:it));
   const commit=(id,field)=>{
     const it=items.find(x=>x.id===id);
@@ -4916,7 +5040,7 @@ function ItemNamingEditor(){
   };
   return <div>
     <TC/>
-    <SectionHead title="Naming Conventions" sub={`${filtered.length} items · edit any name, click away to save`}/>
+    <SectionHead title="Naming Conventions" sub={`${filtered.length} active items · edit any name, click away to save`}/>
     <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search items…"
       style={{width:'100%',marginBottom:14,padding:'8px 12px',borderRadius:7,border:`1.5px solid ${C.bdr}`,fontSize:13,outline:'none',fontFamily:'inherit'}}
       onFocus={e=>e.target.style.borderColor=C.blue} onBlur={e=>e.target.style.borderColor=C.bdr}/>
@@ -5232,10 +5356,10 @@ function MobileInventoryList({items,catF,saleOf,purchOf,marginOf,expectedMap,onO
               {damaged>0&&<Row label="Damaged" value={<Badge v={damaged+' pcs'} color="amber"/>}/>}
               {expected>0&&<Row label="Expected" value={<span style={{color:C.amber,fontWeight:700}}>+{expected}</span>}/>}
               <div style={{display:'flex',gap:6,justifyContent:'flex-end',flexWrap:'wrap',marginTop:4}}>
-                <Btn onClick={()=>onShare(it)} variant="ghost" size="sm">Share</Btn>
-                <Btn onClick={()=>onMove(it)} variant="ghost" size="sm">Move</Btn>
-                <Btn onClick={()=>onMerge(it)} variant="ghost" size="sm">Merge</Btn>
-                <Btn onClick={()=>onEdit(it)} variant="ghost" size="sm">Edit</Btn>
+                <IconBtn onClick={()=>onShare(it)} title="Share">📤</IconBtn>
+                <IconBtn onClick={()=>onMove(it)} title="Move stock">🔀</IconBtn>
+                <IconBtn onClick={()=>onMerge(it)} title="Merge">🔗</IconBtn>
+                <IconBtn onClick={()=>onEdit(it)} title="Edit">✏️</IconBtn>
               </div>
             </div>
           </td></tr>}
@@ -5554,10 +5678,10 @@ function ItemMasters(){
           }},
           {key:'actions',label:'',cardLabel:'Actions',render:it=>
             <div style={{display:'flex',gap:6,justifyContent:'flex-end',flexWrap:'wrap'}}>
-              <Btn onClick={()=>setShareItem(it)} variant="ghost" size="sm">Share</Btn>
-              <Btn onClick={()=>setMoveSrc(it)} variant="ghost" size="sm">Move</Btn>
-              <Btn onClick={()=>setMergeSrc(it)} variant="ghost" size="sm">Merge</Btn>
-              <Btn onClick={()=>openEdit(it)} variant="ghost" size="sm">Edit</Btn>
+              <IconBtn onClick={()=>setShareItem(it)} title="Share">📤</IconBtn>
+              <IconBtn onClick={()=>setMoveSrc(it)} title="Move stock">🔀</IconBtn>
+              <IconBtn onClick={()=>setMergeSrc(it)} title="Merge">🔗</IconBtn>
+              <IconBtn onClick={()=>openEdit(it)} title="Edit">✏️</IconBtn>
             </div>},
         ].filter(c=>role==='owner'||!['purch','margin','marginPerPc'].includes(c.key))}/>}
     </div>
@@ -7554,6 +7678,96 @@ function BusinessIntelligence(){
   </div>;
 }
 
+// ── PROFIT ANALYSIS (per-sale FIFO profit + interest-load, owner-only) ──────────
+// Backed entirely by getSaleProfitAnalysis()/getCustomerProfitSummary() in
+// store.js — see the comment above getSaleProfitAnalysis for the exact
+// interest-load model (1%/month on traceable FIFO cost, over the gap between
+// the supplier's weighted paid-date and the customer's weighted received-date;
+// unpaid remainders are folded into "today" so the figure is a live number,
+// and a negative load is a real float-benefit result, not an error).
+function ProfitAnalysisModule(){
+  const mobile=useIsMobile();
+  const sales=useMemo(()=>getSaleProfitAnalysis(),
+    [state.sales.length,state.purchases.length,state.payments.length,state.supplierPayments.length,state.items.length,state.repairExpenses.length]);
+  const customers=useMemo(()=>getCustomerProfitSummary(),[sales]);
+  const[search,setSearch]=useState('');
+  const filtered=useMemo(()=>!search?sales:sales.filter(s=>(s.partyName||'').toLowerCase().includes(search.toLowerCase())),[sales,search]);
+  const totals=useMemo(()=>sales.reduce((s,r)=>({
+    revenue:s.revenue+r.revenue, grossProfit:s.grossProfit+r.grossProfit,
+    interestLoad:s.interestLoad+r.interestLoad, netProfit:s.netProfit+r.netProfit,
+  }),{revenue:0,grossProfit:0,interestLoad:0,netProfit:0}),[sales]);
+  const bestCustomers=useMemo(()=>customers.filter(c=>c.orderCount>0).slice(0,8)
+    .map(c=>({label:c.partyName,value:c.netMarginPct})),[customers]);
+  const worstCustomers=useMemo(()=>[...customers].filter(c=>c.orderCount>0).reverse().slice(0,8)
+    .map(c=>({label:c.partyName,value:c.netMarginPct})),[customers]);
+
+  const saleCols=[
+    {key:'date',label:'Date',render:r=>fmtD(r.date)},
+    {key:'partyName',label:'Party'},
+    {key:'qty',label:'Qty',align:'right',render:r=>r.qty+' pcs',hideOnMobile:true},
+    {key:'revenue',label:'Revenue',align:'right',render:r=>fmt(r.revenue)},
+    {key:'grossProfit',label:'Gross Profit',align:'right',render:r=><span style={{color:r.grossProfit>=0?C.green:C.red}}>{fmt(r.grossProfit)}</span>,hideOnMobile:true},
+    {key:'grossMarginPct',label:'Gross %',align:'right',render:r=><Badge v={r.grossMarginPct+'%'} color={r.grossMarginPct>25?'green':r.grossMarginPct>10?'amber':'red'}/>,hideOnMobile:true},
+    {key:'interestLoad',label:'Interest Load',align:'right',render:r=><span style={{color:r.interestLoad>0?C.red:r.interestLoad<0?C.green:C.sub}}>{r.interestLoad===0?'—':fmt(r.interestLoad)}</span>},
+    {key:'netProfit',label:'Net Profit',align:'right',render:r=><b style={{color:r.netProfit>=0?C.green:C.red}}>{fmt(r.netProfit)}</b>},
+    {key:'netMarginPct',label:'Net %',align:'right',render:r=><Badge v={r.netMarginPct+'%'} color={r.netMarginPct>25?'green':r.netMarginPct>10?'amber':'red'}/>},
+  ];
+
+  const custCols=[
+    {key:'partyName',label:'Customer'},
+    {key:'orderCount',label:'Sales',align:'right',render:c=>c.orderCount},
+    {key:'revenue',label:'Revenue',align:'right',render:c=>fmt(c.revenue),hideOnMobile:true},
+    {key:'grossMarginPct',label:'Gross %',align:'right',render:c=>c.grossMarginPct+'%',hideOnMobile:true},
+    {key:'interestLoad',label:'Interest Load',align:'right',render:c=><span style={{color:c.interestLoad>0?C.red:c.interestLoad<0?C.green:C.sub}}>{c.interestLoad===0?'—':fmt(c.interestLoad)}</span>},
+    {key:'netMarginPct',label:'Net Margin',align:'right',render:c=><Badge v={c.netMarginPct+'%'} color={c.netMarginPct>25?'green':c.netMarginPct>10?'amber':'red'}/>},
+  ];
+
+  return <div>
+    <SectionHead title="Profit Analysis" sub="Per-sale FIFO profit, adjusted for the financing cost of payment timing"/>
+    <div style={{display:'grid',gridTemplateColumns:mobile?'1fr 1fr':'repeat(4,1fr)',gap:10,marginBottom:12}}>
+      <StatCard label="Revenue (all sales)" value={fmtL(totals.revenue)} color={C.blue}/>
+      <StatCard label="Gross Profit" value={fmtL(totals.grossProfit)} color={totals.grossProfit>=0?C.green:C.red}/>
+      <StatCard label="Total Interest Load" value={fmtL(totals.interestLoad)} sub={totals.interestLoad<0?'Net float benefit':'Financing cost'} color={totals.interestLoad>0?C.red:C.green}/>
+      <StatCard label="Net Profit" value={fmtL(totals.netProfit)} color={totals.netProfit>=0?C.green:C.red}/>
+    </div>
+    <div style={{fontSize:11,color:C.sub,marginBottom:16}}>
+      Interest load = 1% per month × the FIFO cost actually traceable to a logged purchase, over the gap between that
+      purchase's own weighted paid-date and this sale's weighted received-date (both FIFO-matched against payments the
+      same way the Business Intelligence category split is). Unpaid balances — on either side — are valued as if settled
+      today, so the figure updates live as bills age. A negative load means the customer paid before the supplier had to
+      be paid — this deal financed itself. Cost from stock with no traceable purchase (opening balance, or a return put
+      back at current cost) is excluded from the interest calc but still counted in gross profit.
+    </div>
+
+    <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:16,marginBottom:20}}>
+      <div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,padding:'18px 20px'}}>
+        <div style={{fontSize:14,fontWeight:700,color:C.txt,marginBottom:2}}>Best Net Margin Customers</div>
+        <div style={{fontSize:11,color:C.sub,marginBottom:12}}>By net margin %, after interest load</div>
+        <HBarChart rows={bestCustomers} color={C.green} valueFmt={v=>v+'%'}/>
+      </div>
+      <div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,padding:'18px 20px'}}>
+        <div style={{fontSize:14,fontWeight:700,color:C.txt,marginBottom:2}}>Worst Net Margin Customers</div>
+        <div style={{fontSize:11,color:C.sub,marginBottom:12}}>Where interest load (slow payment) is hurting margin most</div>
+        <HBarChart rows={worstCustomers} color={C.red} valueFmt={v=>v+'%'}/>
+      </div>
+    </div>
+
+    <div style={{fontSize:16,fontWeight:800,color:C.txt,marginBottom:10}}>Profit per Customer</div>
+    <div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,overflow:'hidden',marginBottom:24}}>
+      <CardTable columns={custCols} rows={customers} mobile={mobile} keyFn={c=>c.partyId} emptyLabel="No sales yet"/>
+    </div>
+
+    <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:10,flexWrap:'wrap',gap:8}}>
+      <div style={{fontSize:16,fontWeight:800,color:C.txt}}>Profit per Sale</div>
+      <div style={{width:200}}><Inp placeholder="Search customer…" value={search} onChange={setSearch}/></div>
+    </div>
+    <div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,overflow:'hidden'}}>
+      <CardTable columns={saleCols} rows={filtered.slice(0,200)} mobile={mobile} keyFn={r=>r.saleId} emptyLabel="No sales yet"/>
+    </div>
+    {filtered.length>200&&<div style={{fontSize:11,color:C.sub,marginTop:8,textAlign:'center'}}>Showing most recent 200 of {filtered.length} sales — narrow with search to see older ones.</div>}
+  </div>;
+}
+
 // ── LOGIN (cloud sync gate) ─────────────────────────────────────────────────────
 // Only rendered when a Supabase project is configured for this build AND no
 // session is cached yet — a dev checkout with no VITE_SUPABASE_* env vars
@@ -7697,6 +7911,7 @@ function App(){
       case'accounts':   return role==='owner'?<AccountsModule/>:<RestrictedAccess/>;
       case'reports':    return role==='owner'?<ReportsModule/>:<RestrictedAccess/>;
       case'insights':   return role==='owner'?<BusinessIntelligence/>:<RestrictedAccess/>;
+      case'profit':     return role==='owner'?<ProfitAnalysisModule/>:<RestrictedAccess/>;
       case'team':       return role==='owner'?<TeamModule/>:<RestrictedAccess/>;
       case'sales-log':  return <SalesLog/>;
       case'deliveries': return <DeliveriesModule/>;

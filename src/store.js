@@ -302,6 +302,212 @@ export function getAllVendorMetrics() {
   });
 }
 
+// ── Profit Analysis: per-sale FIFO profit + interest-load (1%/month) ───────
+// Reuses the exact FIFO bill-vs-payment-event matching getAllCustomerMetrics/
+// getAllVendorMetrics already do (weightedDaysSum/matchedAmt there) — but
+// per-BILL (not aggregated per party) and folding any still-unpaid remainder
+// into "settled as of today" rather than leaving it unmatched. That fold is
+// a deliberate modelling choice, not an oversight: if a bill is still open,
+// the capital (or the credit) is still live right now, so the interest
+// clock for it is still running — using today() here is what makes the
+// resulting number a live, moving figure rather than a frozen one that
+// ignores open bills entirely. Returns a Map keyed by the bill's own id
+// (purchase id for the supplier side, sale id for the customer side) to a
+// weighted-average settlement date, in epoch ms.
+const msOf = dateStr => new Date((dateStr || today()) + 'T00:00:00').getTime();
+
+export function getPurchasePaidDateMap() {
+  const out = new Map();
+  const todayMs = msOf(today());
+  for (const p of state.parties.filter(p => p.type === 'supplier')) {
+    const hist = SUPPLIER_HISTORY[p.name] || {};
+    const histBills = (hist.s || []).map(([d, total]) => ({ id: null, date: d, total }));
+    const newBills = state.purchases.filter(pu => pu.partyId === p.id && pu.type !== 'return')
+      .map(pu => ({ id: pu.id, date: pu.date, total: pu.total + (pu.extraChargesTotal || 0) }));
+    const payEvents = [
+      ...(hist.p || []).map(([d, amt]) => ({ date: d, amt })),
+      ...state.supplierPayments.filter(sp => sp.partyId === p.id).map(sp => ({ date: sp.date, amt: sp.amount })),
+    ].sort((a, b) => a.date.localeCompare(b.date));
+    const billQueue = [...histBills, ...newBills].sort((a, b) => a.date.localeCompare(b.date))
+      .map(b => ({ ...b, rem: b.total, weightedSum: 0, matched: 0 }));
+    let bi = 0;
+    for (const pay of payEvents) {
+      let remaining = pay.amt;
+      while (remaining > 0.01 && bi < billQueue.length) {
+        const bill = billQueue[bi];
+        if (bill.rem <= 0.01) { bi++; continue; }
+        const applied = Math.min(remaining, bill.rem);
+        bill.weightedSum += msOf(pay.date) * applied; bill.matched += applied;
+        bill.rem -= applied; remaining -= applied;
+        if (bill.rem <= 0.01) bi++;
+      }
+    }
+    for (const bill of billQueue) {
+      if (!bill.id) continue; // only ERP purchases are traceable back to a sale's FIFO cost layer
+      if (bill.rem > 0.01) { bill.weightedSum += todayMs * bill.rem; bill.matched += bill.rem; }
+      out.set(bill.id, bill.matched > 0 ? bill.weightedSum / bill.matched : todayMs);
+    }
+  }
+  return out;
+}
+
+export function getSaleReceivedDateMap() {
+  const out = new Map();
+  const todayMs = msOf(today());
+  for (const p of state.parties.filter(p => p.type === 'customer')) {
+    const hist = PARTY_HISTORY[p.name] || {};
+    const histBills = (hist.s || []).map(([d, total]) => ({ id: null, date: d, total }));
+    const newBills = state.sales.filter(s => s.partyId === p.id && s.type !== 'return').map(s => ({ id: s.id, date: s.date, total: s.total }));
+    const payEvents = [
+      ...(hist.p || []).map(([d, amt]) => ({ date: d, amt })),
+      ...state.payments.filter(pm => pm.partyId === p.id).map(pm => ({ date: pm.date, amt: pm.amount })),
+      // Sales returns are a same-day credit against the oldest open bill —
+      // same treatment getPartyBills gives them — fed into the same FIFO
+      // match as if they were a payment dated on the return itself.
+      ...state.sales.filter(s => s.partyId === p.id && s.type === 'return').map(s => ({ date: s.date, amt: Math.abs(s.total) })),
+    ].sort((a, b) => a.date.localeCompare(b.date));
+    const billQueue = [...histBills, ...newBills].sort((a, b) => a.date.localeCompare(b.date))
+      .map(b => ({ ...b, rem: b.total, weightedSum: 0, matched: 0 }));
+    let bi = 0;
+    for (const pay of payEvents) {
+      let remaining = pay.amt;
+      while (remaining > 0.01 && bi < billQueue.length) {
+        const bill = billQueue[bi];
+        if (bill.rem <= 0.01) { bi++; continue; }
+        const applied = Math.min(remaining, bill.rem);
+        bill.weightedSum += msOf(pay.date) * applied; bill.matched += applied;
+        bill.rem -= applied; remaining -= applied;
+        if (bill.rem <= 0.01) bi++;
+      }
+    }
+    for (const bill of billQueue) {
+      if (!bill.id) continue; // only ERP sales get a per-sale profit row
+      if (bill.rem > 0.01) { bill.weightedSum += todayMs * bill.rem; bill.matched += bill.rem; }
+      out.set(bill.id, bill.matched > 0 ? bill.weightedSum / bill.matched : todayMs);
+    }
+  }
+  return out;
+}
+
+// Per-sale FIFO profit — same layer replay as getFifoSaleMarginMap, but (a)
+// kept per-sale rather than aggregated per-item, (b) tags every layer with
+// the purchase id/date that supplied it, and (c) looks up that purchase's
+// paid-date and the sale's own received-date (both from the two functions
+// above) to compute a 1%/month interest load: the financing cost of the gap
+// between when cash left for the stock and when cash came back in for
+// selling it. A negative interest load is a real, meaningful result — it
+// means the customer's payment arrived before the supplier had to be paid,
+// i.e. this particular deal funded itself and actually earned a float
+// benefit rather than costing one.
+//
+// Cost drawn from stock whose origin isn't a logged in-app purchase (the
+// opening-stock/baseline reconciliation layer, or a sales-return put back
+// at current cost) has no purchase to date-match against, so it's excluded
+// from the interest-bearing base (`traceableCost`) — `cost`/`grossProfit`
+// still include it, only the interest calc does not. This is called out in
+// the UI rather than silently assumed.
+export function getSaleProfitAnalysis() {
+  const eventsById = {};
+  const add = (id, date, seq, type, netQty, rate, meta) => {
+    if (!id) return;
+    (eventsById[id] ||= []).push({ date, seq: seq || '', type, netQty, rate, meta });
+  };
+  for (const p of state.purchases) for (const l of (p.items || [])) add(l.itemId, p.date, p.createdAt, 'purch', l.qty || 0, l.rate || 0, { purchaseId: p.id });
+  for (const s of state.sales) for (const x of (s.items || [])) add(x.itemId, s.date, s.createdAt, 'sale', -(x.qty || 0), x.rate, { saleId: s.id });
+  for (const r of state.repairExpenses) add(r.itemId, r.date, r.createdAt, 'repair', -(r.qty || 0), null, {});
+
+  const bySale = new Map(); // saleId -> { qty, revenue, cost, segs:[{purchaseId,amt}] }
+  for (const it of state.items) {
+    const events = (eventsById[it.id] || []).slice().sort((a, b) => a.date.localeCompare(b.date) || a.seq.localeCompare(b.seq));
+    const netFromEvents = events.reduce((s, e) => s + e.netQty, 0);
+    const plug = (it.stock || 0) - netFromEvents;
+    const layers = [];
+    if (plug > 1e-9) layers.push({ qty: plug, rate: it.purch || 0, purchaseId: null });
+    const withdrawDetailed = qty => {
+      let need = qty; const segs = [];
+      while (need > 1e-9 && layers.length) {
+        const l = layers[0]; const take = Math.min(l.qty, need);
+        segs.push({ qty: take, rate: l.rate, purchaseId: l.purchaseId });
+        l.qty -= take; need -= take;
+        if (l.qty <= 1e-9) layers.shift();
+      }
+      if (need > 1e-9) segs.push({ qty: need, rate: it.purch || 0, purchaseId: null });
+      return segs;
+    };
+    for (const e of events) {
+      if (e.type === 'purch') {
+        if (e.netQty > 1e-9) layers.push({ qty: e.netQty, rate: e.rate, purchaseId: e.meta.purchaseId });
+        else if (e.netQty < -1e-9) withdrawDetailed(-e.netQty);
+      } else if (e.type === 'repair') {
+        if (e.netQty < -1e-9) withdrawDetailed(-e.netQty);
+      } else if (e.type === 'sale') {
+        if (e.netQty < -1e-9) {
+          const qty = -e.netQty;
+          const segs = withdrawDetailed(qty);
+          const cost = segs.reduce((s, g) => s + g.qty * g.rate, 0);
+          const rec = bySale.get(e.meta.saleId) || { qty: 0, revenue: 0, cost: 0, segs: [] };
+          rec.qty += qty; rec.revenue += qty * (e.rate || 0); rec.cost += cost;
+          rec.segs.push(...segs.map(g => ({ purchaseId: g.purchaseId, amt: g.qty * g.rate })));
+          bySale.set(e.meta.saleId, rec);
+        } else if (e.netQty > 1e-9) {
+          layers.push({ qty: e.netQty, rate: it.purch || 0, purchaseId: null }); // sales return, back at current cost
+        }
+      }
+    }
+  }
+
+  const purchasePaidMap = getPurchasePaidDateMap();
+  const saleReceivedMap = getSaleReceivedDateMap();
+  const todayMs = msOf(today());
+  const out = [];
+  for (const s of state.sales) {
+    if (s.type === 'return') continue;
+    const rec = bySale.get(s.id);
+    if (!rec) continue;
+    const party = state.parties.find(p => p.id === s.partyId);
+    const grossProfit = rec.revenue - rec.cost;
+    const grossMarginPct = rec.revenue > 0 ? Math.round(grossProfit / rec.revenue * 1000) / 10 : 0;
+    const traceableSegs = rec.segs.filter(g => g.purchaseId);
+    const traceableCost = traceableSegs.reduce((s2, g) => s2 + g.amt, 0);
+    let interestLoad = 0;
+    if (traceableCost > 1e-6) {
+      const weightedPurchMs = traceableSegs.reduce((s2, g) => s2 + (purchasePaidMap.get(g.purchaseId) ?? todayMs) * g.amt, 0) / traceableCost;
+      const saleRecMs = saleReceivedMap.get(s.id) ?? todayMs;
+      const months = (saleRecMs - weightedPurchMs) / (1000 * 60 * 60 * 24 * 30);
+      interestLoad = Math.round(traceableCost * 0.01 * months);
+    }
+    const netProfit = Math.round(grossProfit - interestLoad);
+    const netMarginPct = rec.revenue > 0 ? Math.round(netProfit / rec.revenue * 1000) / 10 : 0;
+    out.push({
+      saleId: s.id, date: s.date, partyId: s.partyId, partyName: party?.name || s.partyName || '—',
+      qty: Math.round(rec.qty * 100) / 100, revenue: Math.round(rec.revenue), cost: Math.round(rec.cost),
+      grossProfit: Math.round(grossProfit), grossMarginPct,
+      traceableCost: Math.round(traceableCost), interestLoad, netProfit, netMarginPct,
+    });
+  }
+  return out.sort((a, b) => b.date.localeCompare(a.date));
+}
+
+// Per-customer roll-up of getSaleProfitAnalysis — avg profit % (both gross
+// and interest-adjusted) and total interest load per customer, ranked by
+// net margin so the "where am I earning more / losing because of interest
+// load" comparison (request #4) is a straight sort, not a separate calc.
+export function getCustomerProfitSummary() {
+  const sales = getSaleProfitAnalysis();
+  const byParty = new Map();
+  for (const s of sales) {
+    const cur = byParty.get(s.partyId) || { partyId: s.partyId, partyName: s.partyName, revenue: 0, grossProfit: 0, interestLoad: 0, netProfit: 0, orderCount: 0 };
+    cur.revenue += s.revenue; cur.grossProfit += s.grossProfit; cur.interestLoad += s.interestLoad; cur.netProfit += s.netProfit; cur.orderCount++;
+    byParty.set(s.partyId, cur);
+  }
+  return [...byParty.values()].map(c => ({
+    ...c,
+    grossMarginPct: c.revenue > 0 ? Math.round(c.grossProfit / c.revenue * 1000) / 10 : 0,
+    netMarginPct: c.revenue > 0 ? Math.round(c.netProfit / c.revenue * 1000) / 10 : 0,
+    interestLoadPctOfRevenue: c.revenue > 0 ? Math.round(c.interestLoad / c.revenue * 1000) / 10 : 0,
+  })).sort((a, b) => b.netMarginPct - a.netMarginPct);
+}
+
 export function getCategoryBiz(catId) {
   if (state.categoryTags[catId]) return state.categoryTags[catId];
   return DEFAULT_CATEGORY_BIZ[catId] || 'business';
@@ -644,6 +850,59 @@ export function getFifoSaleMarginMap() {
     map[it.id] = { soldQty: Math.round(soldQty * 100) / 100, marginPerPc, marginPct };
   }
   return map;
+}
+
+// Same FIFO layer replay as getFifoSaleMarginMap, but filtered to a date
+// range for revenue/cost accumulation while still replaying EVERY event
+// (including purchases/sales outside the range) in chronological order —
+// a sale's correct FIFO cost depends on the full layer history up to that
+// point, not just what happened inside the window. Used by the Dashboard's
+// "Profit This Month" tile (request #7) so it reflects true landed cost
+// rather than the flat item.purch proxy.
+export function getFifoProfitInRange(fromDate, toDate) {
+  const eventsById = {};
+  const add = (id, date, seq, type, netQty, rate) => {
+    if (!id) return;
+    (eventsById[id] ||= []).push({ date, seq: seq || '', type, netQty, rate });
+  };
+  for (const p of state.purchases) for (const l of (p.items || [])) add(l.itemId, p.date, p.createdAt, 'purch', l.qty || 0, l.rate || 0);
+  for (const s of state.sales) for (const x of (s.items || [])) add(x.itemId, s.date, s.createdAt, 'sale', -(x.qty || 0), x.rate);
+  for (const r of state.repairExpenses) add(r.itemId, r.date, r.createdAt, 'repair', -(r.qty || 0), null);
+
+  let revenue = 0, cost = 0, qty = 0;
+  for (const it of state.items) {
+    const events = (eventsById[it.id] || []).slice().sort((a, b) => a.date.localeCompare(b.date) || a.seq.localeCompare(b.seq));
+    const netFromEvents = events.reduce((s, e) => s + e.netQty, 0);
+    const plug = (it.stock || 0) - netFromEvents;
+    const layers = [];
+    if (plug > 1e-9) layers.push({ qty: plug, rate: it.purch || 0 });
+    const withdraw = q => {
+      let need = q, costSum = 0, got = 0;
+      while (need > 1e-9 && layers.length) {
+        const l = layers[0]; const take = Math.min(l.qty, need);
+        costSum += take * l.rate; got += take; l.qty -= take; need -= take;
+        if (l.qty <= 1e-9) layers.shift();
+      }
+      if (need > 1e-9) { costSum += need * (it.purch || 0); got += need; }
+      return got > 0 ? costSum / got : (it.purch || 0);
+    };
+    for (const e of events) {
+      if (e.type === 'purch') {
+        if (e.netQty > 1e-9) layers.push({ qty: e.netQty, rate: e.rate });
+        else if (e.netQty < -1e-9) withdraw(-e.netQty);
+      } else if (e.type === 'repair') {
+        if (e.netQty < -1e-9) withdraw(-e.netQty);
+      } else if (e.type === 'sale') {
+        if (e.netQty < -1e-9) {
+          const q = -e.netQty; const costRate = withdraw(q);
+          if (e.date >= fromDate && e.date <= toDate) { revenue += q * (e.rate || 0); cost += q * costRate; qty += q; }
+        } else if (e.netQty > 1e-9) {
+          layers.push({ qty: e.netQty, rate: it.purch || 0 });
+        }
+      }
+    }
+  }
+  return { revenue: Math.round(revenue), cost: Math.round(cost), profit: Math.round(revenue - cost), qty: Math.round(qty * 100) / 100 };
 }
 
 // Per-sale FIFO cost/margin detail for ONE item, keyed by sale id — same
@@ -1059,6 +1318,12 @@ export const state = {
   itemCustomerNames: {},
   repairExpenses:   [],
   stockAdjustments: [],
+  // Item ids temporarily dismissed from the Dashboard's "Out of Stock" list
+  // (item #4 of the dashboard request) — a soft hide, not a data change:
+  // the item is still genuinely out of stock, the user just doesn't want it
+  // cluttering the board right now (e.g. a discontinued line they're not
+  // reordering). Toggled back on from the same card's "Hidden (n)" sub-view.
+  dashboardHiddenOOS: [],
   // Owner/Staff role mapping, keyed by signed-in Supabase auth email — see
   // computeRole()/useRole() in App.jsx. NOT a persisted-at-boot "current
   // user" field: currentUserEmail below is runtime-only, set fresh from
@@ -1091,7 +1356,41 @@ export const save = {
   repairExpenses:   () => DB.set('data:repairExpenses',    state.repairExpenses),
   stockAdjustments: () => DB.set('data:stockAdjustments',  state.stockAdjustments),
   users:            () => DB.set('data:users',             state.users),
+  dashboardHiddenOOS: () => DB.set('data:dashboardHiddenOOS', state.dashboardHiddenOOS),
 };
+
+// ── Dashboard: Out of Stock hide/unhide (request #4) ────────────────────────
+export function hideFromDashboardOOS(itemId) {
+  if (state.dashboardHiddenOOS.includes(itemId)) return;
+  state.dashboardHiddenOOS = [...state.dashboardHiddenOOS, itemId];
+  save.dashboardHiddenOOS();
+}
+export function unhideFromDashboardOOS(itemId) {
+  state.dashboardHiddenOOS = state.dashboardHiddenOOS.filter(id => id !== itemId);
+  save.dashboardHiddenOOS();
+}
+
+// ── Reorder levels (request #5/#6) ───────────────────────────────────────────
+// A per-item `reorderLevel` (number of pcs) — undefined/0 means "no level
+// set, don't flag this item". Stored directly on the item record (same
+// pattern as every other per-item field) rather than a separate map, so it
+// travels with the item through the existing items sync/save path with no
+// new top-level state key needed.
+export function setReorderLevel(itemId, level) {
+  const lvl = Math.max(0, Number(level) || 0);
+  state.items = state.items.map(it => it.id === itemId ? { ...it, reorderLevel: lvl } : it);
+  save.items();
+}
+// Items at or below their set reorder level (and still active) — the
+// Dashboard's "Reorder" list. Out-of-stock items (stock<=0) already have
+// their own dedicated board section, so this list is for the "running low,
+// not yet zero" warning zone; an item sitting at 0 with a reorder level set
+// still qualifies here too (it needs reordering more than anyone), it just
+// also shows up in the Out of Stock card.
+export function getReorderItems() {
+  return state.items.filter(it => it.active !== false && (it.reorderLevel || 0) > 0 && (it.stock || 0) <= it.reorderLevel)
+    .sort((a, b) => (a.stock || 0) - (b.stock || 0));
+}
 
 // Learns which transporter is typically used for each delivery city, from
 // the "Transport" field entered on past sales — so New Sale can suggest a
@@ -1138,6 +1437,7 @@ const STORAGE_KEY_TO_STATE = {
   'data:orders':'orders', 'data:dispatchPhone':'dispatchPhone', 'data:itemCustomerNames':'itemCustomerNames',
   'data:cityOrder':'cityOrder', 'data:repairExpenses':'repairExpenses',
   'data:stockAdjustments':'stockAdjustments', 'data:users':'users',
+  'data:dashboardHiddenOOS':'dashboardHiddenOOS',
 };
 const liveListeners = new Set();
 export function subscribeLive(fn) { liveListeners.add(fn); return () => liveListeners.delete(fn); }
@@ -1173,13 +1473,14 @@ export function updatePartyPhone(partyId, phone) {
 export async function loadAll() {
   if (state.loaded) return;
   try {
-    const [sales,payments,pe,pt,fu,txns,parties,items,purchases,supplierPayments,freightCharges,customCategories,categoryTags,cityTransport,orders,dispatchPhone,itemCustomerNames,cityOrder,repairExpenses,stockAdjustments,users] = await Promise.all([
+    const [sales,payments,pe,pt,fu,txns,parties,items,purchases,supplierPayments,freightCharges,customCategories,categoryTags,cityTransport,orders,dispatchPhone,itemCustomerNames,cityOrder,repairExpenses,stockAdjustments,users,dashboardHiddenOOS] = await Promise.all([
       DB.get('data:sales'), DB.get('data:payments'), DB.get('data:phoneEdits'),
       DB.get('data:partyTransport'), DB.get('data:followups'), DB.get('data:txns'),
       DB.get('data:parties'), DB.get('data:items'), DB.get('data:purchases'), DB.get('data:supplierPayments'),
       DB.get('data:freightCharges'), DB.get('data:customCategories'), DB.get('data:categoryTags'),
       DB.get('data:cityTransport'), DB.get('data:orders'), DB.get('data:dispatchPhone'), DB.get('data:itemCustomerNames'),
       DB.get('data:cityOrder'), DB.get('data:repairExpenses'), DB.get('data:stockAdjustments'), DB.get('data:users'),
+      DB.get('data:dashboardHiddenOOS'),
     ]);
     if (sales)    state.sales    = sales;
     if (payments) state.payments = payments;
@@ -1199,6 +1500,7 @@ export async function loadAll() {
     if (repairExpenses)   state.repairExpenses    = repairExpenses;
     if (stockAdjustments) state.stockAdjustments  = stockAdjustments;
     if (users)            state.users             = users;
+    if (dashboardHiddenOOS) state.dashboardHiddenOOS = dashboardHiddenOOS;
     // One-time migration: persisted items predate two corrections in the seed
     // data — (1) `purch` used to be a flat 22% of `sale` instead of a real
     // rate, hiding per-item margins, and (2) `stock`/`stockValue` weren't yet
