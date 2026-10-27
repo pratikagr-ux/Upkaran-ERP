@@ -4940,7 +4940,7 @@ function CategoryLedger({catId,onClose}) {
   </Modal>;
 }
 
-function Dashboard({navigate}){
+function Dashboard({navigate,reviewOrder,setReviewOrder,doneSale,setDoneSale}){
   const mobile=useIsMobile();
   const role=useRole();
   const customers=state.parties.filter(isCustomerParty);
@@ -5027,7 +5027,12 @@ function Dashboard({navigate}){
   const pendingOrdersOpen=useMemo(()=>state.orders.filter(o=>o.status!=='invoiced')
     .sort((a,b)=>(b.createdAt||'').localeCompare(a.createdAt||'')),[state.orders.length,_fvD]);
   const pendingOrdersCount=pendingOrdersOpen.length;
-  const[reviewOrder,setReviewOrder]=useState(null);
+  // reviewOrder/setReviewOrder/doneSale/setDoneSale are owned by App() and
+  // passed in as props (same fix as OrdersModule, see App()'s comment near
+  // its own reviewOrder/doneSale state) — a local useState here gets wiped
+  // by the liveTick remount the instant save.orders() fires inside
+  // ReviewOrderModal's onSaved handler, which silently dropped the
+  // WhatsApp/invoice-send step after a dispatch made from this board.
   // Open (not-yet-received) Purchase Orders — the other half of the board.
   const pendingPurchases=useMemo(()=>state.purchases.filter(p=>getPurchaseStatus(p)!=='received')
     .sort((a,b)=>(b.createdAt||'').localeCompare(a.createdAt||'')),[state.purchases.length,_fvD]);
@@ -5289,7 +5294,9 @@ function Dashboard({navigate}){
         </div>
       </div>}
     {reviewOrder&&<ReviewOrderModal order={reviewOrder} onClose={()=>setReviewOrder(null)}
-      onSaved={()=>{setReviewOrder(null);forceUpdate(n=>n+1);}}/>}
+      onSaved={sale=>{setReviewOrder(null);setDoneSale(sale);}}/>}
+    {/* doneSale is handled by the single InvoiceModal rendered at the App()
+        level (shared with OrdersModule) — no second render site needed here. */}
     {viewPurchase&&<PurchaseViewModal purchase={viewPurchase} onClose={()=>setViewPurchase(null)}/>}
   </div>;
 }
@@ -9024,7 +9031,9 @@ function App(){
 
   const renderMod=()=>{
     switch(mod){
-      case'dashboard': return <Dashboard navigate={nav}/>;
+      case'dashboard': return <Dashboard navigate={nav}
+        reviewOrder={reviewOrder} setReviewOrder={setReviewOrder}
+        doneSale={doneSale} setDoneSale={setDoneSale}/>;
       case'sale':      return <SaleEntry/>;
       case'orders':    return <OrdersModule navigate={nav}
         dispatchOrder={dispatchOrder} setDispatchOrder={setDispatchOrder}
@@ -9042,7 +9051,9 @@ function App(){
       case'deliveries': return <DeliveriesModule/>;
       case'purch-log':  return <PurchLog/>;
       case'settings':   return <Settings/>;
-      default:         return <Dashboard navigate={nav}/>;
+      default:         return <Dashboard navigate={nav}
+        reviewOrder={reviewOrder} setReviewOrder={setReviewOrder}
+        doneSale={doneSale} setDoneSale={setDoneSale}/>;
     }
   };
 
