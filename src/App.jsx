@@ -2051,9 +2051,23 @@ function SaleEntry({onSaved,mode='sale'}){
         <div style={{position:'relative'}}>
           <label style={{fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,display:'block',marginBottom:4}}>Transport</label>
           <input id="sale-transport-input" value={transport} autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck="false"
-            onChange={e=>{setTransport(e.target.value);setTrIdx(0);if(sel){state.partyTransport[sel.id]=e.target.value;save.partyTransport();}}}
+            onChange={e=>{setTransport(e.target.value);setTrIdx(0);}}
             onFocus={e=>{setTrFocus(true);e.target.style.borderColor=C.blue;}}
-            onBlur={e=>{setTrFocus(false);e.target.style.borderColor=C.bdr;}}
+            onBlur={e=>{
+              // Persist the "remembered transporter for this party" only on
+              // blur/Enter/suggestion-pick — NOT on every keystroke. Every
+              // save.*() call fires a live-update tick that the top-level
+              // App() uses to remount the active module (so other tabs/
+              // devices' changes show up without a manual refresh — see the
+              // `key={mod+'#'+liveTick}` wrapper). Saving per character
+              // typed here fired that remount on every keystroke, wiping
+              // the entire in-progress Sales Order form the user was
+              // filling in. Saving once, when the user is actually done
+              // typing, keeps the "remember transporter" feature without
+              // that side effect.
+              setTrFocus(false);e.target.style.borderColor=C.bdr;
+              if(sel&&transport){state.partyTransport[sel.id]=transport;save.partyTransport();}
+            }}
             onKeyDown={e=>{
               if(e.key==='ArrowDown'){e.preventDefault();setTrIdx(i=>Math.min(i+1,(trSuggestions.length||1)-1));}
               if(e.key==='ArrowUp'){e.preventDefault();setTrIdx(i=>Math.max(i-1,0));}
