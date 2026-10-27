@@ -678,7 +678,9 @@ export function getAllItemRows() {
   }
   for (const p of state.purchases) {
     for (const x of (p.items || [])) {
-      rows.push({ d: p.date, item: x.customerName||x.itemName, itemId: x.itemId, qty: x.qty, rate: x.rate, amount: (x.qty||0)*(x.rate||0), dir: 'in', party: p.partyName, isNew: true });
+      // purchaseId mirrors saleId above — lets the Item Ledger drill into the
+      // full PurchaseViewModal for this row, same pattern PartyLedger already uses.
+      rows.push({ d: p.date, item: x.customerName||x.itemName, itemId: x.itemId, qty: x.qty, rate: x.rate, amount: (x.qty||0)*(x.rate||0), dir: 'in', party: p.partyName, isNew: true, purchaseId: p.id });
     }
   }
   return rows;
@@ -1207,6 +1209,26 @@ export function getExpectedStockMap() {
   return map;
 }
 
+// Reserved/committed inventory: qty still sitting on open Sales Orders
+// (status !== 'invoiced'). A pending order never deducts item.stock — that
+// only happens on dispatch via ReviewOrderModal's doCreateInvoice, which
+// also shrinks the order line's own qty down to just the undispatched
+// remainder — so an order line's current `qty` already IS the "still owed"
+// figure, both for a never-touched order and for a partially-dispatched one.
+// "Available to sell" = item.stock - reserved; this is what the Reorder List
+// and the Inventory "To Go Out" column are both built on.
+export function getReservedStockMap() {
+  const map = {};
+  for (const o of state.orders) {
+    if (o.status === 'invoiced') continue;
+    for (const l of (o.items || [])) {
+      if (!l.itemId) continue;
+      map[l.itemId] = (map[l.itemId] || 0) + (l.qty || 0);
+    }
+  }
+  return map;
+}
+
 // Local-time "YYYY-MM" for a Date — NOT d.toISOString().slice(0,7), which
 // converts to UTC first. For any timezone ahead of UTC (IST included), the
 // 1st of the month at local midnight is still the last day of the PREVIOUS
@@ -1578,9 +1600,27 @@ export function setReorderLevel(itemId, level) {
 // not yet zero" warning zone; an item sitting at 0 with a reorder level set
 // still qualifies here too (it needs reordering more than anyone), it just
 // also shows up in the Out of Stock card.
+//
+// Two refinements requested on top of the raw-stock version:
+//  1. Compare against AVAILABLE stock (on-hand minus qty already committed
+//     to open Sales Orders), not raw on-hand — an item can be "about to run
+//     low" even while its shelf count still looks fine, if a chunk of that
+//     count is already promised to a pending order.
+//  2. Skip items that already have an open (not-yet-received) Purchase
+//     Order covering them — reordering something already on order is
+//     redundant; getExpectedStockMap() is the same "incoming" figure the
+//     Out of Stock board already uses for this exact exclusion.
+// Each returned item carries `available`/`reserved` alongside its own
+// fields so callers (Dashboard, Inventory quick-filter) don't need to
+// recompute the maps themselves.
 export function getReorderItems() {
-  return state.items.filter(it => it.active !== false && (it.reorderLevel || 0) > 0 && (it.stock || 0) <= it.reorderLevel)
-    .sort((a, b) => (a.stock || 0) - (b.stock || 0));
+  const expected = getExpectedStockMap();
+  const reserved = getReservedStockMap();
+  return state.items
+    .filter(it => it.active !== false && (it.reorderLevel || 0) > 0 && !(expected[it.id] > 0))
+    .map(it => ({ ...it, reserved: reserved[it.id] || 0, available: (it.stock || 0) - (reserved[it.id] || 0) }))
+    .filter(it => it.available <= it.reorderLevel)
+    .sort((a, b) => a.available - b.available);
 }
 
 // Learns which transporter is typically used for each delivery city, from

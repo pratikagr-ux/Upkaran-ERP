@@ -279,9 +279,15 @@ export const DB = {
     if (!DB.notificationsSupported()) return;
     if (Notification.permission !== 'granted') return;
     if (DB.isNotificationsMuted()) return;
+    // tag is unique per call (not just per-body) so a second notification
+    // whose text happens to match an earlier still-visible one (e.g. the
+    // same order's "New Sales Order" then "Dispatched" alerts, same
+    // party/item/total) doesn't silently coalesce into it — a repeated tag
+    // replaces the existing notification without re-alerting (no sound) by
+    // default, which would look exactly like "nothing happened".
     navigator.serviceWorker.ready.then(reg => reg.showNotification(title, {
-      body, icon: 'icon-192.png', badge: 'icon-192.png', vibrate: [200, 100, 200], tag: body,
-    })).catch(() => {});
+      body, icon: 'icon-192.png', badge: 'icon-192.png', vibrate: [200, 100, 200], tag: `${title}-${Date.now()}`,
+    })).catch(e => console.warn('[notify] showNotification failed', e?.message || e));
   },
 
   testNotification: async () => {
@@ -292,6 +298,7 @@ export const DB = {
       body: 'Test alert — if you heard/saw this, sound notifications are working on this device.',
       icon: 'icon-192.png',
       vibrate: [200, 100, 200],
+      tag: `test-${Date.now()}`,
     });
   },
 };

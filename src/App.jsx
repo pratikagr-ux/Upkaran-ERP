@@ -5,14 +5,14 @@
 // Storage uses localStorage via src/db.js (same API as artifact window.storage).
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { Fragment, useState, useEffect, useMemo, useCallback } from 'react';
+import { Fragment, useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import * as XLSX from 'xlsx';
 import { C, fmt, fmtL, fmtD, today, uid, ROUTES, ACCOUNTS, ACC_MAP, TXN_CATEGORIES, HISTORICAL_EXPENSES, TAG_COLORS, APP_VERSION } from './constants.js';
 import { DB } from './db.js';
 import { supabase } from './supabaseClient.js';
-import { state, save, loadAll, updatePartyPhone, getBestRate, gPS, getPrevItems, parseQty, parseResponse, getAccBal, getSupplierBal, getCustomerBal, getPartyBills, getSupplierBills, getBestPurchRate, getAllCustomerMetrics, getAllVendorMetrics, getExpenseReport, setCategoryBiz, getCategorySubLedger, getAllItemRows, getItemMetrics, getAllItemMetrics, getExpectedStockMap, getFifoStockMap, getItemLandingCost, getFifoSaleMarginMap, getFifoSaleCosts, getFifoProfitInRange, getExpensesInRange, hideFromDashboardOOS, unhideFromDashboardOOS, getReorderItems, setReorderLevel, getSaleProfitAnalysis, getProfitBreakdownInRange, getCustomerProfitSummary, getRecentModeSaleRate, getMonthlyBI, getMonthlyBIByCategory, getSalesProfitByCategory, getPnL, getBalanceSheet, getRepairExpenseTotal, splitPosNegItems, recordCityTransport, getTopTransportersForCity, getAllTransporterNames, subscribeLive, getItemCustomerName, setItemCustomerName, PARTY_INVOICES, PARTY_HISTORY, SUPPLIER_HISTORY, ACCOUNT_OB, ACCOUNT_HISTORY, applyTemplate, DEFAULT_TEMPLATES, describeOrder } from './store.js';
+import { state, save, loadAll, updatePartyPhone, getBestRate, gPS, getPrevItems, parseQty, parseResponse, getAccBal, getSupplierBal, getCustomerBal, getPartyBills, getSupplierBills, getBestPurchRate, getAllCustomerMetrics, getAllVendorMetrics, getExpenseReport, setCategoryBiz, getCategorySubLedger, getAllItemRows, getItemMetrics, getAllItemMetrics, getExpectedStockMap, getReservedStockMap, getFifoStockMap, getItemLandingCost, getFifoSaleMarginMap, getFifoSaleCosts, getFifoProfitInRange, getExpensesInRange, hideFromDashboardOOS, unhideFromDashboardOOS, getReorderItems, setReorderLevel, getSaleProfitAnalysis, getProfitBreakdownInRange, getCustomerProfitSummary, getRecentModeSaleRate, getMonthlyBI, getMonthlyBIByCategory, getSalesProfitByCategory, getPnL, getBalanceSheet, getRepairExpenseTotal, splitPosNegItems, recordCityTransport, getTopTransportersForCity, getAllTransporterNames, subscribeLive, getItemCustomerName, setItemCustomerName, PARTY_INVOICES, PARTY_HISTORY, SUPPLIER_HISTORY, ACCOUNT_OB, ACCOUNT_HISTORY, applyTemplate, DEFAULT_TEMPLATES, describeOrder } from './store.js';
 
 // ── CONVENIENT ALIASES (same pattern as monolith) ─────────────────────────────
 const _p  = () => state.parties;
@@ -132,6 +132,13 @@ function mergeItems(sourceId, targetId) {
       damaged: (x.damaged||0) + (source.damaged||0),
       repaired: (x.repaired||0) + (source.repaired||0),
       mergedNames: [...new Set([...(x.mergedNames||[]), ...sourceNames, ...(source.mergedNames||[])])],
+      // A discontinued duplicate is often exactly WHY the other side has 0
+      // stock in the first place, and the merge picker now allows either
+      // side to be the target — so if either predecessor was still active,
+      // the merged result should be too, instead of silently vanishing into
+      // the Discontinued tab just because the discontinued one happened to
+      // be picked as the target.
+      active: x.active !== false || source.active !== false,
     } : x)
     .filter(x => x.id !== sourceId);
   save.items();
@@ -222,6 +229,21 @@ function markPurchaseDispatched(id, expectedDate) {
   state.purchases = state.purchases.map(p => p.id===id ? { ...p, status:'dispatched', dispatchedOn: p.dispatchedOn||p.bookedDate||p.date||today(), expectedDate: expectedDate||p.expectedDate||'' } : p);
   save.purchases();
 }
+// Request #92: dispatch/expected dates shouldn't be a one-time, write-once
+// action — a supplier's dispatch can slip, or get entered wrong the first
+// time. This lets both dates be revised at any point up until the purchase
+// is actually received (after that it's a closed record), unlike
+// markPurchaseDispatched above which only ever sets them once on the
+// ordered→dispatched transition.
+function updatePurchaseDispatchDates(id, { dispatchedOn, expectedDate }) {
+  state.purchases = state.purchases.map(p => p.id===id ? {
+    ...p,
+    status: p.status==='received' ? p.status : 'dispatched',
+    dispatchedOn: dispatchedOn || p.dispatchedOn || p.bookedDate || p.date || today(),
+    expectedDate: expectedDate || '',
+  } : p);
+  save.purchases();
+}
 // Data-only — adjusts stock exactly like PurchLog's original local
 // markReceived did. UI wrappers (toast/forceUpdate) stay at the call site.
 function markPurchaseReceived(id) {
@@ -238,13 +260,37 @@ function markPurchaseReceived(id) {
 // every sales-order line waiting on that PO with no separate sync step.
 function computeOrderLineStatus(line) {
   if (line.availability !== 'outOfStock') return { label:'Available', color:'gray' };
-  if (!line.linkedPoId) return { label:'Out of Stock', color:'red' };
-  const po = state.purchases.find(p => p.id === line.linkedPoId);
+  let po = line.linkedPoId ? state.purchases.find(p => p.id === line.linkedPoId) : null;
+  if (!po) {
+    // No explicit link yet — auto-detect: if a supplier already has an open
+    // (not-yet-received) PO covering this item, show that status directly
+    // instead of forcing the user to manually link one first (request #89).
+    // Prefer a dispatched PO over a merely-ordered one as the more advanced,
+    // more informative status when several are open for the same item.
+    const open = state.purchases.filter(p => getPurchaseStatus(p) !== 'received' && (p.items||[]).some(l => l.itemId === line.itemId));
+    po = open.find(p => getPurchaseStatus(p) === 'dispatched') || open[0] || null;
+  }
   if (!po) return { label:'Out of Stock', color:'red' };
   const st = getPurchaseStatus(po);
   if (st === 'received') return { label:'Available', color:'green' };
   if (st === 'dispatched') return { label:(po.dispatchedOn?('Dispatched '+fmtD(po.dispatchedOn)):'Dispatched')+(po.expectedDate?(' · exp '+fmtD(po.expectedDate)):''), color:'amber' };
   return { label:'Ordered', color:'blue' };
+}
+// One-row-per-order status (request #91: collapse a multi-item order's
+// several lines into a single concise row) — worst-case line wins, in order
+// of urgency: an item nobody's even ordered yet beats one already on its way,
+// which beats one already in stock. An order with every line already
+// available (nothing to chase) reads as "Ready to Dispatch" rather than the
+// per-line "Available" wording, since at the order level that IS the actionable state.
+function computeOrderStatus(order) {
+  const lines = (order.items || []).filter(l => (l.qty || 0) > 0);
+  if (!lines.length) return { label:'Ready to Dispatch', color:'green' };
+  const statuses = lines.map(computeOrderLineStatus);
+  if (statuses.some(s => s.label === 'Out of Stock')) return { label:'Out of Stock', color:'red' };
+  if (statuses.some(s => s.label === 'Ordered')) return { label:'Ordered', color:'blue' };
+  const dispatched = statuses.find(s => s.color === 'amber');
+  if (dispatched) return dispatched;
+  return { label:'Ready to Dispatch', color:'green' };
 }
 
 // Infrared/Induction goods coming back via a sales return aren't known-good —
@@ -553,6 +599,27 @@ function Sel({label,value,onChange,options,placeholder,required}){
 
 function Modal({title,onClose,children,width=560}){
   const mobile = useIsMobile();
+  // Make the hardware/browser Back button close this modal instead of
+  // navigating away underneath it (or exiting the PWA). We push one dummy
+  // history entry when the modal mounts; a Back press fires `popstate`,
+  // which we intercept to call onClose() instead of letting the browser's
+  // default back-navigation proceed. If the modal is closed any other way
+  // (×, Cancel, overlay click), we pop that dummy entry ourselves via
+  // history.back() so it doesn't sit there requiring a second back-press
+  // later. onCloseRef keeps the popstate listener calling the latest
+  // onClose without having to re-run the effect.
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  const closedByPopRef = useRef(false);
+  useEffect(() => {
+    window.history.pushState({ modalOpen: true }, '');
+    const onPop = () => { closedByPopRef.current = true; onCloseRef.current(); };
+    window.addEventListener('popstate', onPop);
+    return () => {
+      window.removeEventListener('popstate', onPop);
+      if (!closedByPopRef.current) window.history.back();
+    };
+  }, []);
   return <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.5)',zIndex:1000,
     display:'flex',alignItems:'center',justifyContent:'center',padding:mobile?0:16}}
     onClick={e=>{if(e.target===e.currentTarget)onClose();}}>
@@ -4752,7 +4819,7 @@ function Dashboard({navigate}){
   const[ledgerParty,setLedgerParty]=useState(null);
   const[showHiddenOOS,setShowHiddenOOS]=useState(false);
   const[reorderEditorOpen,setReorderEditorOpen]=useState(false);
-  const reorderItems=useMemo(()=>getReorderItems(),[state.items.length,_fvD]);
+  const reorderItems=useMemo(()=>getReorderItems(),[state.items.length,state.purchases.length,state.orders.length,_fvD]);
   // "Profit This Month" tile (request #7) — true FIFO landed-cost margin for
   // sales dated in the current calendar month, not the flat item.purch
   // proxy used by the plain "Sales This Month" card above.
@@ -4770,51 +4837,59 @@ function Dashboard({navigate}){
   const markDone=id=>{state.followups=state.followups.map(f=>f.id===id?{...f,status:'done'}:f);save.followups();forceUpdate(n=>n+1);};
 
   // ── Order-status board (linked backorder-style, Feature #6) ─────────────
-  // Every line of every non-invoiced Sales Order — not just lines waiting on
-  // stock. Originally this board only surfaced out-of-stock lines, which
-  // meant a fully in-stock order needing nothing but dispatch never showed
-  // up here at all; now every pending line appears, with its status badge
-  // computed live from computeOrderLineStatus (which already returns
-  // "Available" for an in-stock line, so a ready-to-ship order reads as
-  // ready rather than silently missing).
-  const pendingOrderLines=useMemo(()=>{
-    const rows=[];
-    state.orders.filter(o=>o.status!=='invoiced').forEach(o=>{
-      (o.items||[]).forEach((l,idx)=>{
-        rows.push({order:o,line:l,idx});
-      });
-    });
-    return rows;
-  },[state.orders.length,_fvD]);
-  const pendingOrdersCount=useMemo(()=>state.orders.filter(o=>o.status!=='invoiced').length,[state.orders.length,_fvD]);
+  // One row per non-invoiced Sales Order (request #91 — a multi-item order
+  // used to render as N separate flattened lines; now it's a single
+  // concise row, with the full per-item breakdown one click away via
+  // ReviewOrderModal, reused as-is below since it already supports
+  // deselecting/qty/rate-editing a line before dispatch — request #88).
+  const pendingOrdersOpen=useMemo(()=>state.orders.filter(o=>o.status!=='invoiced')
+    .sort((a,b)=>(b.createdAt||'').localeCompare(a.createdAt||'')),[state.orders.length,_fvD]);
+  const pendingOrdersCount=pendingOrdersOpen.length;
+  const[reviewOrder,setReviewOrder]=useState(null);
   // Open (not-yet-received) Purchase Orders — the other half of the board.
   const pendingPurchases=useMemo(()=>state.purchases.filter(p=>getPurchaseStatus(p)!=='received')
     .sort((a,b)=>(b.createdAt||'').localeCompare(a.createdAt||'')),[state.purchases.length,_fvD]);
-  const[dispatchingId,setDispatchingId]=useState(null);
+  // Request #92: editable at any time (not just set-once-on-dispatch) — see
+  // updatePurchaseDispatchDates in store.js-style helpers above.
+  const[editDatesId,setEditDatesId]=useState(null);
+  const[dispatchedDraft,setDispatchedDraft]=useState('');
   const[expectedDraft,setExpectedDraft]=useState('');
-  const confirmDispatch=id=>{
-    markPurchaseDispatched(id,expectedDraft||null);
-    setDispatchingId(null);setExpectedDraft('');
+  const openDateEditor=p=>{
+    setEditDatesId(p.id);
+    setDispatchedDraft(p.dispatchedOn||p.bookedDate||p.date||today());
+    setExpectedDraft(p.expectedDate||'');
+  };
+  const confirmDates=id=>{
+    updatePurchaseDispatchDates(id,{dispatchedOn:dispatchedDraft,expectedDate:expectedDraft});
+    setEditDatesId(null);
     forceUpdate(n=>n+1);
   };
   const doMarkReceived=id=>{
     markPurchaseReceived(id);
     forceUpdate(n=>n+1);
   };
+  const[viewPurchase,setViewPurchase]=useState(null);
 
   const pendingOrdersBlock=<div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,overflow:'hidden'}}>
     <div style={{padding:'12px 16px',borderBottom:`1px solid ${C.bdr}`,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
       <h3 style={{margin:0,fontSize:14,fontWeight:700,color:C.txt}}>📲 Pending Sales Orders · {pendingOrdersCount} pending dispatch</h3>
       <button onClick={()=>navigate('orders')} style={{background:'none',border:'none',cursor:'pointer',fontSize:12,color:C.blue,fontWeight:600}}>All →</button>
     </div>
-    {pendingOrderLines.length===0
+    {pendingOrdersOpen.length===0
       ?<div style={{padding:'20px',textAlign:'center',color:C.muted,fontSize:13}}>No pending sales orders ✓</div>
-      :pendingOrderLines.slice(0,8).map(({order,line},i)=>{
-        const st=computeOrderLineStatus(line);
-        return <div key={order.id+'_'+i} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'8px 16px',borderBottom:`1px solid ${C.bdr}`,gap:10}}>
+      :pendingOrdersOpen.slice(0,8).map(order=>{
+        const st=computeOrderStatus(order);
+        const lines=(order.items||[]).filter(l=>(l.qty||0)>0);
+        const totalAmt=lines.reduce((s,l)=>s+(l.qty||0)*(l.rate||0),0);
+        return <div key={order.id} onClick={()=>setReviewOrder(order)} title="Click to review, edit, and dispatch"
+          style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'8px 16px',borderBottom:`1px solid ${C.bdr}`,gap:10,cursor:'pointer'}}>
           <div style={{minWidth:0}}>
             <div style={{fontWeight:600,color:C.txt,fontSize:12}}>{order.partyName}</div>
-            <div style={{fontSize:11,color:C.sub,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{line.customerName||line.itemName} ×{line.qty}</div>
+            <div style={{fontSize:11,color:C.sub,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
+              {lines.length===1
+                ?`${lines[0].customerName||lines[0].itemName} ×${lines[0].qty} @ ${fmt(lines[0].rate)}`
+                :`${lines.length} items · ${fmt(totalAmt)}`}
+            </div>
           </div>
           <Badge v={st.label} color={st.color}/>
         </div>;
@@ -4830,7 +4905,9 @@ function Dashboard({navigate}){
       ?<div style={{padding:'20px',textAlign:'center',color:C.muted,fontSize:13}}>No open purchase orders ✓</div>
       :pendingPurchases.slice(0,8).map(p=>{
         const st=getPurchaseStatus(p);
-        return <div key={p.id} style={{padding:'8px 16px',borderBottom:`1px solid ${C.bdr}`}}>
+        const editing=editDatesId===p.id;
+        return <div key={p.id} onClick={()=>!editing&&setViewPurchase(p)} title="Click to view full purchase order"
+          style={{padding:'8px 16px',borderBottom:`1px solid ${C.bdr}`,cursor:editing?'default':'pointer'}}>
           <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:10}}>
             <div style={{minWidth:0}}>
               <div style={{fontWeight:600,color:C.txt,fontSize:12}}>{p.partyName}</div>
@@ -4838,16 +4915,18 @@ function Dashboard({navigate}){
             </div>
             <Badge v={st==='dispatched'?(p.dispatchedOn?'Dispatched '+fmtD(p.dispatchedOn):'Dispatched')+(p.expectedDate?' · exp '+fmtD(p.expectedDate):''):'Ordered'} color={st==='dispatched'?'amber':'blue'}/>
           </div>
-          <div style={{display:'flex',gap:6,marginTop:6,flexWrap:'wrap',alignItems:'center'}}>
-            {st==='ordered'&&(dispatchingId===p.id
+          <div onClick={e=>e.stopPropagation()} style={{display:'flex',gap:6,marginTop:6,flexWrap:'wrap',alignItems:'center'}}>
+            {editing
               ?<>
-                <span style={{fontSize:10,color:C.sub}}>Expected arrival:</span>
+                <span style={{fontSize:10,color:C.sub}}>Dispatched:</span>
+                <input type="date" value={dispatchedDraft} onChange={e=>setDispatchedDraft(e.target.value)} style={{padding:'3px 6px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:11,fontFamily:'inherit'}}/>
+                <span style={{fontSize:10,color:C.sub}}>Expected:</span>
                 <input type="date" value={expectedDraft} onChange={e=>setExpectedDraft(e.target.value)} style={{padding:'3px 6px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:11,fontFamily:'inherit'}}/>
-                <Btn onClick={()=>confirmDispatch(p.id)} size="sm" variant="amber">Confirm Dispatched</Btn>
-                <Btn onClick={()=>{setDispatchingId(null);setExpectedDraft('');}} size="sm" variant="ghost">Cancel</Btn>
+                <Btn onClick={()=>confirmDates(p.id)} size="sm" variant="amber">Save</Btn>
+                <Btn onClick={()=>setEditDatesId(null)} size="sm" variant="ghost">Cancel</Btn>
               </>
-              :<Btn onClick={()=>{setDispatchingId(p.id);setExpectedDraft(p.expectedDate||'');}} size="sm" variant="secondary">Mark Dispatched</Btn>)}
-            <Btn onClick={()=>doMarkReceived(p.id)} size="sm" variant="success">Mark Received</Btn>
+              :<Btn onClick={()=>openDateEditor(p)} size="sm" variant="secondary">{st==='dispatched'?'Edit Dates':'Mark Dispatched'}</Btn>}
+            {!editing&&<Btn onClick={()=>doMarkReceived(p.id)} size="sm" variant="success">Mark Received</Btn>}
           </div>
         </div>;
       })}
@@ -4896,8 +4975,11 @@ function Dashboard({navigate}){
       ?<div style={{padding:'20px',textAlign:'center',color:C.muted,fontSize:13}}>{state.items.some(it=>it.reorderLevel>0)?'Nothing below its reorder level ✓':'No reorder levels set yet'}</div>
       :reorderItems.slice(0,8).map(it=>
         <div key={it.id} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'8px 16px',borderBottom:`1px solid ${C.bdr}`,gap:10}}>
-          <div style={{minWidth:0,fontSize:12,fontWeight:600,color:C.txt,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{it.dispatchName||it.internal||it.name}</div>
-          <Badge v={(it.stock||0)+' / '+it.reorderLevel} color={(it.stock||0)<=0?'red':'amber'}/>
+          <div style={{minWidth:0,fontSize:12,fontWeight:600,color:C.txt,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
+            {it.dispatchName||it.internal||it.name}
+            {it.reserved>0&&<span style={{display:'block',fontSize:10,color:C.sub,fontWeight:400}}>{it.stock||0} on hand − {it.reserved} to go out</span>}
+          </div>
+          <Badge v={it.available+' / '+it.reorderLevel} color={it.available<=0?'red':'amber'}/>
         </div>)}
   </div>;
 
@@ -4977,17 +5059,19 @@ function Dashboard({navigate}){
       </div>
       {!mobile&&quickActionsBlock}
     </div>
+    {/* Request #98: exactly 4 top tiles, in this order — Sales This Month,
+        Profit This Month, Net of Business Expenses, Pending Sale Orders
+        (count, clickable). Profit/Net stay owner-only, consistent with
+        every other margin-adjacent figure already gated by role elsewhere
+        in this app, so Staff see just the two non-sensitive tiles. */}
     <div style={{display:'grid',gridTemplateColumns:mobile?'repeat(2,1fr)':'repeat(auto-fit,minmax(175px,1fr))',gap:mobile?10:12,marginBottom:18}}>
-      <StatCard label="Total Outstanding" value={fmtL(totalOD)} sub={`${odParties.length} parties`} color={C.red} icon="⏰" onClick={()=>navigate('outstanding')}/>
       <StatCard label="Sales This Month" value={monthSales.length?fmtL(monthAmt):'—'} sub={monthSales.length?<>
         {monthSales.length} invoices
         <div style={{marginTop:2}}>Lighter {fmtL(monthCatSplit.lighter)} · Appliances {fmtL(monthCatSplit.appliances)}</div>
       </>:'No sales'} color={C.green} icon="🧾"/>
-      <StatCard label="Follow-ups Due" value={String(followupsDue.length||0)} sub={followupsDue.length?'Action needed':'All clear'} color={followupsDue.length>0?C.amber:C.green} icon="📋" onClick={()=>navigate('outstanding')}/>
-      <StatCard label="Parties" value={String(customers.length)} sub={`${state.parties.filter(isSupplierParty).length} suppliers`} color={C.blue} icon="🏪" onClick={()=>navigate('parties')}/>
-      <StatCard label="Out of Stock" value={String(outOfStock.length)} sub={outOfStock.length?'Items need reorder':'All stocked'} color={outOfStock.length>0?C.red:C.green} icon="📦" onClick={()=>{pendingItemsFilter='oos';navigate('items');}}/>
       {role==='owner'&&<StatCard label="Profit This Month" value={fmtL(monthProfit.profit)} sub={monthProfit.qty?`${monthProfit.qty} pcs · FIFO landed cost`:'No sales yet'} color={monthProfit.profit>=0?C.green:C.red} icon="💰"/>}
       {role==='owner'&&<StatCard label="Net of Business Expenses" value={fmtL(netOfExpenses)} sub={monthBizExpenses?`− ${fmtL(monthBizExpenses)} business expenses`:'No expenses booked'} color={netOfExpenses>=0?C.green:C.red} icon="🧮" onClick={()=>navigate('profit')}/>}
+      <StatCard label="Pending Sale Orders" value={String(pendingOrdersCount)} sub={pendingOrdersCount?'Awaiting dispatch':'All clear'} color={pendingOrdersCount>0?C.amber:C.green} icon="📲" onClick={()=>navigate('orders')}/>
     </div>
     {reorderEditorOpen&&<ReorderLevelEditorModal onClose={()=>{setReorderEditorOpen(false);forceUpdate();}}/>}
     {mobile
@@ -5012,6 +5096,9 @@ function Dashboard({navigate}){
           {reorderBlock}
         </div>
       </div>}
+    {reviewOrder&&<ReviewOrderModal order={reviewOrder} onClose={()=>setReviewOrder(null)}
+      onSaved={()=>{setReviewOrder(null);forceUpdate(n=>n+1);}}/>}
+    {viewPurchase&&<PurchaseViewModal purchase={viewPurchase} onClose={()=>setViewPurchase(null)}/>}
   </div>;
 }
 
@@ -5642,6 +5729,10 @@ function ItemDetail({item,onClose}){
   const[dmgQty,setDmgQty]=useState('');
   const[fixQty,setFixQty]=useState('');
   const[stock,setStock]=useState(item.stock||0);
+  // Drill-down (request #97): clicking a ledger row opens the full sale/
+  // purchase, same pattern PartyLedger already uses.
+  const[viewSale,setViewSale]=useState(null);
+  const[viewPurchase,setViewPurchase]=useState(null);
   const PAGE=20;
   const metrics=useMemo(()=>getItemMetrics(item),[item.id,state.sales.length,state.purchases.length,state.items.length]);
   const grandRevenue=useMemo(()=>getAllItemMetrics().reduce((s,m)=>s+m.totalRevenue,0),[state.sales.length,state.purchases.length]);
@@ -5660,6 +5751,9 @@ function ItemDetail({item,onClose}){
     const l=(p.items||[]).find(x=>x.itemId===item.id);
     return s+(l?l.qty:0);
   },0),[item.id,state.purchases.length]);
+  // "To Go Out" (request #96): qty already committed to open Sales Orders
+  // for this item — see getReservedStockMap in store.js.
+  const reservedQty=useMemo(()=>getReservedStockMap()[item.id]||0,[item.id,state.orders.length]);
   // Per-sale FIFO cost/margin (see getFifoSaleCosts in store.js) — keyed by
   // saleId, only populated for in-app sales (same documented FIFO-costing
   // restriction as getFifoStockMap/getFifoSaleMarginMap: historical,
@@ -5788,6 +5882,8 @@ function ItemDetail({item,onClose}){
       </div>
       <Card label="Stock Value" value={fmt(stockValue)}/>
       <Card label="Expected (Incoming)" value={expectedQty+' pcs'} color={expectedQty>0?C.amber:C.txt}/>
+      <Card label="To Go Out" value={reservedQty+' pcs'} color={reservedQty>0?C.blue:C.txt}/>
+      <Card label="Available to Sell" value={Math.max(0,stock-reservedQty)+' pcs'} color={(stock-reservedQty)<=0?C.red:C.txt}/>
     </div>
     {((item.photos||[]).length>0||(item.specs||[]).length>0||item.dimensions)&&
       <div style={{background:'#F9FAFB',borderRadius:8,border:`1px solid ${C.bdr}`,padding:'10px 12px',marginBottom:16}}>
@@ -5822,9 +5918,16 @@ function ItemDetail({item,onClose}){
     </div>
     <div style={{border:mobile?'none':`1px solid ${C.bdr}`,borderRadius:8,overflow:'hidden'}}>
       <CardTable mobile={mobile} keyFn={(r,i)=>i} rows={pageRows} emptyLabel="No purchase/sale entries for this item"
+        onRowClick={r=>{
+          if(r.saleId){const found=state.sales.find(x=>x.id===r.saleId);if(found)setViewSale(found);}
+          else if(r.purchaseId){const found=state.purchases.find(x=>x.id===r.purchaseId);if(found)setViewPurchase(found);}
+        }}
         columns={[
           {key:'date',label:'Date',render:r=><span style={{whiteSpace:'nowrap',color:C.sub}}>{fmtD(r.d)}</span>},
-          {key:'party',label:'Party',render:r=><span style={{fontWeight:500,color:C.txt}}>{r.party||'—'}</span>},
+          {key:'party',label:'Party',render:r=>{
+            const clickable=!!(r.saleId||r.purchaseId);
+            return <span style={{fontWeight:500,color:clickable?C.blue:C.txt,textDecoration:clickable?'underline':'none',textDecorationStyle:'dotted'}}>{r.party||'—'}</span>;
+          }},
           {key:'qty',label:'Qty',align:'right',render:r=>Math.abs(r.qty||0)},
           {key:'rate',label:'Rate',align:'right',render:r=>r.isTransfer?<span style={{color:C.muted}}>—</span>:<span style={{color:C.sub}}>{fmt(r.rate)}</span>},
           {key:'amount',label:'Amount',align:'right',render:r=>r.isTransfer?<span style={{color:C.muted}}>—</span>:<span style={{fontWeight:700,color:C.blue}}>{fmt(Math.abs(r.amount||0))}</span>},
@@ -5849,6 +5952,8 @@ function ItemDetail({item,onClose}){
       <span style={{fontSize:12,color:C.sub}}>Page {page+1} of {totalPages} · {rows.length} entries</span>
       <Btn onClick={()=>setPage(p=>Math.min(totalPages-1,p+1))} disabled={page>=totalPages-1} variant="secondary" size="sm">Next →</Btn>
     </div>}
+    {viewSale&&<SaleBillModal sale={viewSale} onClose={()=>setViewSale(null)}/>}
+    {viewPurchase&&<PurchaseViewModal purchase={viewPurchase} onClose={()=>setViewPurchase(null)}/>}
   </Modal>;
 }
 
@@ -5877,7 +5982,7 @@ function formatStockQty(stock,item){
   if(pcs>0||petis===0)parts.push(pcs+' pc'+(pcs===1?'':'s'));
   return parts.join(' ')+' ('+n+' pcs)';
 }
-function MobileInventoryList({items,catF,saleOf,purchOf,marginOf,expectedMap,onOpenLedger,onMove,onMerge,onEdit,onShare,onSell,role}){
+function MobileInventoryList({items,catF,saleOf,purchOf,marginOf,expectedMap,reservedMap,onOpenLedger,onMove,onMerge,onEdit,onShare,onSell,role}){
   const[expandedId,setExpandedId]=useState(null);
   if(!items.length)return <div style={{padding:'30px 10px',textAlign:'center',color:C.sub,fontSize:13}}>No items match</div>;
   return <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}>
@@ -5888,7 +5993,7 @@ function MobileInventoryList({items,catF,saleOf,purchOf,marginOf,expectedMap,onO
         const showSub=it.subHead&&normSubHeadDisplay(it.subHead)!==normSubHeadDisplay(prev?prev.subHead:undefined);
         const expanded=expandedId===it.id;
         const sale=saleOf(it),purch=purchOf(it),{pct:marginPct,perPc:marginPerPc,isReal}=marginOf(it);
-        const stock=it.stock||0,expected=expectedMap[it.id]||0,damaged=it.damaged||0,repaired=it.repaired||0;
+        const stock=it.stock||0,expected=expectedMap[it.id]||0,reserved=(reservedMap||{})[it.id]||0,damaged=it.damaged||0,repaired=it.repaired||0;
         return <Fragment key={it.id}>
           {showCat&&<tr><td colSpan={2} style={{padding:'10px 12px',background:C.blueSoft,fontSize:13,fontWeight:800,color:C.blue,borderTop:prev?`2px solid ${C.blue}`:'none'}}>{it.cat||'Other'}</td></tr>}
           {showSub&&<tr><td colSpan={2} style={{padding:'6px 12px',background:C.amberSoft,fontSize:11,fontWeight:800,color:C.amberBright,borderLeft:`3px solid ${C.amber}`,textTransform:'uppercase',letterSpacing:.5}}>{it.subHead}</td></tr>}
@@ -5910,6 +6015,7 @@ function MobileInventoryList({items,catF,saleOf,purchOf,marginOf,expectedMap,onO
               {damaged>0&&<Row label="Damaged" value={<Badge v={damaged+' pcs'} color="amber"/>}/>}
               {repaired>0&&<Row label="Repaired" value={<Badge v={repaired+' pcs'} color="green"/>}/>}
               {expected>0&&<Row label="Expected" value={<span style={{color:C.amber,fontWeight:700}}>+{expected}</span>}/>}
+              {reserved>0&&<Row label="To Go Out" value={<span style={{color:C.blue,fontWeight:700}}>−{reserved}</span>}/>}
               <div style={{display:'flex',gap:6,justifyContent:'flex-end',flexWrap:'wrap',marginTop:4}}>
                 {(it.active===false||damaged>0||repaired>0)&&(stock+damaged+repaired)>0&&
                   <IconBtn onClick={()=>onSell(it)} title="Sell off this item's stock (incl. damaged/repaired/discontinued)">💸</IconBtn>}
@@ -5962,6 +6068,8 @@ function ItemMasters(){
   const cats=useMemo(()=>[...new Set(state.items.map(i=>i.cat))].sort(),[]);
   const catOptions=useMemo(()=>[...new Set([...cats,'Other'])].sort(),[cats]);
   const expectedMap=useMemo(()=>getExpectedStockMap(),[state.purchases.length]);
+  const reservedMap=useMemo(()=>getReservedStockMap(),[state.orders.length]);
+  const reorderIds=useMemo(()=>new Set(getReorderItems().map(it=>it.id)),[state.items.length,state.purchases.length,state.orders.length]);
   // Purch ₹ column: FIFO avg cost of the item's current balance (see
   // getFifoStockMap in store.js) instead of the flat item.purch field, which
   // only ever changes when someone hand-edits it — it drifts stale the
@@ -5998,10 +6106,11 @@ function ItemMasters(){
     (!search||(it.customer||it.internal||'').toLowerCase().includes(search.toLowerCase()))&&
     // Dashboard "View all" hand-off (see quickFilter above) — 'oos' mirrors
     // Dashboard's own Out of Stock definition exactly (zero stock AND no
-    // incoming PO already covering it), 'reorder' mirrors getReorderItems'
-    // at-or-below-reorder-level definition.
+    // incoming PO already covering it), 'reorder' mirrors getReorderItems()
+    // itself (available-after-reservations vs reorder level, also excluding
+    // items already on an open PO) so the two never drift apart.
     (quickFilter!=='oos'||((it.stock||0)<=0&&!(expectedMap[it.id]>0)))&&
-    (quickFilter!=='reorder'||((it.reorderLevel||0)>0&&(it.stock||0)<=it.reorderLevel))
+    (quickFilter!=='reorder'||reorderIds.has(it.id))
   ).sort((a,b)=>(a.cat||'').localeCompare(b.cat||'')||(a.sortOrder??Infinity)-(b.sortOrder??Infinity)||(a.internal||'').localeCompare(b.internal||''));
   const pageData=filtered.slice(page*PAGE,(page+1)*PAGE);
   const totalPages=Math.ceil(filtered.length/PAGE);
@@ -6200,7 +6309,7 @@ function ItemMasters(){
       <input value={search} onChange={e=>{setSearch(e.target.value);setPage(0);}} placeholder="Search items…" style={{width:'100%',border:'none',outline:'none',fontSize:13,color:C.txt,fontFamily:'inherit',background:'transparent'}}/>
     </div>
     <div style={{background:mobile?'transparent':C.surf,borderRadius:8,border:mobile?'none':`1px solid ${C.bdr}`,overflow:'hidden'}}>
-      {mobile?<MobileInventoryList items={pageData} catF={catF} saleOf={saleOf} purchOf={purchOf} marginOf={marginOf} expectedMap={expectedMap}
+      {mobile?<MobileInventoryList items={pageData} catF={catF} saleOf={saleOf} purchOf={purchOf} marginOf={marginOf} expectedMap={expectedMap} reservedMap={reservedMap}
         onOpenLedger={setDetailItem} onMove={setMoveSrc} onMerge={setMergeSrc} onEdit={openEdit} onShare={setShareItem} onSell={setSellItem} role={role}/>:
       <CardTable mobile={mobile} rows={pageData} keyFn={(it,i)=>it.id||i} emptyLabel="No items match"
         groupHeader={(it,prev)=>{
@@ -6257,6 +6366,10 @@ function ItemMasters(){
           {key:'expected',label:'Expected',align:'right',render:it=>{
             const expected=expectedMap[it.id]||0;
             return <span style={{color:expected>0?C.amber:C.muted,fontWeight:expected>0?700:400}}>{expected>0?'+'+expected:'—'}</span>;
+          }},
+          {key:'toGoOut',label:'To Go Out',align:'right',render:it=>{
+            const reserved=reservedMap[it.id]||0;
+            return <span style={{color:reserved>0?C.blue:C.muted,fontWeight:reserved>0?700:400}} title="Qty already committed to pending Sales Orders">{reserved>0?'−'+reserved:'—'}</span>;
           }},
           {key:'actions',label:'',cardLabel:'Actions',render:it=>
             <div style={{display:'flex',gap:6,justifyContent:'flex-end',flexWrap:'wrap'}}>
@@ -6322,7 +6435,12 @@ function MergeItemModal({source,onClose,onMerged}){
   const[targetId,setTargetId]=useState('');
   const mobile=useIsMobile();
   const{toast,TC}=useToast();
-  const candidates=useMemo(()=>state.items.filter(it=>it.id!==source.id&&it.active!==false&&(!pq||(it.internal||it.name||'').toLowerCase().includes(pq.toLowerCase()))).slice(0,8),[pq,source.id]);
+  // No active!==false filter here on purpose — unlike MoveStockModal, merge
+  // is exactly the tool for folding a discontinued/0-stock duplicate (very
+  // often how a name/case duplicate ends up with 0 stock in the first
+  // place) into its live counterpart, so a discontinued item must stay
+  // pickable on EITHER side of the merge, not just as the source.
+  const candidates=useMemo(()=>state.items.filter(it=>it.id!==source.id&&(!pq||(it.internal||it.name||'').toLowerCase().includes(pq.toLowerCase()))).slice(0,8),[pq,source.id]);
   const target=state.items.find(it=>it.id===targetId);
   const doMerge=()=>{
     if(!targetId)return toast('Pick an item to merge into','error');
@@ -6339,13 +6457,13 @@ function MergeItemModal({source,onClose,onMerged}){
           style={{width:'100%',padding:'8px 12px',borderRadius:7,border:`1.5px solid ${C.bdr}`,fontSize:13,outline:'none',fontFamily:'inherit',marginBottom:8,boxSizing:'border-box'}}/>
         {pq.length>0&&candidates.map(it=><div key={it.id} onClick={()=>setTargetId(it.id)} style={{padding:'8px 12px',borderRadius:7,cursor:'pointer',border:`1px solid ${C.bdr}`,marginBottom:6}}
           {...(mobile?{}:{onMouseEnter:e=>e.currentTarget.style.background='#F6F8FA',onMouseLeave:e=>e.currentTarget.style.background='transparent'})}>
-          <div style={{fontWeight:600,color:C.txt,fontSize:13}}>{it.internal||it.name}</div>
+          <div style={{fontWeight:600,color:C.txt,fontSize:13}}>{it.internal||it.name}{it.active===false&&<span style={{marginLeft:6,fontSize:10,fontWeight:400,color:C.muted}}>(discontinued)</span>}</div>
           <div style={{fontSize:11,color:C.sub}}>{it.cat||'—'} · {it.stock||0} pcs in stock</div>
         </div>)}
       </>
       :<div style={{padding:'10px 14px',borderRadius:8,border:`1.5px solid ${C.blue}`,background:C.blueSoft,marginBottom:14}}>
         <div style={{fontSize:11,color:C.sub}}>Merging into</div>
-        <div style={{fontWeight:700,color:C.txt,fontSize:14}}>{target.internal||target.name}</div>
+        <div style={{fontWeight:700,color:C.txt,fontSize:14}}>{target.internal||target.name}{target.active===false&&<span style={{marginLeft:6,fontSize:10,fontWeight:400,color:C.muted}}>(discontinued)</span>}</div>
         <div style={{fontSize:11,color:C.sub,marginTop:2}}>{target.stock||0} pcs → {(target.stock||0)+(source.stock||0)} pcs after merge</div>
         <button onClick={()=>setTargetId('')} style={{marginTop:4,background:'none',border:'none',color:C.blue,cursor:'pointer',fontSize:11,textDecoration:'underline',fontFamily:'inherit'}}>Change</button>
       </div>}
@@ -7935,13 +8053,14 @@ function CloudSyncPanel(){
 }
 
 // ── SETTINGS ──────────────────────────────────────────────────────────────────
-// Sound alert on "new Sales Order" / "new Dispatch recorded" — the actual
-// detection + Web Push send happens server-side (Supabase Edge Function
-// `notify-order-events`, triggered by a Database Webhook on kv_store); this
-// panel only handles the client half: ask the browser for permission and
-// register this device's push endpoint so the server has somewhere to send
-// to. Every signed-in device that turns this on gets the sound, including
-// the device that created the order itself (by design — see chat).
+// Sound alert on "new Sales Order" / "new Dispatch recorded" — local
+// Notification API only (see db.js), no server/push infra. This panel asks
+// the browser for permission and shows the on/off state. The device that
+// creates the order gets notified directly (App.jsx calls DB.notify() right
+// after the save); every OTHER signed-in device gets notified via its own
+// Realtime subscription diffing the incoming order array (store.js's
+// notifyOrderDiff) — so "every signed-in device, including the one that
+// created it" holds, just through two different code paths.
 function NotificationsPanel(){
   const{toast,TC}=useToast();
   const[perm,setPerm]=useState(()=>DB.getNotificationPermission());
@@ -8595,7 +8714,7 @@ function LoginScreen({ onSignedIn }) {
 // ── APP ───────────────────────────────────────────────────────────────────────
 function App(){
   const initialMod=(window.location.hash||'').slice(1);
-  const[mod,setMod]=useState(NAV.some(n=>n.id===initialMod)?initialMod:(initialMod?'dashboard':'orders'));
+  const[mod,setMod]=useState(NAV.some(n=>n.id===initialMod)?initialMod:'dashboard');
   const[ready,setReady]=useState(false);
   // null = checking cached session, false = show LoginScreen, true = proceed.
   // Stays `true` immediately when this build has no Supabase project
@@ -8622,14 +8741,36 @@ function App(){
     DB.initSync().then(loadAll).then(()=>{ ensureOwnerBootstrap(email); setReady(true); });
   };
 
+  // Tracks which signed-in user we've already run the full boot sequence
+  // for. Supabase's client re-fires onAuthStateChange on things that
+  // aren't a genuine new sign-in — a token refresh, or a tab regaining
+  // focus/visibility re-checking the session — not just on real sign-in.
+  // bootAfterAuth()'s DB.initSync() does an unconditional "remote wins"
+  // bulk pull of the whole kv_store table into localStorage/state; re-
+  // running it on one of those spurious re-fires can race a local write
+  // that hasn't finished pushing to Supabase yet (e.g. a Sales Order just
+  // saved, then the user alt-tabs to WhatsApp to send it to dispatch and
+  // back) and silently overwrite it with a stale snapshot — that's what
+  // was causing newly-created Sales Orders to "disappear". Only re-run the
+  // full boot when the signed-in account actually changed.
+  const bootedUidRef=useRef(null);
+
   useEffect(()=>{
     if(!supabase){ bootAfterAuth(); return; }
     DB.getSession().then(session=>{
-      if(session){setAuthed(true);bootAfterAuth(session.user?.email);}
-      else setAuthed(false);
+      if(session){
+        setAuthed(true);
+        bootedUidRef.current=session.user?.id||session.user?.email||null;
+        bootAfterAuth(session.user?.email);
+      } else setAuthed(false);
     });
     return DB.onAuthChange(session=>{
-      if(session){setAuthed(true);bootAfterAuth(session.user?.email);}
+      if(!session)return;
+      setAuthed(true);
+      const uid=session.user?.id||session.user?.email||null;
+      if(uid&&uid===bootedUidRef.current)return; // same account still signed in — skip the destructive re-pull
+      bootedUidRef.current=uid;
+      bootAfterAuth(session.user?.email);
     });
   },[]);
 
