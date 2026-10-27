@@ -9096,14 +9096,9 @@ function App(){
         {/* Logo */}
         <div style={{height:52,display:'flex',alignItems:'center',padding:'0 13px',
           gap:10,justifyContent:sideOpen?'flex-start':'center',borderBottom:'1px solid #1a2035',flexShrink:0}}>
-          <div style={{width:30,height:30,borderRadius:8,
-            background:'linear-gradient(135deg,#2563EB,#1D4ED8)',
-            display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0,cursor:'pointer'}}
-            onClick={()=>setSideOpen(o=>!o)}>
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5" strokeLinecap="round">
-              <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
-            </svg>
-          </div>
+          <img src={`${import.meta.env.BASE_URL}icon-192.png`} alt="Upkaran" width={30} height={30}
+            style={{borderRadius:8,flexShrink:0,cursor:'pointer',objectFit:'cover'}}
+            onClick={()=>setSideOpen(o=>!o)}/>
           {sideOpen&&<div>
             <div style={{fontSize:14,fontWeight:800,color:'#FFFFFF',letterSpacing:-.4,whiteSpace:'nowrap'}}>Upkaran</div>
             <div style={{fontSize:9,color:'rgba(255,255,255,.28)',whiteSpace:'nowrap',letterSpacing:.5}}>ERP v{APP_VERSION}</div>
