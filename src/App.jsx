@@ -1728,12 +1728,23 @@ function InvoiceModal({sale,party,onClose,viewOnly=false}){
 function SaleBillModal({sale,onClose,onEdited}){
   const[editing,setEditing]=useState(false);
   const[liveSale,setLiveSale]=useState(sale);
+  // Send Invoice (new request #3) — reuses the exact same InvoiceModal built
+  // for a fresh dispatch (WhatsApp estimate image + text, plus the dispatch-
+  // photo copy-loop if this sale carries any sale.dispatchPhotos), just
+  // pointed at an already-recorded sale instead of a brand-new one. This is
+  // the shared "bill view" modal used from SalesLog/PartyLedger/ItemDetail/
+  // PartySaleProfitModal, so adding it here covers all of those at once.
+  const[sendingInvoice,setSendingInvoice]=useState(false);
   if(editing)return <EditSaleModal sale={liveSale} onClose={()=>setEditing(false)} onSaved={()=>{
     const fresh=state.sales.find(x=>x.id===liveSale.id);
     if(fresh)setLiveSale(fresh);
     setEditing(false);
     onEdited?.();
   }}/>;
+  if(sendingInvoice){
+    const party=state.parties.find(p=>p.id===liveSale.partyId)||{name:liveSale.partyName,phone:''};
+    return <InvoiceModal sale={liveSale} party={party} onClose={()=>setSendingInvoice(false)}/>;
+  }
   const items=liveSale.items||[];
   const isReturn=liveSale.type==='return'||(liveSale.total||0)<0;
   const due=()=>{
@@ -1768,7 +1779,10 @@ function SaleBillModal({sale,onClose,onEdited}){
       </tfoot>}
     </table>
     <div style={{display:'flex',justifyContent:'space-between'}}>
-      {liveSale.id?<Btn onClick={()=>setEditing(true)} variant="secondary" icon="✎">Edit Sale</Btn>:<span/>}
+      <div style={{display:'flex',gap:8}}>
+        {liveSale.id?<Btn onClick={()=>setEditing(true)} variant="secondary" icon="✎">Edit Sale</Btn>:null}
+        {!isReturn&&<Btn onClick={()=>setSendingInvoice(true)} variant="secondary" icon="📲">Send Invoice</Btn>}
+      </div>
       <Btn onClick={onClose} variant="secondary">Close</Btn>
     </div>
   </Modal>;
@@ -2080,11 +2094,17 @@ function SaleEntry({onSaved,mode='sale'}){
           </div>:null}
         columns={[
           {key:'idx',label:'#',hideOnMobile:true,render:(l,i)=><span style={{color:C.muted,fontSize:11}}>{i+1}</span>},
-          {key:'item',label:'Item',render:l=><div>
-            <div style={{fontWeight:600,color:l.id==='__freight'?C.amber:C.txt}}>{l.customerName||l.itemName}</div>
-            {l.customerName&&l.customerName!==l.itemName&&<div style={{fontSize:10,color:C.muted}}>{l.itemName}</div>}
+          {key:'item',label:'Item',render:l=>{
+            // Sales Orders (mode==='order') go to the dispatch/warehouse team
+            // first, who know items by dispatch name, not the customer-
+            // facing name (new request #1) — a direct Sale keeps showing
+            // the customer-facing name as before.
+            const primary=mode==='order'?(l.dispatchName||l.itemName):(l.customerName||l.itemName);
+            return <div>
+            <div style={{fontWeight:600,color:l.id==='__freight'?C.amber:C.txt}}>{primary}</div>
+            {primary&&primary!==l.itemName&&<div style={{fontSize:10,color:C.muted}}>{l.itemName}</div>}
             {l.warranty&&l.warranty!=='no warranty'&&<div style={{fontSize:10,color:C.purple,fontWeight:600}}>🛡 {l.warranty}</div>}
-          </div>},
+            </div>;}},
           {key:'qty',label:'Qty',align:'right',render:(l,i)=>
             l.id!=='__freight'?<input value={l.qty} onChange={e=>editLine(i,'qty',e.target.value)} type="number" style={{width:60,padding:'3px 7px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:12,textAlign:'right',outline:'none',fontFamily:'inherit'}}/>:<span style={{color:C.amber,fontSize:12}}>1</span>},
           {key:'rate',label:'Rate ₹',align:'right',render:(l,i)=>
@@ -2326,7 +2346,9 @@ function ReviewOrderModal({order,onClose,onSaved}){
       </tr></thead>
       <tbody>
         {lines.map((l,i)=><tr key={l.id||i} style={{borderBottom:`1px solid ${C.bdr}`}}>
-          <td style={{padding:'7px 12px',fontWeight:600,color:C.txt}}>{l.customerName||l.itemName}</td>
+          {/* Dispatch step — the warehouse team works off the dispatch name,
+              not the customer-facing one (new request #1). */}
+          <td style={{padding:'7px 12px',fontWeight:600,color:C.txt}}>{l.dispatchName||l.itemName}</td>
           <td style={{padding:'7px 12px',textAlign:'right',color:C.sub}}>{l.orderedQty}</td>
           <td style={{padding:'7px 12px',textAlign:'right'}}>
             <input value={l.qty} onChange={e=>editLine(i,'qty',e.target.value)} type="number" min={0} max={l.orderedQty}
@@ -2444,10 +2466,11 @@ function OrdersModule({navigate,dispatchOrder,setDispatchOrder,reviewOrder,setRe
               <td style={{padding:'9px 14px',fontWeight:600,color:C.txt,verticalAlign:'top'}}>{o.partyName}</td>
               <td style={{padding:'9px 14px',fontSize:12,color:C.sub}}>
                 {(o.items||[]).map((x,j)=><div key={j} style={{marginBottom:4}}>
-                  <span style={{display:'block'}}>{(x.customerName||x.itemName)} ×{x.qty}</span>
+                  {/* Sales Orders list — dispatch-facing, use dispatch name (new request #1) */}
+                  <span style={{display:'block'}}>{(x.dispatchName||x.itemName)} ×{x.qty}</span>
                   {x.availability==='outOfStock'&&(()=>{const st=computeOrderLineStatus(x);return <div style={{display:'flex',alignItems:'center',gap:6,marginTop:2}}>
                     <Badge v={st.label} color={st.color}/>
-                    {!x.linkedPoId&&<button onClick={()=>setLinkCtx({orderId:o.id,itemIdx:j,itemId:x.itemId,itemName:x.customerName||x.itemName})}
+                    {!x.linkedPoId&&<button onClick={()=>setLinkCtx({orderId:o.id,itemIdx:j,itemId:x.itemId,itemName:x.dispatchName||x.itemName})}
                       style={{border:'none',background:'none',color:C.blue,cursor:'pointer',fontSize:11,fontWeight:700,textDecoration:'underline',padding:0}}>Link to PO</button>}
                   </div>;})()}
                 </div>)}
@@ -2679,7 +2702,7 @@ function EditOrderModal({order,onClose,onSaved}){
   const[step,setStep]=useState('item');
   const[input,setInput]=useState('');
   const[si,setSi]=useState(0);
-  const[draft,setDraft]=useState({itemId:'',iName:'',cName:'',peti:1,qty:'',rate:''});
+  const[draft,setDraft]=useState({itemId:'',iName:'',cName:'',dName:'',peti:1,qty:'',rate:''});
   const[swapIdx,setSwapIdx]=useState(null);
   const[swapQ,setSwapQ]=useState('');
   const[swapSi,setSwapSi]=useState(0);
@@ -2692,9 +2715,9 @@ function EditOrderModal({order,onClose,onSaved}){
   const searchItems=q=>{q=q.trim().toLowerCase();if(!q)return[];const words=q.split(/[\s,]+/).filter(Boolean);return state.items.filter(it=>it.active!==false).map(it=>{const cn=(it.customer||it.internal||'').toLowerCase();const hay=[cn,(it.internal||'').toLowerCase(),(it.cat||'').toLowerCase()].join(' ');let sc=0;for(const w of words){if(cn.includes(w))sc+=10;if(hay.includes(w))sc+=4;if(cn.startsWith(w))sc+=10;}if(cn.includes(q))sc+=15;return{it,sc};}).filter(x=>x.sc>0).sort((a,b)=>b.sc-a.sc).slice(0,8).map(x=>x.it);};
   const isugg=useMemo(()=>step==='item'?searchItems(input):[],[input,step]);
   const swapSugg=useMemo(()=>swapIdx===null?[]:searchItems(swapQ),[swapQ,swapIdx]);
-  const pickItem=it=>{const rate=selParty?getBestRate(selParty.name,it.internal||'',it.customer||'',it.sale):it.sale;setDraft({itemId:it.id,iName:it.internal||it.name||'',cName:it.customer||it.internal||'',peti:it.peti,qty:'',rate});setStep('qty');setInput('');setSi(0);};
-  const commit=()=>{const qty=parseQty(draft.qty,draft.peti);if(isNaN(qty)||qty<=0)return toast('Invalid qty','error');setLines(p=>[...p,{id:uid('EO'),itemId:draft.itemId,itemName:draft.iName,customerName:draft.cName,qty,rate:Number(draft.rate)||0,changed:true}]);setDraft({itemId:'',iName:'',cName:'',peti:1,qty:'',rate:''});setStep('item');setInput('');setSi(0);};
-  const swapItem=it=>{const i=swapIdx;if(i==null)return;const rate=selParty?getBestRate(selParty.name,it.internal||'',it.customer||'',it.sale):it.sale;setLines(p=>p.map((l,j)=>j!==i?l:{...l,itemId:it.id,itemName:it.internal||it.name||'',customerName:it.customer||it.internal||'',rate,changed:true}));setSwapIdx(null);setSwapQ('');setSwapSi(0);};
+  const pickItem=it=>{const rate=selParty?getBestRate(selParty.name,it.internal||'',it.customer||'',it.sale):it.sale;setDraft({itemId:it.id,iName:it.internal||it.name||'',cName:it.customer||it.internal||'',dName:it.dispatchName||it.internal||'',peti:it.peti,qty:'',rate});setStep('qty');setInput('');setSi(0);};
+  const commit=()=>{const qty=parseQty(draft.qty,draft.peti);if(isNaN(qty)||qty<=0)return toast('Invalid qty','error');setLines(p=>[...p,{id:uid('EO'),itemId:draft.itemId,itemName:draft.iName,customerName:draft.cName,dispatchName:draft.dName,qty,rate:Number(draft.rate)||0,changed:true}]);setDraft({itemId:'',iName:'',cName:'',dName:'',peti:1,qty:'',rate:''});setStep('item');setInput('');setSi(0);};
+  const swapItem=it=>{const i=swapIdx;if(i==null)return;const rate=selParty?getBestRate(selParty.name,it.internal||'',it.customer||'',it.sale):it.sale;setLines(p=>p.map((l,j)=>j!==i?l:{...l,itemId:it.id,itemName:it.internal||it.name||'',customerName:it.customer||it.internal||'',dispatchName:it.dispatchName||it.internal||'',rate,changed:true}));setSwapIdx(null);setSwapQ('');setSwapSi(0);};
   const onKey=e=>{if(step==='item'){if(e.key==='ArrowDown'){e.preventDefault();setSi(i=>Math.min(i+1,(isugg.length||1)-1));}if(e.key==='ArrowUp'){e.preventDefault();setSi(i=>Math.max(i-1,0));}if(e.key==='Enter'&&isugg.length){e.preventDefault();pickItem(isugg[si]||isugg[0]);}if(e.key==='Escape'){setInput('');setSi(0);}}else if(step==='qty'){if(e.key==='Enter'){e.preventDefault();if(!draft.qty)return;const q=parseQty(draft.qty,draft.peti);if(isNaN(q))return toast('Invalid qty','error');setDraft(d=>({...d,qty:String(q)}));setStep('rate');}if(e.key==='Escape'){setStep('item');setInput('');}}else if(step==='rate'){if(e.key==='Enter'){e.preventDefault();commit();}if(e.key==='Escape'){setStep('qty');}}};
   const editLine=(i,k,v)=>setLines(p=>p.map((l,j)=>j!==i?l:{...l,[k]:k==='qty'||k==='rate'?Number(v)||0:v}));
   const doSave=()=>{
@@ -2779,7 +2802,7 @@ function EditOrderModal({order,onClose,onSaved}){
                   <button onClick={()=>{setSwapIdx(null);setSwapQ('');}} style={{position:'absolute',right:-2,top:-22,background:'none',border:'none',cursor:'pointer',color:C.muted,fontSize:11}}>cancel</button>
                 </div>
                 :<div style={{display:'flex',alignItems:'center',gap:6}}>
-                  <span style={{flex:1}}>{l.customerName||l.itemName||''}</span>
+                  <span style={{flex:1}}>{l.dispatchName||l.itemName||''}</span>
                   <button onClick={()=>{setSwapIdx(i);setSwapQ('');setSwapSi(0);}} title="Swap this line to a different item" style={{background:'none',border:`1px solid ${C.bdr}`,borderRadius:5,cursor:'pointer',color:C.sub,fontSize:11,padding:'2px 6px',whiteSpace:'nowrap'}}>⇄ Change</button>
                 </div>}
             </td>
@@ -3348,7 +3371,7 @@ function PartyLedger({party,onClose}){
   // sees exactly which bills are outstanding, not just a lump total.
   const sendPaymentReminder=()=>{
     const openBills=getPartyBills(party).filter(b=>b.remaining>0.5);
-    const invoiceDetails=openBills.map(b=>'• '+fmtD(b.date)+' — '+fmt(b.remaining)+(b.overdue>0?' ('+b.overdue+'d overdue)':'')).join('\n');
+    const invoiceDetails=openBills.map(b=>'• '+fmtD(b.date)+' — '+fmt(b.remaining)+' ('+b.daysSince+'d from invoice)').join('\n');
     const msg=applyTemplate('payment',{amount:fmt(currentOD),partyName:party.name,invoiceDetails});
     const ph=party.phone;
     window.open(ph?('https://wa.me/91'+ph+'?text='+encodeURIComponent(msg)):('https://wa.me/?text='+encodeURIComponent(msg)),'_blank');
@@ -5073,8 +5096,9 @@ function Dashboard({navigate,reviewOrder,setReviewOrder,doneSale,setDoneSale}){
           <div style={{minWidth:0}}>
             <div style={{fontWeight:600,color:C.txt,fontSize:12}}>{order.partyName}</div>
             <div style={{fontSize:11,color:C.sub,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
+              {/* Pending Sales Orders board — dispatch-facing, use dispatch name (new request #1) */}
               {lines.length===1
-                ?`${lines[0].customerName||lines[0].itemName} ×${lines[0].qty} @ ${fmt(lines[0].rate)}`
+                ?`${lines[0].dispatchName||lines[0].itemName} ×${lines[0].qty} @ ${fmt(lines[0].rate)}`
                 :`${lines.length} items · ${fmt(totalAmt)}`}
             </div>
           </div>

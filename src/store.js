@@ -326,22 +326,37 @@ export function getAllVendorMetrics() {
 // weighted-average settlement date, in epoch ms.
 const msOf = dateStr => new Date((dateStr || today()) + 'T00:00:00').getTime();
 
-export function getPurchasePaidDateMap() {
+// Shared FIFO date-matcher behind getPurchasePaidDateMap/getSaleReceivedDateMap
+// below. Walks a chronological bill queue and a chronological payment stream,
+// matching each payment to the oldest open bill(s) first.
+//
+// Bug fix (found via a real party whose legacy-migrated payment history
+// includes negative entries — corrections/reversals from the pre-app ledger,
+// e.g. a bounced cheque or a data-entry correction): the original loop only
+// ever entered its `while` with a positive `remaining`, so a negative pay
+// event matched nothing and was silently dropped — it never reduced any
+// bill's matched amount. Over many entries this let the *positive-only* side
+// of the payment stream outweigh what the bills actually net out to (the
+// account-level totals, which sum payments with sign, agreed with the
+// correct net outstanding — only this per-bill FIFO walk was blind to the
+// negative entries). The excess positive total then ran the FIFO cursor all
+// the way to the end of the queue, marking even today's brand-new, entirely
+// unpaid bill as "fully matched" against old payment dates — producing a
+// negative days-to-payment / inverted interest-load for a bill that in
+// reality has zero payments against it.
+// Fix: a negative pay event now claws back previously-matched money instead
+// of being skipped, most-recently-matched bill first (LIFO), reopening the
+// forward cursor if that bill becomes open again. This keeps the per-bill
+// matched total always consistent with the signed running total, so a bill
+// can never appear more "paid" than the net cash stream actually supports.
+function fifoWeightedSettleDateMap(bills, payEvents) {
   const out = new Map();
   const todayMs = msOf(today());
-  for (const p of state.parties.filter(p => p.type === 'supplier')) {
-    const hist = SUPPLIER_HISTORY[p.name] || {};
-    const histBills = (hist.s || []).map(([d, total]) => ({ id: null, date: d, total }));
-    const newBills = state.purchases.filter(pu => pu.partyId === p.id && pu.type !== 'return')
-      .map(pu => ({ id: pu.id, date: pu.date, total: pu.total + (pu.extraChargesTotal || 0) }));
-    const payEvents = [
-      ...(hist.p || []).map(([d, amt]) => ({ date: d, amt })),
-      ...state.supplierPayments.filter(sp => sp.partyId === p.id).map(sp => ({ date: sp.date, amt: sp.amount })),
-    ].sort((a, b) => a.date.localeCompare(b.date));
-    const billQueue = [...histBills, ...newBills].sort((a, b) => a.date.localeCompare(b.date))
-      .map(b => ({ ...b, rem: b.total, weightedSum: 0, matched: 0 }));
-    let bi = 0;
-    for (const pay of payEvents) {
+  const billQueue = bills.slice().sort((a, b) => a.date.localeCompare(b.date))
+    .map(b => ({ ...b, rem: b.total, weightedSum: 0, matched: 0 }));
+  let bi = 0;
+  for (const pay of payEvents.slice().sort((a, b) => a.date.localeCompare(b.date))) {
+    if (pay.amt > 0.01) {
       let remaining = pay.amt;
       while (remaining > 0.01 && bi < billQueue.length) {
         const bill = billQueue[bi];
@@ -351,19 +366,47 @@ export function getPurchasePaidDateMap() {
         bill.rem -= applied; remaining -= applied;
         if (bill.rem <= 0.01) bi++;
       }
+    } else if (pay.amt < -0.01) {
+      let toClaw = -pay.amt;
+      let j = Math.min(bi, billQueue.length - 1);
+      while (toClaw > 0.01 && j >= 0) {
+        const bill = billQueue[j];
+        if (bill.matched > 0.01) {
+          const take = Math.min(toClaw, bill.matched);
+          bill.weightedSum -= (bill.weightedSum / bill.matched) * take; // proportional share of its weighted date
+          bill.matched -= take; bill.rem += take; toClaw -= take;
+          bi = Math.min(bi, j); // this bill (and any after it) is open again
+        }
+        j--;
+      }
     }
-    for (const bill of billQueue) {
-      if (!bill.id) continue; // only ERP purchases are traceable back to a sale's FIFO cost layer
-      if (bill.rem > 0.01) { bill.weightedSum += todayMs * bill.rem; bill.matched += bill.rem; }
-      out.set(bill.id, bill.matched > 0 ? bill.weightedSum / bill.matched : todayMs);
-    }
+  }
+  for (const bill of billQueue) {
+    if (!bill.id) continue; // only ERP bills are traceable back to a FIFO cost/sale layer
+    if (bill.rem > 0.01) { bill.weightedSum += todayMs * bill.rem; bill.matched += bill.rem; }
+    out.set(bill.id, bill.matched > 0 ? bill.weightedSum / bill.matched : todayMs);
+  }
+  return out;
+}
+
+export function getPurchasePaidDateMap() {
+  const out = new Map();
+  for (const p of state.parties.filter(p => p.type === 'supplier')) {
+    const hist = SUPPLIER_HISTORY[p.name] || {};
+    const histBills = (hist.s || []).map(([d, total]) => ({ id: null, date: d, total }));
+    const newBills = state.purchases.filter(pu => pu.partyId === p.id && pu.type !== 'return')
+      .map(pu => ({ id: pu.id, date: pu.date, total: pu.total + (pu.extraChargesTotal || 0) }));
+    const payEvents = [
+      ...(hist.p || []).map(([d, amt]) => ({ date: d, amt })),
+      ...state.supplierPayments.filter(sp => sp.partyId === p.id).map(sp => ({ date: sp.date, amt: sp.amount })),
+    ];
+    for (const [id, ms] of fifoWeightedSettleDateMap([...histBills, ...newBills], payEvents)) out.set(id, ms);
   }
   return out;
 }
 
 export function getSaleReceivedDateMap() {
   const out = new Map();
-  const todayMs = msOf(today());
   for (const p of state.parties.filter(p => p.type === 'customer')) {
     const hist = PARTY_HISTORY[p.name] || {};
     const histBills = (hist.s || []).map(([d, total]) => ({ id: null, date: d, total }));
@@ -375,26 +418,8 @@ export function getSaleReceivedDateMap() {
       // same treatment getPartyBills gives them — fed into the same FIFO
       // match as if they were a payment dated on the return itself.
       ...state.sales.filter(s => s.partyId === p.id && s.type === 'return').map(s => ({ date: s.date, amt: Math.abs(s.total) })),
-    ].sort((a, b) => a.date.localeCompare(b.date));
-    const billQueue = [...histBills, ...newBills].sort((a, b) => a.date.localeCompare(b.date))
-      .map(b => ({ ...b, rem: b.total, weightedSum: 0, matched: 0 }));
-    let bi = 0;
-    for (const pay of payEvents) {
-      let remaining = pay.amt;
-      while (remaining > 0.01 && bi < billQueue.length) {
-        const bill = billQueue[bi];
-        if (bill.rem <= 0.01) { bi++; continue; }
-        const applied = Math.min(remaining, bill.rem);
-        bill.weightedSum += msOf(pay.date) * applied; bill.matched += applied;
-        bill.rem -= applied; remaining -= applied;
-        if (bill.rem <= 0.01) bi++;
-      }
-    }
-    for (const bill of billQueue) {
-      if (!bill.id) continue; // only ERP sales get a per-sale profit row
-      if (bill.rem > 0.01) { bill.weightedSum += todayMs * bill.rem; bill.matched += bill.rem; }
-      out.set(bill.id, bill.matched > 0 ? bill.weightedSum / bill.matched : todayMs);
-    }
+    ];
+    for (const [id, ms] of fifoWeightedSettleDateMap([...histBills, ...newBills], payEvents)) out.set(id, ms);
   }
   return out;
 }
