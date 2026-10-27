@@ -1613,6 +1613,30 @@ function InvoiceModal({sale,party,onClose,viewOnly=false}){
       toast('Copy not supported here — image downloaded instead','error');
     }
   };
+  // Dispatch photos (new request #4) — uploaded on ReviewOrderModal at the
+  // moment of dispatch, ride along on sale.dispatchPhotos. Same copy-loop
+  // pattern as ShareItemModal.copyPhoto below (one image on the clipboard
+  // at a time is a hard wa.me/WhatsApp-paste limitation, not something this
+  // app can route around).
+  const dispatchPhotos=sale.dispatchPhotos||[];
+  const[dpIdx,setDpIdx]=useState(0);
+  const[dpCopying,setDpCopying]=useState(false);
+  const copyDispatchPhoto=async()=>{
+    const url=dispatchPhotos[dpIdx];
+    if(!url)return;
+    setDpCopying(true);
+    try{
+      const resp=await fetch(url);
+      const raw=await resp.blob();
+      const png=await blobToPngBlob(raw);
+      await navigator.clipboard.write([new ClipboardItem({'image/png':png})]);
+      toast(dispatchPhotos.length>1?'Dispatch photo '+(dpIdx+1)+' of '+dispatchPhotos.length+' copied — paste it, then click Next':'Dispatch photo copied — paste it in WhatsApp');
+    }catch(e){
+      toast('Could not copy this photo — try again','error');
+    }finally{
+      setDpCopying(false);
+    }
+  };
 
   useEffect(()=>{
     const onDocKey=e=>{
@@ -1666,6 +1690,20 @@ function InvoiceModal({sale,party,onClose,viewOnly=false}){
       </button>
     </div>
     <div style={{fontSize:11,color:C.muted,textAlign:'center',marginBottom:10}}>Copy the image, open WhatsApp, paste it in the chat — the text sends separately as its own message.</div>
+    {dispatchPhotos.length>0&&<div style={{background:'#F6F8FA',borderRadius:9,border:`1px solid ${C.bdr}`,padding:12,marginBottom:14}}>
+      <div style={{display:'flex',gap:8,alignItems:'center',marginBottom:8}}>
+        <img src={dispatchPhotos[dpIdx]} alt="" style={{width:52,height:52,objectFit:'cover',borderRadius:7,border:`1px solid ${C.bdr}`}}/>
+        <div>
+          <div style={{fontSize:12,fontWeight:700,color:C.txt}}>Dispatch Photo{dispatchPhotos.length>1?'s':''}</div>
+          {dispatchPhotos.length>1&&<div style={{fontSize:11,color:C.sub}}>Photo {dpIdx+1} of {dispatchPhotos.length}</div>}
+        </div>
+      </div>
+      <div style={{display:'flex',gap:8}}>
+        <Btn onClick={copyDispatchPhoto} disabled={dpCopying} variant="secondary" size="sm">🖼️ {dpCopying?'Copying…':'Copy this photo'}</Btn>
+        {dispatchPhotos.length>1&&<Btn onClick={()=>setDpIdx(i=>(i+1)%dispatchPhotos.length)} variant="ghost" size="sm">Next photo →</Btn>}
+      </div>
+      <div style={{fontSize:11,color:C.muted,marginTop:6}}>Copy, paste in the WhatsApp chat, then come back for the next one if there's more than one.</div>
+    </div>}
     <div style={{textAlign:'center',marginBottom:6}}>
       <button onClick={downloadImage} disabled={!shareFile} style={{background:'none',border:'none',cursor:shareFile?'pointer':'default',fontSize:11,color:C.muted,textDecoration:'underline',fontFamily:'inherit'}}>
         …or download the image instead
@@ -2204,22 +2242,57 @@ function DispatchPreviewModal({order,onClose}){
 function ReviewOrderModal({order,onClose,onSaved}){
   const[lines,setLines]=useState(()=>(order.items||[]).map(l=>({...l,orderedQty:l.qty})));
   const{toast,TC}=useToast();
+  // Transport/freight charge recoverable from the buyer (new request #1) —
+  // the order was created with a freight mode/amount already (set once in
+  // SaleEntry), but the actual amount is often only known for sure at
+  // dispatch time (that's when the transporter is actually booked), so
+  // this re-exposes the same fMode/fAmt/fAddToInv controls here, editable,
+  // seeded from whatever was set on the order. Mirrors SaleEntry's
+  // freightLine pattern exactly: when mode is 'paid' and "add to invoice"
+  // is checked, it becomes a billable "Freight" line on the invoice.
+  const[fMode,setFMode]=useState(order.freightMode||'');
+  const[fAmt,setFAmt]=useState(String(order.freightAmt||''));
+  const[fAddToInv,setFAddToInv]=useState(!!order.freightAddToInv);
+  // Dispatch photos (new request #4) — reuses the exact same Supabase
+  // Storage upload helper already built for Catalogue photos (DB.uploadPhoto),
+  // just keyed under the order id instead of an item id. Stored on the sale
+  // once invoiced (sale.dispatchPhotos) so InvoiceModal's WhatsApp-send step
+  // can offer them in its clipboard copy-loop alongside the invoice image.
+  const[dispatchPhotos,setDispatchPhotos]=useState([]);
+  const[uploading,setUploading]=useState(false);
+  const addPhotos=async e=>{
+    const files=Array.from(e.target.files||[]);
+    e.target.value='';
+    if(!files.length)return;
+    setUploading(true);
+    try{
+      const urls=[];
+      for(const f of files){ urls.push(await DB.uploadPhoto(f,order.id)); }
+      setDispatchPhotos(p=>[...p,...urls]);
+    }catch(err){
+      toast('Photo upload failed: '+(err?.message||err),'error');
+    }finally{
+      setUploading(false);
+    }
+  };
+  const removePhoto=url=>{ setDispatchPhotos(p=>p.filter(u=>u!==url)); DB.deletePhoto(url); };
   const editLine=(i,k,v)=>setLines(p=>p.map((l,j)=>{
     if(j!==i)return l;
     if(k==='qty'){ const q=Math.max(0,Math.min(Number(v)||0,l.orderedQty)); return {...l,qty:q}; }
     return {...l,[k]:Number(v)||0};
   }));
-  const total=lines.reduce((s,l)=>s+(l.qty*l.rate),0);
+  const freightLine=useMemo(()=>fMode==='paid'&&fAddToInv&&Number(fAmt)>0?[{id:'__freight',itemName:'Freight',customerName:'Freight',peti:1,qty:1,rate:Number(fAmt)}]:[],[fMode,fAddToInv,fAmt]);
+  const total=lines.reduce((s,l)=>s+(l.qty*l.rate),0)+freightLine.reduce((s,l)=>s+l.rate,0);
   const anyPartial=lines.some(l=>l.qty<l.orderedQty);
   const doCreateInvoice=()=>{
     const dispatchedLines=lines.filter(l=>(l.qty||0)>0);
     if(!dispatchedLines.length)return toast('Enter a qty to dispatch for at least one item','error');
     const id=uid('SAL');
-    const allItems=dispatchedLines.map(l=>({itemId:l.itemId,itemName:l.itemName,customerName:l.customerName,dispatchName:l.dispatchName,qty:l.qty,rate:l.rate,amount:l.qty*l.rate,warranty:l.warranty,bundledJaali:l.bundledJaali}));
+    const allItems=[...dispatchedLines,...freightLine].map(l=>({itemId:l.itemId,itemName:l.itemName,customerName:l.customerName,dispatchName:l.dispatchName,qty:l.qty,rate:l.rate,amount:l.qty*l.rate,warranty:l.warranty,bundledJaali:l.bundledJaali}));
     const invTotal=allItems.reduce((s,l)=>s+l.amount,0);
     const sale={id,date:today(),partyId:order.partyId,partyName:order.partyName,transport:order.transport,bilty:order.bilty,
-      freightMode:order.freightMode,freightAmt:order.freightAmt,freightAddToInv:order.freightAddToInv,creditDays:order.creditDays,
-      items:allItems,total:invTotal,orderId:order.id,createdAt:new Date().toISOString()};
+      freightMode:fMode,freightAmt:Number(fAmt)||0,freightAddToInv:fAddToInv,creditDays:order.creditDays,
+      items:allItems,total:invTotal,orderId:order.id,dispatchPhotos,createdAt:new Date().toISOString()};
     state.sales=[sale,...state.sales];save.sales();
     dispatchedLines.forEach(l=>adjustStock(l.itemId,-l.qty));
     const remainingItems=lines.map(l=>({itemId:l.itemId,itemName:l.itemName,customerName:l.customerName,dispatchName:l.dispatchName,
@@ -2263,12 +2336,55 @@ function ReviewOrderModal({order,onClose,onSaved}){
           <td style={{padding:'7px 12px',textAlign:'right'}}><input value={l.rate} onChange={e=>editLine(i,'rate',e.target.value)} type="number" style={{width:75,padding:'3px 7px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:12,textAlign:'right',outline:'none',fontFamily:'inherit'}}/></td>
           <td style={{padding:'7px 12px',textAlign:'right',fontWeight:700,color:C.blue}}>{fmt(l.qty*l.rate)}</td>
         </tr>)}
+        {freightLine.map(l=><tr key={l.id} style={{borderBottom:`1px solid ${C.bdr}`}}>
+          <td style={{padding:'7px 12px',fontWeight:600,color:C.sub}}>{l.itemName}</td>
+          <td style={{padding:'7px 12px',textAlign:'right',color:C.muted}}>—</td>
+          <td style={{padding:'7px 12px',textAlign:'right',color:C.muted}}>—</td>
+          <td style={{padding:'7px 12px',textAlign:'right',color:C.sub}}>{fmt(l.rate)}</td>
+          <td style={{padding:'7px 12px',textAlign:'right',fontWeight:700,color:C.blue}}>{fmt(l.rate)}</td>
+        </tr>)}
       </tbody>
       <tfoot><tr style={{background:'#F6F8FA'}}>
         <td colSpan={4} style={{padding:'9px 12px',fontWeight:700,textAlign:'right',color:C.txt}}>TOTAL (dispatching now)</td>
         <td style={{padding:'9px 12px',textAlign:'right',fontSize:16,fontWeight:800,color:C.blue}}>{fmt(total)}</td>
       </tr></tfoot>
     </table>
+    {/* Transport charge recoverable from the buyer (new request #1) — same
+        fMode/fAmt/fAddToInv controls as SaleEntry, editable here at the
+        actual moment of dispatch (when the real transporter/charge is
+        known), seeded from whatever was set when the order was created. */}
+    <div style={{marginBottom:14}}>
+      <label style={{fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,display:'block',marginBottom:6}}>Transport / Freight Charge</label>
+      <div style={{display:'flex',gap:6,alignItems:'center',flexWrap:'wrap'}}>
+        {[['topay','To Pay by party'],['','Not applicable'],['paid','Paid by us']].map(([val,lbl])=>(
+          <button key={val} onClick={()=>{setFMode(val);if(val!=='paid')setFAddToInv(false);}} style={{padding:'5px 13px',borderRadius:20,fontSize:12,fontWeight:600,cursor:'pointer',fontFamily:'inherit',border:`1.5px solid ${fMode===val?C.blue:C.bdr}`,background:fMode===val?C.blueSoft:'transparent',color:fMode===val?C.blue:C.sub}}>{lbl}</button>
+        ))}
+        {fMode==='paid'&&<>
+          <input value={fAmt} onChange={e=>setFAmt(e.target.value)} type="number" placeholder="Rs amount" autoComplete="off"
+            style={{width:90,padding:'5px 10px',borderRadius:7,border:`1.5px solid ${C.bdr}`,fontSize:12,outline:'none',fontFamily:'inherit'}}/>
+          <label style={{display:'flex',alignItems:'center',gap:5,fontSize:12,color:C.txt,cursor:'pointer'}}>
+            <input type="checkbox" checked={fAddToInv} onChange={e=>setFAddToInv(e.target.checked)}/>Recover from buyer (add to invoice)
+          </label>
+        </>}
+      </div>
+    </div>
+    {/* Dispatch photos (new request #4) — uploaded here, ride along on the
+        sale record, offered in InvoiceModal's WhatsApp-send step right
+        after this invoice is created (App() already auto-opens InvoiceModal
+        via doneSale once onSaved fires below). */}
+    <div style={{marginBottom:14}}>
+      <label style={{fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,display:'block',marginBottom:6}}>Dispatch Photos <span style={{fontWeight:400,color:C.muted,textTransform:'none',letterSpacing:0}}>— optional, shared with the invoice on WhatsApp</span></label>
+      <div style={{display:'flex',gap:8,flexWrap:'wrap',alignItems:'center'}}>
+        {dispatchPhotos.map(url=><div key={url} style={{position:'relative'}}>
+          <img src={url} alt="" style={{width:52,height:52,objectFit:'cover',borderRadius:7,border:`1px solid ${C.bdr}`}}/>
+          <button onClick={()=>removePhoto(url)} title="Remove" style={{position:'absolute',top:-6,right:-6,width:18,height:18,borderRadius:9,border:'none',background:C.red,color:'#fff',fontSize:11,lineHeight:1,cursor:'pointer',fontFamily:'inherit'}}>×</button>
+        </div>)}
+        <label style={{width:52,height:52,display:'flex',alignItems:'center',justifyContent:'center',borderRadius:7,border:`1.5px dashed ${C.bdr}`,cursor:uploading?'default':'pointer',fontSize:18,color:C.sub}}>
+          {uploading?'…':'＋'}
+          <input type="file" accept="image/*" multiple onChange={addPhotos} disabled={uploading} style={{display:'none'}}/>
+        </label>
+      </div>
+    </div>
     {anyPartial&&<div style={{padding:'8px 12px',borderRadius:7,background:C.amberSoft,color:C.amber,fontSize:12,fontWeight:600,marginBottom:10}}>This is a partial dispatch — the undispatched remainder will stay on this Sales Order as "Pending" for next time.</div>}
     <div style={{fontSize:11,color:C.muted,marginBottom:10}}>Press Enter to create the invoice, Esc to cancel.</div>
     <div style={{display:'flex',justifyContent:'flex-end',gap:8}}>
@@ -3224,6 +3340,19 @@ function PartyLedger({party,onClose}){
     return getAllCustomerMetrics().find(m=>m.party.id===party.id);
   },[party.id,isSupplier,isTransporterParty,state.sales.length,state.payments.length,state.purchases.length,state.supplierPayments.length]);
 
+  // Payment reminder (new request #5) — reuses the existing DEFAULT_TEMPLATES.payment
+  // template (already defined in store.js, previously unused anywhere) via the
+  // same applyTemplate() substitution every other WhatsApp message in this app
+  // goes through. invoiceDetails lists each still-open bill from getPartyBills
+  // (the same FIFO bill queue the Accounts payment picker uses), so the party
+  // sees exactly which bills are outstanding, not just a lump total.
+  const sendPaymentReminder=()=>{
+    const openBills=getPartyBills(party).filter(b=>b.remaining>0.5);
+    const invoiceDetails=openBills.map(b=>'• '+fmtD(b.date)+' — '+fmt(b.remaining)+(b.overdue>0?' ('+b.overdue+'d overdue)':'')).join('\n');
+    const msg=applyTemplate('payment',{amount:fmt(currentOD),partyName:party.name,invoiceDetails});
+    const ph=party.phone;
+    window.open(ph?('https://wa.me/91'+ph+'?text='+encodeURIComponent(msg)):('https://wa.me/?text='+encodeURIComponent(msg)),'_blank');
+  };
   const typeMeta={sale:{label:'Sale',color:C.blue,badge:'blue'},purchase:{label:'Purchase',color:C.blue,badge:'blue'},freight:{label:'Freight',color:C.blue,badge:'blue'},return:{label:'Return',color:C.amber,badge:'amber'},payment:{label:'Payment',color:C.green,badge:'green'}};
   const typeLabel={sale:'Sale',purchase:'Purchase',return:'Return',freight:'Freight'};
   const gradeColor={A:C.green,B:C.blue,C:C.amber,D:C.red};
@@ -3407,6 +3536,8 @@ function PartyLedger({party,onClose}){
       <div>
         <div style={{fontSize:11,color:C.sub,textTransform:'uppercase',letterSpacing:.5}}>{currentOD<0?'In Credit':(isSupplier||isTransporterParty)?'Current Payable':'Current Outstanding'}</div>
         <div style={{fontSize:28,fontWeight:800,color:currentOD>0?C.red:C.green,fontVariantNumeric:'tabular-nums'}}>{currentOD<0?'−':''}{fmt(Math.abs(currentOD))}</div>
+        {!isSupplier&&!isTransporterParty&&currentOD>0&&
+          <button onClick={sendPaymentReminder} style={{marginTop:6,display:'flex',alignItems:'center',gap:6,padding:'5px 12px',borderRadius:7,border:'none',background:'#25D366',color:'#fff',cursor:'pointer',fontSize:11,fontWeight:700,fontFamily:'inherit'}}>📲 Send Payment Reminder</button>}
       </div>
       <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8,textAlign:'right'}}>
         <div><div style={{fontSize:10,color:C.sub}}>{isSupplier?'Total Purchased':isTransporterParty?'Total Freight':'Total Sold'}</div><div style={{fontWeight:700,color:C.txt}}>{fmt(totalSold)}</div></div>
@@ -4860,6 +4991,27 @@ function Dashboard({navigate}){
   // getExpensesInRange in store.js) to show what's actually left.
   const monthBizExpenses=useMemo(()=>getExpensesInRange(today().slice(0,7)+'-01',today()).business,[state.txns.length,state.customCategories.length,_fvD]);
   const netOfExpenses=monthProfit.profit-monthBizExpenses;
+  // Finance tiles (new request) — Total Receivables / Receivables Due /
+  // Total Payables / Total Stock Value. Receivables+Payables reuse
+  // getBalanceSheet()'s existing per-party sums (which in turn already
+  // benefit from the just-fixed "liability only counts once received"
+  // gate in getSupplierBal). "Due" narrows Receivables down to the
+  // actually-overdue portion (party.credit days elapsed), via each
+  // customer's getPartyBills() per-bill `overdue` flag — a plain
+  // "outstanding" figure already exists elsewhere (Top Outstanding card),
+  // so this tile is specifically the collections-priority subset of it.
+  // Stock value here is deliberately selling-price basis (item.sale), not
+  // the cost-basis figure getBalanceSheet().inventoryValue already uses
+  // elsewhere — a different, non-cost-sensitive number so Staff can see it.
+  const financeTiles=useMemo(()=>{
+    const bs=getBalanceSheet();
+    let due=0;
+    for(const p of customers){
+      due+=getPartyBills(p).filter(b=>b.remaining>0.5&&b.overdue>0).reduce((s,b)=>s+b.remaining,0);
+    }
+    const stockValueAtSale=state.items.filter(it=>it.active!==false).reduce((s,it)=>s+(it.stock||0)*(it.sale||0),0);
+    return {receivables:bs.receivables,due,payables:bs.payables,stockValueAtSale};
+  },[state.sales.length,state.payments.length,state.purchases.length,state.freightCharges.length,state.supplierPayments.length,state.items.length,_fvD]);
   const hideOOS=id=>{hideFromDashboardOOS(id);forceUpdate();};
   const unhideOOS=id=>{unhideFromDashboardOOS(id);forceUpdate();};
   const followupsDue=state.followups.filter(f=>f.status==='open'&&f.followUpDate&&f.followUpDate<=t).sort((a,b)=>a.followUpDate.localeCompare(b.followUpDate));
@@ -5102,6 +5254,16 @@ function Dashboard({navigate}){
       {role==='owner'&&<StatCard label="Profit This Month" value={fmtL(monthProfit.profit)} sub={monthProfit.qty?`${monthProfit.qty} pcs · FIFO landed cost`:'No sales yet'} color={monthProfit.profit>=0?C.green:C.red} icon="💰"/>}
       {role==='owner'&&<StatCard label="Net of Business Expenses" value={fmtL(netOfExpenses)} sub={monthBizExpenses?`− ${fmtL(monthBizExpenses)} business expenses`:'No expenses booked'} color={netOfExpenses>=0?C.green:C.red} icon="🧮" onClick={()=>navigate('profit')}/>}
       <StatCard label="Pending Sale Orders" value={String(pendingOrdersCount)} sub={pendingOrdersCount?'Awaiting dispatch':'All clear'} color={pendingOrdersCount>0?C.amber:C.green} icon="📲" onClick={()=>navigate('orders')}/>
+    </div>
+    {/* Finance tiles — Total Receivables / Receivables Due / Total Payables
+        (owner-only, same gate as Accounts/Profit — it's a purchase-cost-
+        adjacent liability figure) / Total Stock Value at selling price
+        (not cost, so visible to Staff too, same as item.sale already is). */}
+    <div style={{display:'grid',gridTemplateColumns:mobile?'repeat(2,1fr)':'repeat(auto-fit,minmax(175px,1fr))',gap:mobile?10:12,marginBottom:18}}>
+      <StatCard label="Total Receivables" value={fmtL(financeTiles.receivables)} sub="Outstanding from customers" color={C.blue} icon="📥" onClick={()=>navigate('outstanding')}/>
+      <StatCard label="Receivables Due" value={fmtL(financeTiles.due)} sub={financeTiles.due>0?'Past credit terms':'Nothing overdue ✓'} color={financeTiles.due>0?C.red:C.green} icon="⏰" onClick={()=>navigate('outstanding')}/>
+      {role==='owner'&&<StatCard label="Total Payables" value={fmtL(financeTiles.payables)} sub="Owed to suppliers/transporters" color={C.amber} icon="📤"/>}
+      <StatCard label="Stock Value (Selling Price)" value={fmtL(financeTiles.stockValueAtSale)} sub="Current stock × sale rate" color={C.purple} icon="📦" onClick={()=>navigate('items')}/>
     </div>
     {reorderEditorOpen&&<ReorderLevelEditorModal onClose={()=>{setReorderEditorOpen(false);forceUpdate();}}/>}
     {mobile

@@ -103,14 +103,21 @@ export function getAccBal(accId) {
   return bal;
 }
 
+// A booked-but-not-yet-received purchase (p.receivedDate still blank) isn't
+// a real liability yet — nothing physically changed hands, so it shouldn't
+// inflate what's "owed" to the supplier or transporter until the material
+// actually arrives and receivedDate gets set (the same signal adjustStock
+// already keys off). A return always has receivedDate stamped at the moment
+// it's recorded (see the return-entry flow), so it's unaffected by this gate.
+function isPurchaseReceived(p) { return !!p.receivedDate; }
 export function getSupplierBal(partyId) {
   const party = state.parties.find(p => p.id === partyId);
   if (!party) return 0;
   // p.extraChargesTotal (loading/packing/octroi etc. named on the purchase
   // itself, billed by the same supplier) is owed to this same party, unlike
   // freight which is owed to a separate transporter — so it rolls in here.
-  const purch   = state.purchases.filter(p => p.partyId === partyId).reduce((s,p) => s + p.total + (p.extraChargesTotal||0), 0);
-  const freight = state.freightCharges.filter(f => f.transporterId === partyId).reduce((s,f) => s + f.amount, 0);
+  const purch   = state.purchases.filter(p => p.partyId === partyId && isPurchaseReceived(p)).reduce((s,p) => s + p.total + (p.extraChargesTotal||0), 0);
+  const freight = state.freightCharges.filter(f => f.transporterId === partyId && isPurchaseReceived(state.purchases.find(p => p.id === f.purchaseId) || {})).reduce((s,f) => s + f.amount, 0);
   const paid    = state.supplierPayments.filter(p => p.partyId === partyId).reduce((s,p) => s + p.amount, 0);
   return (party.ob || 0) + purch + freight - paid;
 }
@@ -175,11 +182,11 @@ export function getSupplierBills(party) {
   if (!party) return [];
   const isTransporterParty = party.type === 'transporter';
   const rawBills = isTransporterParty
-    ? state.freightCharges.filter(f => f.transporterId === party.id).map(f => ({
+    ? state.freightCharges.filter(f => f.transporterId === party.id && isPurchaseReceived(state.purchases.find(p => p.id === f.purchaseId) || {})).map(f => ({
         date: f.date, total: f.amount, orig: f.amount,
         items: f.notes || 'Freight', isNew: true,
       }))
-    : state.purchases.filter(p => p.partyId === party.id && p.type !== 'return').map(p => ({
+    : state.purchases.filter(p => p.partyId === party.id && p.type !== 'return' && isPurchaseReceived(p)).map(p => ({
         date: p.date, total: p.total + (p.extraChargesTotal||0), orig: p.total + (p.extraChargesTotal||0),
         items: [(p.items||[]).slice(0,3).map(x => (x.supplierName||x.itemName)+' ×'+x.qty).join(', ') || 'Purchase',
           ...((p.extraCharges||[]).map(c => c.name+' ₹'+c.amount))].join(' · '),
