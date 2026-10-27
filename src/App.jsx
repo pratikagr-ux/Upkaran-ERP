@@ -2267,10 +2267,14 @@ function ReviewOrderModal({order,onClose,onSaved}){
 }
 
 // ── NEW ORDER MODULE ──────────────────────────────────────────────────────────
-function OrdersModule({navigate}){
-  const[dispatchOrder,setDispatchOrder]=useState(null);
-  const[reviewOrder,setReviewOrder]=useState(null);
-  const[doneSale,setDoneSale]=useState(null);
+function OrdersModule({navigate,dispatchOrder,setDispatchOrder,reviewOrder,setReviewOrder,doneSale,setDoneSale}){
+  // dispatchOrder/reviewOrder/doneSale are now owned by App() and passed in
+  // as props (see App() for why: a save.orders() call in openReview/onSaved
+  // below triggers a forced remount of this whole module via the live-tick
+  // key, which used to wipe whatever local state we'd just set in the same
+  // handler — e.g. "Send to Dispatch" never showing the just-created
+  // order's transport line, because the modal holding it got discarded
+  // before it ever painted).
   const[editOrder,setEditOrder]=useState(null);
   const[linkCtx,setLinkCtx]=useState(null); // {orderId,itemIdx,itemId,itemName}
   const[_fv,_setFv]=useState(0); const forceUpdate=()=>_setFv(v=>v+1);
@@ -2334,10 +2338,10 @@ function OrdersModule({navigate}){
       </div>
     </div>}
 
-    {dispatchOrder&&<DispatchPreviewModal order={dispatchOrder} onClose={()=>{setDispatchOrder(null);forceUpdate();}}/>}
+    {/* dispatchOrder/reviewOrder/doneSale modals render at the App() level now
+        — see this module's top-of-function comment — so they're not shown
+        here even though their triggers (above) still live in this module. */}
     {editOrder&&<EditOrderModal order={editOrder} onClose={()=>setEditOrder(null)} onSaved={()=>{setEditOrder(null);forceUpdate();}}/>}
-    {reviewOrder&&<ReviewOrderModal order={reviewOrder} onClose={()=>setReviewOrder(null)} onSaved={sale=>{setReviewOrder(null);forceUpdate();setDoneSale(sale);}}/>}
-    {doneSale&&<InvoiceModal sale={doneSale} party={state.parties.find(p=>p.id===doneSale.partyId)||{name:doneSale.partyName,phone:''}} onClose={()=>setDoneSale(null)}/>}
     {linkCtx&&<LinkPurchaseOrderModal itemId={linkCtx.itemId} itemName={linkCtx.itemName}
       onPick={poId=>linkPo(linkCtx.orderId,linkCtx.itemIdx,poId)}
       onClose={()=>setLinkCtx(null)}
@@ -8807,6 +8811,22 @@ function App(){
   const[liveTick,setLiveTick]=useState(0);
   useEffect(()=>subscribeLive(()=>setLiveTick(t=>t+1)),[]);
 
+  // Lifted out of OrdersModule on purpose: a handler that calls save.orders()
+  // (e.g. finishing a new Sales Order, or marking one Dispatched) and then
+  // opens a result modal in the SAME handler — setDispatchOrder/setReviewOrder/
+  // setDoneSale right after save.orders() — used to lose that modal, because
+  // save.orders() calls notifyLive() -> bumps liveTick right here in App() ->
+  // changes the key on the <div> below -> React discards the OrdersModule
+  // instance that was mid-handler and mounts a brand-new one with fresh
+  // (null) state, dropping the just-set "show this modal" update along with
+  // it. Holding this state in App() instead means it survives that remount
+  // (App() itself never remounts — only the keyed child div does), so the
+  // modal shows up like it should. See OrdersModule below, which now takes
+  // these as props instead of owning them locally.
+  const[dispatchOrder,setDispatchOrder]=useState(null);
+  const[reviewOrder,setReviewOrder]=useState(null);
+  const[doneSale,setDoneSale]=useState(null);
+
   // useRole() must be called unconditionally, on every render, before any
   // early return below — it calls useState/useEffect internally, so calling
   // it only AFTER the authed/ready gates (as it used to be) meant App()
@@ -8832,7 +8852,10 @@ function App(){
     switch(mod){
       case'dashboard': return <Dashboard navigate={nav}/>;
       case'sale':      return <SaleEntry/>;
-      case'orders':    return <OrdersModule navigate={nav}/>;
+      case'orders':    return <OrdersModule navigate={nav}
+        dispatchOrder={dispatchOrder} setDispatchOrder={setDispatchOrder}
+        reviewOrder={reviewOrder} setReviewOrder={setReviewOrder}
+        doneSale={doneSale} setDoneSale={setDoneSale}/>;
       case'outstanding':return <Outstanding/>;
       case'parties':   return <PartyMasters/>;
       case'items':     return <ItemMasters/>;
@@ -8953,6 +8976,14 @@ function App(){
         </a>;
       })}
     </div>}
+
+    {/* Rendered here (outside the key={mod+'#'+liveTick} div above) so a
+        save.orders() call made while opening one of these doesn't wipe it
+        out from under itself — see the comment by their state declarations
+        above. */}
+    {dispatchOrder&&<DispatchPreviewModal order={dispatchOrder} onClose={()=>setDispatchOrder(null)}/>}
+    {reviewOrder&&<ReviewOrderModal order={reviewOrder} onClose={()=>setReviewOrder(null)} onSaved={sale=>{setReviewOrder(null);setDoneSale(sale);}}/>}
+    {doneSale&&<InvoiceModal sale={doneSale} party={state.parties.find(p=>p.id===doneSale.partyId)||{name:doneSale.partyName,phone:''}} onClose={()=>setDoneSale(null)}/>}
   </div>;
 }
 
