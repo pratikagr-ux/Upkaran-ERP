@@ -260,6 +260,18 @@ function markPurchaseReceived(id) {
 // every sales-order line waiting on that PO with no separate sync step.
 function computeOrderLineStatus(line) {
   if (line.availability !== 'outOfStock') return { label:'Available', color:'gray' };
+  // Check real current stock first. markPurchaseReceived() already calls
+  // adjustStock() to put the item back in stock the moment a PO is marked
+  // Received — but the auto-detect fallback below only searches *open*
+  // (not-yet-received) purchases, so the instant the one relevant PO flips
+  // to 'received' it drops out of that search and this line fell back to
+  // "Out of Stock" again even though the stock was actually sitting right
+  // there. Checking state.items directly sidesteps that (and also covers
+  // stock coming back via some other route entirely — a different PO, a
+  // stock adjustment/reconciliation, etc. — not just the one we'd have
+  // auto-detected or linked).
+  const it = line.itemId ? state.items.find(x => x.id === line.itemId) : null;
+  if (it && (it.stock||0) >= (line.qty||0)) return { label:'Available', color:'green' };
   let po = line.linkedPoId ? state.purchases.find(p => p.id === line.linkedPoId) : null;
   if (!po) {
     // No explicit link yet — auto-detect: if a supplier already has an open
