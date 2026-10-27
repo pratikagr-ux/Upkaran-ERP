@@ -286,7 +286,7 @@ export const DB = {
     // replaces the existing notification without re-alerting (no sound) by
     // default, which would look exactly like "nothing happened".
     navigator.serviceWorker.ready.then(reg => reg.showNotification(title, {
-      body, icon: 'icon-192.png', badge: 'icon-192.png', vibrate: [200, 100, 200], tag: `${title}-${Date.now()}`,
+      body, icon: 'icon-192-v2.png', badge: 'icon-192-v2.png', vibrate: [200, 100, 200], tag: `${title}-${Date.now()}`,
     })).catch(e => console.warn('[notify] showNotification failed', e?.message || e));
   },
 
@@ -296,7 +296,7 @@ export const DB = {
     const reg = await navigator.serviceWorker.ready;
     await reg.showNotification('Upkaran ERP', {
       body: 'Test alert — if you heard/saw this, sound notifications are working on this device.',
-      icon: 'icon-192.png',
+      icon: 'icon-192-v2.png',
       vibrate: [200, 100, 200],
       tag: `test-${Date.now()}`,
     });

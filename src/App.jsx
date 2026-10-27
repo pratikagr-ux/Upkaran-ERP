@@ -9096,7 +9096,7 @@ function App(){
         {/* Logo */}
         <div style={{height:52,display:'flex',alignItems:'center',padding:'0 13px',
           gap:10,justifyContent:sideOpen?'flex-start':'center',borderBottom:'1px solid #1a2035',flexShrink:0}}>
-          <img src={`${import.meta.env.BASE_URL}icon-192.png`} alt="Upkaran" width={30} height={30}
+          <img src={`${import.meta.env.BASE_URL}icon-192-v2.png`} alt="Upkaran" width={30} height={30}
             style={{borderRadius:8,flexShrink:0,cursor:'pointer',objectFit:'cover'}}
             onClick={()=>setSideOpen(o=>!o)}/>
           {sideOpen&&<div>
