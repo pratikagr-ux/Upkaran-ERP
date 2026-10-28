@@ -105,4 +105,5 @@ export const TXN_CATEGORIES = [
 export const TAG_COLORS = {
   promise: '#2563EB', paid: '#059669', unavailable: '#D97706',
   'no-answer': '#4B5563', dispute: '#DC2626', note: '#7C3AED',
+  'sales-followup': '#0D9488',
 };

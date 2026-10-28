@@ -130,6 +130,18 @@ export function getCustomerBal(partyId) {
   return (party.ob || 0) + sales - paid;
 }
 
+// For a party.type==='both' (a party we both buy from and sell to), the business
+// wants ONE ledger with ONE combined balance, not a receivable and a payable
+// tracked side by side — this is that single net figure. Positive = party owes
+// us (net receivable); negative = we owe the party (net payable). For a plain
+// customer, getSupplierBal is 0 (no purchases/freight/payments tied to that
+// partyId), so this collapses to getCustomerBal unchanged — and symmetrically
+// for a plain supplier/transporter — so it's safe to use as a drop-in anywhere
+// a single "how much is outstanding with this party" figure is needed.
+export function getPartyNetBal(partyId) {
+  return getCustomerBal(partyId) - getSupplierBal(partyId);
+}
+
 // FIFO bill queue for a customer: historical PARTY_INVOICES rows + new ERP sales,
 // oldest-first, with all-time ERP payments (and return credits) consumed against
 // the oldest outstanding bill first. `party.ob` for a party is the rolled-up sum of
@@ -1208,8 +1220,14 @@ export function getBalanceSheet() {
   const cash = ACCOUNTS.reduce((s, a) => s + getAccBal(a.id), 0);
   const fifoMap = getFifoStockMap();
   const inventoryValue = state.items.filter(it => it.active !== false).reduce((s, it) => s + (fifoMap[it.id] ? fifoMap[it.id].value : ((it.stock || 0) * (it.purch || 0))), 0);
-  const receivables = state.parties.filter(p => p.type === 'customer').reduce((s, p) => { const od = getCustomerBal(p.id); return s + (od > 0 ? od : 0); }, 0);
-  const payables = state.parties.filter(p => p.type === 'supplier' || p.type === 'transporter').reduce((s, p) => { const bal = getSupplierBal(p.id); return s + (bal > 0 ? bal : 0); }, 0);
+  // 'both'-type parties (buy from AND sell to) get ONE netted balance
+  // (getPartyNetBal) folded into whichever side it currently sits on, instead
+  // of being excluded entirely (the old filters only matched 'customer' /
+  // 'supplier'|'transporter', silently dropping 'both' parties from both
+  // totals). getPartyNetBal collapses to getCustomerBal/getSupplierBal
+  // unchanged for non-'both' parties, so this is purely additive.
+  const receivables = state.parties.filter(p => p.type === 'customer' || p.type === 'both').reduce((s, p) => { const net = getPartyNetBal(p.id); return s + (net > 0 ? net : 0); }, 0);
+  const payables = state.parties.filter(p => p.type === 'supplier' || p.type === 'transporter' || p.type === 'both').reduce((s, p) => { const net = getPartyNetBal(p.id); return s + (net < 0 ? -net : 0); }, 0);
   const assets = cash + inventoryValue + receivables;
   const equity = assets - payables;
   return { cash, inventoryValue, receivables, assets, payables, equity };
@@ -1223,6 +1241,21 @@ export function getBestPurchRate(supplierName, itemId, def) {
     if (line && (!best || p.date > best.date)) best = { date: p.date, rate: line.rate };
   }
   return best ? best.rate : (def || 0);
+}
+
+// Items have no fixed supplier link (purchase rate is looked up per
+// supplier+item from past purchases via getBestPurchRate above) — this finds
+// whoever MOST RECENTLY sold this item to us, so the Dashboard reorder
+// list's "Place Order" button (request #5) has a sensible default supplier
+// to prefill instead of leaving the purchase form's required field blank.
+export function getLastSupplierForItem(itemId) {
+  let best = null;
+  for (const p of state.purchases) {
+    if (!p.partyId) continue;
+    const line = (p.items || []).find(l => l.itemId === itemId);
+    if (line && (!best || p.date > best.date)) best = { date: p.date, partyId: p.partyId, partyName: p.partyName, rate: line.rate };
+  }
+  return best;
 }
 
 // Expected inventory: qty from purchases that have been booked (ordered) but
@@ -1562,6 +1595,11 @@ export const state = {
   // cluttering the board right now (e.g. a discontinued line they're not
   // reordering). Toggled back on from the same card's "Hidden (n)" sub-view.
   dashboardHiddenOOS: [],
+  // Party ids permanently excluded from the Sales Follow-up module's queue
+  // (request #2's "Hide" action) — distinct from the date-based snooze
+  // (an open followups entry with a future followUpDate), which just skips
+  // a customer until that date; this is "never surface this one again".
+  salesFollowupHidden: [],
   // Owner/Staff role mapping, keyed by signed-in Supabase auth email — see
   // computeRole()/useRole() in App.jsx. NOT a persisted-at-boot "current
   // user" field: currentUserEmail below is runtime-only, set fresh from
@@ -1602,6 +1640,7 @@ export const save = {
   stockReconciliations: mk('data:stockReconciliations', () => state.stockReconciliations),
   users:            mk('data:users',            () => state.users),
   dashboardHiddenOOS: mk('data:dashboardHiddenOOS', () => state.dashboardHiddenOOS),
+  salesFollowupHidden: mk('data:salesFollowupHidden', () => state.salesFollowupHidden),
 };
 
 // ── Dashboard: Out of Stock hide/unhide (request #4) ────────────────────────
@@ -1613,6 +1652,62 @@ export function hideFromDashboardOOS(itemId) {
 export function unhideFromDashboardOOS(itemId) {
   state.dashboardHiddenOOS = state.dashboardHiddenOOS.filter(id => id !== itemId);
   save.dashboardHiddenOOS();
+}
+
+// ── Sales Follow-up module (request #2) ─────────────────────────────────────
+// Customers who haven't bought anything in 30+ days, as a rotating outreach
+// queue: "rotating" means once a follow-up date is set for a customer
+// (Set Follow-up Date, Skip, or a parsed free-text response — all three
+// write the same `type:'sales'` followups entry), they drop out of the
+// queue entirely until that date, then resurface ranked ABOVE everyone else
+// (earliest-due first), rather than being re-ranked purely by days-since-
+// last-sale alongside customers who were never snoozed.
+export function getSalesFollowupCandidates() {
+  const todayStr = today();
+  const lastSaleByParty = {};
+  for (const s of state.sales) {
+    if (s.type === 'return' || !s.partyId) continue;
+    if (!lastSaleByParty[s.partyId] || s.date > lastSaleByParty[s.partyId]) lastSaleByParty[s.partyId] = s.date;
+  }
+  const openSalesFU = {}; // partyId -> most recently-set OPEN sales-type followup
+  for (const f of state.followups) {
+    if (f.type !== 'sales' || f.status !== 'open') continue;
+    if (!openSalesFU[f.partyId] || f.date > openSalesFU[f.partyId].date) openSalesFU[f.partyId] = f;
+  }
+  const hidden = new Set(state.salesFollowupHidden || []);
+  const daysBetween = (a, b) => Math.round((new Date(b + 'T00:00:00') - new Date(a + 'T00:00:00')) / 86400000);
+  const out = [];
+  for (const partyId of Object.keys(lastSaleByParty)) {
+    if (hidden.has(partyId)) continue;
+    const party = state.parties.find(p => p.id === partyId);
+    if (!party) continue;
+    const lastSaleDate = lastSaleByParty[partyId];
+    const daysSince = daysBetween(lastSaleDate, todayStr);
+    if (daysSince < 30) continue; // bought recently enough — not due for outreach
+    const fu = openSalesFU[partyId];
+    if (fu && fu.followUpDate && fu.followUpDate > todayStr) continue; // snoozed to a future date
+    out.push({
+      partyId, partyName: party.name, phone: party.phone, lastSaleDate, daysSince,
+      dueFollowUp: fu && fu.followUpDate ? fu.followUpDate : null,
+      lastNote: fu ? fu.response : null,
+    });
+  }
+  out.sort((a, b) => {
+    if (a.dueFollowUp && b.dueFollowUp) return a.dueFollowUp.localeCompare(b.dueFollowUp);
+    if (a.dueFollowUp) return -1;
+    if (b.dueFollowUp) return 1;
+    return b.daysSince - a.daysSince;
+  });
+  return out;
+}
+export function hideSalesFollowup(partyId) {
+  if (state.salesFollowupHidden.includes(partyId)) return;
+  state.salesFollowupHidden = [...state.salesFollowupHidden, partyId];
+  save.salesFollowupHidden();
+}
+export function unhideSalesFollowup(partyId) {
+  state.salesFollowupHidden = state.salesFollowupHidden.filter(id => id !== partyId);
+  save.salesFollowupHidden();
 }
 
 // ── Reorder levels (request #5/#6) ───────────────────────────────────────────
@@ -1701,7 +1796,7 @@ const STORAGE_KEY_TO_STATE = {
   'data:cityOrder':'cityOrder', 'data:repairExpenses':'repairExpenses',
   'data:stockAdjustments':'stockAdjustments', 'data:users':'users',
   'data:stockReconciliations':'stockReconciliations',
-  'data:dashboardHiddenOOS':'dashboardHiddenOOS',
+  'data:dashboardHiddenOOS':'dashboardHiddenOOS', 'data:salesFollowupHidden':'salesFollowupHidden',
 };
 const liveListeners = new Set();
 export function subscribeLive(fn) { liveListeners.add(fn); return () => liveListeners.delete(fn); }
@@ -1772,14 +1867,14 @@ export function updatePartyPhone(partyId, phone) {
 export async function loadAll() {
   if (state.loaded) return;
   try {
-    const [sales,payments,pe,pt,fu,txns,parties,items,purchases,supplierPayments,freightCharges,customCategories,categoryTags,cityTransport,orders,dispatchPhone,itemCustomerNames,cityOrder,repairExpenses,stockAdjustments,users,stockReconciliations,dashboardHiddenOOS] = await Promise.all([
+    const [sales,payments,pe,pt,fu,txns,parties,items,purchases,supplierPayments,freightCharges,customCategories,categoryTags,cityTransport,orders,dispatchPhone,itemCustomerNames,cityOrder,repairExpenses,stockAdjustments,users,stockReconciliations,dashboardHiddenOOS,salesFollowupHidden] = await Promise.all([
       DB.get('data:sales'), DB.get('data:payments'), DB.get('data:phoneEdits'),
       DB.get('data:partyTransport'), DB.get('data:followups'), DB.get('data:txns'),
       DB.get('data:parties'), DB.get('data:items'), DB.get('data:purchases'), DB.get('data:supplierPayments'),
       DB.get('data:freightCharges'), DB.get('data:customCategories'), DB.get('data:categoryTags'),
       DB.get('data:cityTransport'), DB.get('data:orders'), DB.get('data:dispatchPhone'), DB.get('data:itemCustomerNames'),
       DB.get('data:cityOrder'), DB.get('data:repairExpenses'), DB.get('data:stockAdjustments'), DB.get('data:users'),
-      DB.get('data:stockReconciliations'), DB.get('data:dashboardHiddenOOS'),
+      DB.get('data:stockReconciliations'), DB.get('data:dashboardHiddenOOS'), DB.get('data:salesFollowupHidden'),
     ]);
     if (sales)    state.sales    = sales;
     if (payments) state.payments = payments;
@@ -1801,6 +1896,7 @@ export async function loadAll() {
     if (users)            state.users             = users;
     if (stockReconciliations) state.stockReconciliations = stockReconciliations;
     if (dashboardHiddenOOS) state.dashboardHiddenOOS = dashboardHiddenOOS;
+    if (salesFollowupHidden) state.salesFollowupHidden = salesFollowupHidden;
     // One-time migration: persisted items predate two corrections in the seed
     // data — (1) `purch` used to be a flat 22% of `sale` instead of a real
     // rate, hiding per-item margins, and (2) `stock`/`stockValue` weren't yet

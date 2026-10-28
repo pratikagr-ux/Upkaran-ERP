@@ -12,7 +12,7 @@ import * as XLSX from 'xlsx';
 import { C, fmt, fmtL, fmtD, today, uid, ROUTES, ACCOUNTS, ACC_MAP, TXN_CATEGORIES, HISTORICAL_EXPENSES, TAG_COLORS, APP_VERSION } from './constants.js';
 import { DB } from './db.js';
 import { supabase } from './supabaseClient.js';
-import { state, save, loadAll, updatePartyPhone, getBestRate, gPS, getPrevItems, parseQty, parseResponse, getAccBal, getSupplierBal, getCustomerBal, getPartyBills, getSupplierBills, getBestPurchRate, getAllCustomerMetrics, getAllVendorMetrics, getExpenseReport, setCategoryBiz, getCategorySubLedger, getAllItemRows, getItemMetrics, getAllItemMetrics, getExpectedStockMap, getReservedStockMap, getFifoStockMap, getItemLandingCost, getFifoSaleMarginMap, getFifoSaleCosts, getFifoProfitInRange, getExpensesInRange, hideFromDashboardOOS, unhideFromDashboardOOS, getReorderItems, setReorderLevel, getSaleProfitAnalysis, getProfitBreakdownInRange, getCustomerProfitSummary, getRecentModeSaleRate, getMonthlyBI, getMonthlyBIByCategory, getSalesProfitByCategory, getPnL, getBalanceSheet, getRepairExpenseTotal, splitPosNegItems, recordCityTransport, getTopTransportersForCity, getAllTransporterNames, subscribeLive, getItemCustomerName, setItemCustomerName, PARTY_INVOICES, PARTY_HISTORY, SUPPLIER_HISTORY, ACCOUNT_OB, ACCOUNT_HISTORY, applyTemplate, DEFAULT_TEMPLATES, describeOrder } from './store.js';
+import { state, save, loadAll, updatePartyPhone, getBestRate, gPS, getPrevItems, parseQty, parseResponse, getAccBal, getSupplierBal, getCustomerBal, getPartyNetBal, getPartyBills, getSupplierBills, getBestPurchRate, getAllCustomerMetrics, getAllVendorMetrics, getExpenseReport, setCategoryBiz, getCategorySubLedger, getAllItemRows, getItemMetrics, getAllItemMetrics, getExpectedStockMap, getReservedStockMap, getFifoStockMap, getItemLandingCost, getFifoSaleMarginMap, getFifoSaleCosts, getFifoProfitInRange, getExpensesInRange, hideFromDashboardOOS, unhideFromDashboardOOS, getReorderItems, setReorderLevel, getSaleProfitAnalysis, getProfitBreakdownInRange, getCustomerProfitSummary, getRecentModeSaleRate, getMonthlyBI, getMonthlyBIByCategory, getSalesProfitByCategory, getPnL, getBalanceSheet, getRepairExpenseTotal, splitPosNegItems, recordCityTransport, getTopTransportersForCity, getAllTransporterNames, subscribeLive, getItemCustomerName, setItemCustomerName, PARTY_INVOICES, PARTY_HISTORY, SUPPLIER_HISTORY, ACCOUNT_OB, ACCOUNT_HISTORY, applyTemplate, DEFAULT_TEMPLATES, describeOrder, getSalesFollowupCandidates, hideSalesFollowup, unhideSalesFollowup, getLastSupplierForItem } from './store.js';
 
 // ── CONVENIENT ALIASES (same pattern as monolith) ─────────────────────────────
 const _p  = () => state.parties;
@@ -189,7 +189,11 @@ function reconcileItemStock(itemId, physicalQty, notes) {
   if (!item || physicalQty == null || physicalQty < 0) return;
   const bookQty = item.stock || 0;
   const diff = physicalQty - bookQty;
-  if (diff === 0) return;
+  // Previously bailed out silently when diff===0 (physical count confirmed
+  // the book qty, e.g. both genuinely 0) — from the UI that looked exactly
+  // like "nothing happened, didn't save" with zero feedback. A zero-diff
+  // count is still a real, useful audit entry ("checked on this date,
+  // confirmed correct"), so it's logged too now, same as any other count.
   state.items = state.items.map(x => x.id === itemId ? { ...x, stock: physicalQty } : x);
   save.items();
   const rate = item.purchRaw ?? item.purch ?? 0;
@@ -322,6 +326,13 @@ const WARRANTY_OPTIONS = ['1yr warranty','1yr glass warranty','6 months warranty
 // rather than a full routing-params system, since this is the only
 // cross-module filter hand-off anywhere in the app.
 let pendingItemsFilter = null;
+
+// One-shot hand-off from the Dashboard Reorder List's "Place Order" button
+// (request #5) into PurchaseEntry — same pattern as pendingItemsFilter above:
+// a plain module-level variable, set right before navigate('purch-log'),
+// consumed once by PurchaseEntry on mount (which clears it immediately).
+// Shape: { partyId, partyName, items:[{itemId,itemName,customerName,supplierName,peti,qty,rate}] }.
+let pendingPurchasePrefill = null;
 
 // A party can now be both a customer and a supplier (e.g. a vendor who also
 // buys from us) — `type==='both'` is a third value alongside the existing
@@ -513,6 +524,7 @@ const NAV = [
   {id:'sale',       label:'New Sale',    icon:<SvgIcon d="M12 5v14M5 12h14"/>},
   {id:'orders',     label:'Sales Order', icon:<SvgIcon d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2" d2="M9 5a2 2 0 012-2h2a2 2 0 012 2v0a2 2 0 01-2 2h-2a2 2 0 01-2-2v0z"/>},
   {id:'outstanding',label:'Outstanding', icon:<SvgIcon d="M12 2a10 10 0 110 20A10 10 0 0112 2z" d2="M12 6v6l4 2"/>},
+  {id:'sales-followup',label:'Sales Follow-up', icon:<SvgIcon d="M23 4v6h-6" d2="M1 20v-6h6M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/>},
   {id:'parties',    label:'Parties',     icon:<SvgIcon d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2" d2="M9 11a4 4 0 100-8 4 4 0 000 8zm8 2c1.66 0 3 1.34 3 3v2"/>},
   {id:'items',      label:'Inventory',   icon:<SvgIcon d="M21 16V8a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 003 8v8a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0021 16zM3.27 6.96L12 12.01l8.73-5.05M12 22.08V12"/>},
   {id:'accounts',   label:'Accounts',    icon:<SvgIcon d="M3 10h18M7 15h1m4 0h1m-7 4h12a3 3 0 003-3V8a3 3 0 00-3-3H6a3 3 0 00-3 3v8a3 3 0 003 3z"/>},
@@ -582,6 +594,39 @@ function IconBtn({onClick,title,color=C.sub,bg='transparent',children}){
   return <button onClick={onClick} title={title} style={{width:26,height:26,flexShrink:0,display:'inline-flex',
     alignItems:'center',justifyContent:'center',borderRadius:6,border:`1px solid ${color}40`,background:bg,
     color,cursor:'pointer',fontSize:13,padding:0,fontFamily:'inherit',lineHeight:1}}>{children}</button>;
+}
+
+// Collapses a row's N quick-action buttons (Share/Move/Reconcile/Merge/Edit/…)
+// into one kebab button + dropdown, so a row with many possible actions stays
+// exactly one icon wide instead of growing with every action added — the
+// Inventory list row was getting visibly wider/taller as actions piled up
+// (6 × 26px IconBtns + gaps, wrapping to a 2nd line on narrower screens).
+// Pass `items`: [{label, icon, onClick, show=true, danger}] — hidden ones
+// (show:false) are simply left out of the menu, same as before.
+function RowActionsMenu({items}){
+  const[open,setOpen]=useState(false);
+  const ref=useRef(null);
+  useEffect(()=>{
+    if(!open)return;
+    const h=e=>{ if(ref.current&&!ref.current.contains(e.target))setOpen(false); };
+    document.addEventListener('mousedown',h);
+    return()=>document.removeEventListener('mousedown',h);
+  },[open]);
+  const visible=items.filter(it=>it.show!==false);
+  if(visible.length===0)return null;
+  return <div ref={ref} style={{position:'relative',display:'inline-block'}} onClick={e=>e.stopPropagation()}>
+    <IconBtn onClick={()=>setOpen(o=>!o)} title="Actions">⋮</IconBtn>
+    {open&&<div style={{position:'absolute',top:'calc(100% + 4px)',right:0,background:C.surf,
+      border:`1px solid ${C.bdr}`,borderRadius:8,boxShadow:'0 8px 24px rgba(0,0,0,0.15)',zIndex:200,
+      minWidth:170,overflow:'hidden'}}>
+      {visible.map((it,i)=><div key={i} onClick={()=>{setOpen(false);it.onClick();}}
+        style={{display:'flex',alignItems:'center',gap:9,padding:'9px 13px',fontSize:13,
+          color:it.danger?C.red:C.txt,cursor:'pointer',whiteSpace:'nowrap',
+          borderTop:i>0?`1px solid ${C.bdr}`:'none'}}>
+        <span style={{fontSize:14,width:16,textAlign:'center'}}>{it.icon}</span>{it.label}
+      </div>)}
+    </div>}
+  </div>;
 }
 
 function Inp({id,label,value,onChange,placeholder,type='text',required,hint,autoFocus,autoComplete='off',onKeyDown}){
@@ -809,7 +854,12 @@ function OutstandingDetail({party,od,onClose}){
   const mobile=useIsMobile();
   const newSales=state.sales.filter(s=>s.partyId===party.id).reduce((s,t)=>s+t.total,0);
   const payments=state.payments.filter(p=>p.partyId===party.id).reduce((s,p)=>s+p.amount,0);
-  const currentOD=od+newSales-payments;
+  // 'both'-type parties (buy from AND sell to) show the one netted balance
+  // here too (per the single-ledger redesign), instead of the gross
+  // sales-only running total — od+newSales-payments is otherwise exactly
+  // getCustomerBal(party.id) (party.ob + sales - payments), which ignores the
+  // purchase/payable side entirely.
+  const currentOD=party.type==='both'?getPartyNetBal(party.id):od+newSales-payments;
   const[response,setResponse]=useState('');
   const[saved,setSaved]=useState(false);
   const[notRecoverable,setNotRecoverable]=useState(!!party.notRecoverable);
@@ -826,6 +876,24 @@ function OutstandingDetail({party,od,onClose}){
   const fuHistory=useMemo(()=>[...state.followups].filter(f=>f.partyId===party.id).sort((a,b)=>b.date.localeCompare(a.date)),[]);
   const lastFU=fuHistory[0];
   const[showFUHistory,setShowFUHistory]=useState(false);
+  // Explicit "set a follow-up date" action — separate from the free-text
+  // Capture Response box below, which only ever gets a follow-up date if the
+  // text happens to parse to one ("kal"/"Monday"/etc). This lets a date be
+  // picked directly, and tagged as either a Payment or a Sales follow-up —
+  // the latter feeds the separate Sales Follow-up module's rotating list.
+  const[fuType,setFuType]=useState('payment');
+  const[fuDate,setFuDate]=useState('');
+  const[fuNote,setFuNote]=useState('');
+  const setManualFollowUp=()=>{
+    if(!fuDate)return toast('Pick a date','error');
+    const fu={id:uid('FU'),partyId:party.id,partyName:party.name,date:today(),
+      response:fuNote.trim()||(fuType==='sales'?'Sales follow-up scheduled':'Payment follow-up scheduled'),
+      tags:[fuType==='sales'?'sales-followup':'promise'],followUpDate:fuDate,
+      label:fuType==='sales'?'Sales follow-up':'Payment follow-up',type:fuType,status:'open'};
+    state.followups=[fu,...state.followups];save.followups();
+    setFuDate('');setFuNote('');
+    toast('Follow-up set for '+fmtD(fuDate)+' ('+(fuType==='sales'?'Sales':'Payment')+') ✓');
+  };
   // getPartyBills covers opening balance + historical + NEW in-app sales via
   // FIFO — the raw PARTY_INVOICES map only has historical rows, which left the
   // WhatsApp reminder's invoice breakdown blank for any party whose outstanding
@@ -836,7 +904,7 @@ function OutstandingDetail({party,od,onClose}){
     if(!response.trim())return;
     const parsed=parseResponse(response);
     const fu={id:uid('FU'),partyId:party.id,partyName:party.name,date:today(),response,
-      tags:parsed.tags,followUpDate:parsed.followUpDate,label:parsed.label,status:'open'};
+      tags:parsed.tags,followUpDate:parsed.followUpDate,label:parsed.label,type:'payment',status:'open'};
     state.followups=[fu,...state.followups];save.followups();setSaved(true);
     toast('Saved'+(parsed.followUpDate?' · Reminder '+fmtD(parsed.followUpDate):''));
   };
@@ -990,7 +1058,10 @@ function OutstandingDetail({party,od,onClose}){
       {showFUHistory&&<div style={{marginTop:8,display:'flex',flexDirection:'column',gap:6}}>
         {fuHistory.map(f=><div key={f.id} style={{padding:'8px 11px',borderRadius:7,background:'#F6F8FA',border:`1px solid ${C.bdr}`}}>
           <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8,marginBottom:3}}>
-            <span style={{fontSize:11,fontWeight:700,padding:'2px 8px',borderRadius:20,background:(TAG_COLORS[f.tags?.[0]]||C.blue)+'18',color:TAG_COLORS[f.tags?.[0]]||C.blue}}>{f.label}</span>
+            <div style={{display:'flex',alignItems:'center',gap:5}}>
+              <span style={{fontSize:11,fontWeight:700,padding:'2px 8px',borderRadius:20,background:(TAG_COLORS[f.tags?.[0]]||C.blue)+'18',color:TAG_COLORS[f.tags?.[0]]||C.blue}}>{f.label}</span>
+              {f.type==='sales'&&<span style={{fontSize:10,fontWeight:700,padding:'2px 7px',borderRadius:20,background:'#0D948818',color:'#0D9488'}}>🛒 Sales</span>}
+            </div>
             <span style={{fontSize:11,color:C.muted}}>{fmtD(f.date)}{f.status==='open'?' · open':''}</span>
           </div>
           <div style={{fontSize:12,color:C.txt,fontStyle:'italic'}}>"{f.response}"</div>
@@ -998,6 +1069,23 @@ function OutstandingDetail({party,od,onClose}){
         </div>)}
       </div>}
     </div>}
+
+    <div style={{borderTop:`1px solid ${C.bdr}`,paddingTop:16,marginBottom:16}}>
+      <div style={{fontSize:12,fontWeight:700,color:C.txt,marginBottom:8}}>Set Follow-up Date</div>
+      <div style={{display:'flex',gap:8,marginBottom:8}}>
+        {[['payment','💰 Payment'],['sales','🛒 Sales']].map(([v,l])=>
+          <button key={v} onClick={()=>setFuType(v)} style={{padding:'6px 12px',borderRadius:20,fontSize:12,fontWeight:600,
+            cursor:'pointer',fontFamily:'inherit',border:`1.5px solid ${fuType===v?C.blue:C.bdr}`,
+            background:fuType===v?C.blue+'15':'transparent',color:fuType===v?C.blue:C.sub}}>{l}</button>)}
+      </div>
+      <div style={{display:'flex',gap:8,flexWrap:'wrap',alignItems:'center'}}>
+        <input type="date" value={fuDate} onChange={e=>setFuDate(e.target.value)}
+          style={{padding:'7px 10px',borderRadius:7,border:`1.5px solid ${C.bdr}`,fontSize:13,fontFamily:'inherit',outline:'none',color:C.txt}}/>
+        <input value={fuNote} onChange={e=>setFuNote(e.target.value)} placeholder="Note (optional)"
+          style={{flex:1,minWidth:140,padding:'7px 10px',borderRadius:7,border:`1.5px solid ${C.bdr}`,fontSize:13,fontFamily:'inherit',outline:'none',color:C.txt}}/>
+        <Btn onClick={setManualFollowUp} size="sm">Set Reminder</Btn>
+      </div>
+    </div>
 
     <div style={{borderTop:`1px solid ${C.bdr}`,paddingTop:16}}>
       <div style={{fontSize:12,fontWeight:700,color:C.txt,marginBottom:8}}>Capture Response</div>
@@ -1062,6 +1150,52 @@ function MobileOutstandingTable({rows,amountOf,onRowClick}){
   </table>;
 }
 
+// ── CAPTURED RESPONSES (shared by Outstanding + Sales Follow-up) ───────────────
+// Request #3: "a place to see the captured responses in both sales follow up
+// and outstandings" — OutstandingDetail/SalesFollowupDetail each already show
+// a per-party history, but there was no single place to scan every response
+// across ALL parties at once. This reads the same state.followups array both
+// those per-party views write to, just unfiltered-by-party and with a
+// type (Payment/Sales) toggle + search, newest first.
+function AllResponsesModal({defaultType='all',onClose}){
+  const mobile=useIsMobile();
+  const[typeF,setTypeF]=useState(defaultType); // 'all' | 'payment' | 'sales'
+  const[search,setSearch]=useState('');
+  const rows=useMemo(()=>[...state.followups]
+    .filter(f=>typeF==='all'||f.type===typeF)
+    .filter(f=>!search||f.partyName?.toLowerCase().includes(search.toLowerCase())||f.response?.toLowerCase().includes(search.toLowerCase()))
+    .sort((a,b)=>b.date.localeCompare(a.date)),
+    [typeF,search]);
+  return <Modal title="Captured Responses" onClose={onClose} width={560}>
+    <div style={{display:'flex',gap:8,marginBottom:10,flexWrap:'wrap'}}>
+      <Chip v="All" active={typeF==='all'} onClick={()=>setTypeF('all')}/>
+      <Chip v="💰 Payment" active={typeF==='payment'} onClick={()=>setTypeF('payment')}/>
+      <Chip v="🛒 Sales" active={typeF==='sales'} onClick={()=>setTypeF('sales')}/>
+    </div>
+    <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search party or response text…"
+      style={{width:'100%',padding:'8px 12px',borderRadius:8,border:`1.5px solid ${C.bdr}`,fontSize:13,
+        fontFamily:'inherit',outline:'none',boxSizing:'border-box',marginBottom:12,color:C.txt}}/>
+    <div style={{maxHeight:mobile?'55vh':440,overflowY:'auto',display:'flex',flexDirection:'column',gap:6}}>
+      {rows.length===0&&<div style={{padding:'24px 10px',textAlign:'center',color:C.sub,fontSize:13}}>No responses found</div>}
+      {rows.map(f=><div key={f.id} style={{padding:'9px 12px',borderRadius:7,background:'#F6F8FA',border:`1px solid ${C.bdr}`}}>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8,marginBottom:3,flexWrap:'wrap'}}>
+          <div style={{display:'flex',alignItems:'center',gap:5,flexWrap:'wrap'}}>
+            <span style={{fontWeight:700,color:C.txt,fontSize:13}}>{f.partyName}</span>
+            <span style={{fontSize:11,fontWeight:700,padding:'2px 8px',borderRadius:20,background:(TAG_COLORS[f.tags?.[0]]||C.blue)+'18',color:TAG_COLORS[f.tags?.[0]]||C.blue}}>{f.label}</span>
+            <span style={{fontSize:10,fontWeight:700,padding:'2px 7px',borderRadius:20,
+              background:f.type==='sales'?'#0D948818':C.blueSoft,color:f.type==='sales'?'#0D9488':C.blue}}>
+              {f.type==='sales'?'🛒 Sales':'💰 Payment'}
+            </span>
+          </div>
+          <span style={{fontSize:11,color:C.muted,whiteSpace:'nowrap'}}>{fmtD(f.date)}{f.status==='open'?' · open':''}</span>
+        </div>
+        <div style={{fontSize:12,color:C.txt,fontStyle:'italic'}}>"{f.response}"</div>
+        {f.followUpDate&&<div style={{fontSize:11,color:C.green,fontWeight:600,marginTop:3}}>📅 Reminder {fmtD(f.followUpDate)}</div>}
+      </div>)}
+    </div>
+  </Modal>;
+}
+
 // ── OUTSTANDING ───────────────────────────────────────────────────────────────
 function Outstanding(){
   const mobile=useIsMobile();
@@ -1072,6 +1206,7 @@ function Outstanding(){
   const[detail,setDetail]=useState(null);
   const[cityView,setCityView]=useState(false);
   const[showCityOrder,setShowCityOrder]=useState(false);
+  const[showResponses,setShowResponses]=useState(false);
 
   // All parties with OD (full unfiltered list for summary cards)
   const allOD=useMemo(()=>{
@@ -1096,6 +1231,23 @@ function Outstanding(){
       const withinAmt=bills.filter(b=>b.overdue<=0).reduce((s,b)=>s+b.remaining,0);
       const overdue030Amt=bills.filter(b=>b.overdue>0&&b.overdue<=30).reduce((s,b)=>s+b.remaining,0);
       const overdue31Amt=bills.filter(b=>b.overdue>30).reduce((s,b)=>s+b.remaining,0);
+      // 'both'-type parties (buy from AND sell to): the headline "amount owed"
+      // here is the single netted balance (sales owed to us minus purchases we
+      // owe them), per the single-ledger redesign — NOT the gross sales-only
+      // total, so a party we net owe doesn't wrongly show as owing us. The
+      // per-bill aging buckets above stay GROSS (real invoice dates/amounts) —
+      // that's a collections-risk signal about which actual sales invoices are
+      // overdue, which netting against unrelated purchase payments would
+      // corrupt — but their total is rescaled to match the netted headline so
+      // the bucket breakdown still adds up to `od` on screen.
+      let net=od;
+      if(p.type==='both'){
+        net=getPartyNetBal(p.id);
+        const factor=od>0?Math.max(0,net)/od:0;
+        return{...p,od:Math.max(0,net),overdueDays:realBills.length?realBills[0].overdue:0,
+          withinAmt:withinAmt*factor,overdue030Amt:overdue030Amt*factor,overdue31Amt:overdue31Amt*factor,
+          isLighter:p.credit===3,notRecoverable:!!p.notRecoverable};
+      }
       return{...p,od,overdueDays:realBills.length?realBills[0].overdue:0,withinAmt,overdue030Amt,overdue31Amt,isLighter:p.credit===3,notRecoverable:!!p.notRecoverable};
     }).filter(p=>p.od>0);
   },[state.payments.length,state.sales.length,state.txns.length,state.parties]);
@@ -1223,9 +1375,11 @@ function Outstanding(){
     {profile&&<PartyLedger party={profile} onClose={()=>setProfile(null)}/>}
     {detail&&<OutstandingDetail party={detail.party} od={detail.od} onClose={()=>setDetail(null)}/>}
     {showCityOrder&&<CityOrderModal cities={byCity.map(c=>c.city)} onClose={()=>setShowCityOrder(false)}/>}
+    {showResponses&&<AllResponsesModal defaultType="payment" onClose={()=>setShowResponses(false)}/>}
 
     <SectionHead title="Outstanding"
-      sub={(routeF||ageF)?`${odList.length} parties · ${fmtL(total)} (filtered)`:  `${allOD.length} parties · ${fmtL(grandTotal)}`}/>
+      sub={(routeF||ageF)?`${odList.length} parties · ${fmtL(total)} (filtered)`:  `${allOD.length} parties · ${fmtL(grandTotal)}`}
+      action={<Btn onClick={()=>setShowResponses(true)} size="sm" variant="secondary">📋 Captured Responses</Btn>}/>
 
     {/* Route + Lighter summary cards — clickable */}
     <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fit,minmax(140px,1fr))',gap:10,marginBottom:14}}>
@@ -1443,12 +1597,192 @@ function CityOrderModal({cities,onClose}){
   </Modal>;
 }
 
+// ── SALES FOLLOW-UP MODULE (request #2) ─────────────────────────────────────
+// Customers who haven't bought anything in 30+ days, most-delayed first — a
+// rotating outreach queue, not a static list: Hide drops a customer out for
+// good, Skip/Set Follow-up Date drop them out until a chosen date, at which
+// point they resurface at the very TOP (ahead of everyone ranked purely by
+// days-since-last-sale) — see getSalesFollowupCandidates() in store.js for
+// the actual rotation rule.
+function SalesFollowupDetail({row,onClose,onChanged}){
+  const party=state.parties.find(p=>p.id===row.partyId);
+  const[response,setResponse]=useState('');
+  const[saved,setSaved]=useState(false);
+  const[fuDate,setFuDate]=useState('');
+  const[fuNote,setFuNote]=useState('');
+  const{toast,TC}=useToast();
+  const fuHistory=useMemo(()=>[...state.followups].filter(f=>f.partyId===row.partyId&&f.type==='sales').sort((a,b)=>b.date.localeCompare(a.date)),[]);
+  // Last item bought — for the WhatsApp follow-up template ("aapki last
+  // purchase X thi Y ko") and for context in the detail header.
+  const lastSale=useMemo(()=>{
+    const ps=state.sales.filter(s=>s.partyId===row.partyId&&s.type!=='return').sort((a,b)=>b.date.localeCompare(a.date));
+    return ps[0]||null;
+  },[]);
+  const lastItem=lastSale?.items?.[0]?(lastSale.items[0].customerName||lastSale.items[0].itemName):'';
+  const waMsg=applyTemplate('followup',{partyName:row.partyName,lastItem:lastItem||'—',lastDate:fmtD(row.lastSaleDate)});
+  const waUrl=party?.phone?('https://wa.me/91'+party.phone+'?text='+encodeURIComponent(waMsg)):null;
+
+  const saveResponse=()=>{
+    if(!response.trim())return;
+    const parsed=parseResponse(response);
+    const fu={id:uid('FU'),partyId:row.partyId,partyName:row.partyName,date:today(),response,
+      tags:parsed.tags,followUpDate:parsed.followUpDate,label:parsed.label,type:'sales',status:'open'};
+    state.followups=[fu,...state.followups];save.followups();setSaved(true);
+    toast('Saved'+(parsed.followUpDate?' · Reminder '+fmtD(parsed.followUpDate):''));
+    onChanged?.();
+  };
+  const setManualFollowUp=()=>{
+    if(!fuDate)return toast('Pick a date','error');
+    const fu={id:uid('FU'),partyId:row.partyId,partyName:row.partyName,date:today(),
+      response:fuNote.trim()||'Sales follow-up scheduled',tags:['sales-followup'],
+      followUpDate:fuDate,label:'Sales follow-up',type:'sales',status:'open'};
+    state.followups=[fu,...state.followups];save.followups();
+    toast('Follow-up set for '+fmtD(fuDate)+' ✓');
+    onChanged?.();onClose?.();
+  };
+  const doSkip=()=>{
+    const d=new Date();d.setDate(d.getDate()+3);
+    const fu={id:uid('FU'),partyId:row.partyId,partyName:row.partyName,date:today(),
+      response:'Skipped — check back in a few days',tags:['sales-followup'],
+      followUpDate:d.toISOString().slice(0,10),label:'Skipped',type:'sales',status:'open'};
+    state.followups=[fu,...state.followups];save.followups();
+    toast('Skipped — back in 3 days');
+    onChanged?.();onClose?.();
+  };
+  const doHide=()=>{
+    hideSalesFollowup(row.partyId);
+    toast('Hidden from Sales Follow-up list');
+    onChanged?.();onClose?.();
+  };
+
+  return <Modal title={row.partyName} onClose={onClose} width={480}>
+    <TC/>
+    <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}}>
+      <div>
+        <div style={{fontSize:11,color:C.sub,textTransform:'uppercase',letterSpacing:.5,marginBottom:2}}>Last Purchase</div>
+        <div style={{fontSize:18,fontWeight:800,color:C.txt}}>{fmtD(row.lastSaleDate)}</div>
+        <div style={{fontSize:12,color:C.red,fontWeight:600,marginTop:2}}>{row.daysSince} days ago{lastItem?' · '+lastItem:''}</div>
+      </div>
+      {waUrl&&<a href={waUrl} target="_blank" rel="noreferrer"
+        style={{padding:'8px 16px',background:'#25D366',color:'#fff',borderRadius:8,textDecoration:'none',fontWeight:700,fontSize:13}}>📲 WhatsApp</a>}
+    </div>
+
+    <div style={{display:'flex',gap:8,marginBottom:16}}>
+      <Btn onClick={doSkip} variant="secondary" size="sm">⏭ Skip (3 days)</Btn>
+      <Btn onClick={doHide} variant="secondary" size="sm">🙈 Hide</Btn>
+    </div>
+
+    {fuHistory.length>0&&<div style={{marginBottom:16}}>
+      <div style={{fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,marginBottom:8}}>Follow-up Notes ({fuHistory.length})</div>
+      <div style={{display:'flex',flexDirection:'column',gap:6,maxHeight:180,overflowY:'auto'}}>
+        {fuHistory.map(f=><div key={f.id} style={{padding:'8px 11px',borderRadius:7,background:'#F6F8FA',border:`1px solid ${C.bdr}`}}>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8,marginBottom:3}}>
+            <span style={{fontSize:11,fontWeight:700,padding:'2px 8px',borderRadius:20,background:(TAG_COLORS[f.tags?.[0]]||C.blue)+'18',color:TAG_COLORS[f.tags?.[0]]||C.blue}}>{f.label}</span>
+            <span style={{fontSize:11,color:C.muted}}>{fmtD(f.date)}{f.status==='open'?' · open':''}</span>
+          </div>
+          <div style={{fontSize:12,color:C.txt,fontStyle:'italic'}}>"{f.response}"</div>
+          {f.followUpDate&&<div style={{fontSize:11,color:C.green,fontWeight:600,marginTop:3}}>📅 Reminder {fmtD(f.followUpDate)}</div>}
+        </div>)}
+      </div>
+    </div>}
+
+    <div style={{borderTop:`1px solid ${C.bdr}`,paddingTop:16,marginBottom:16}}>
+      <div style={{fontSize:12,fontWeight:700,color:C.txt,marginBottom:8}}>Set Follow-up Date</div>
+      <div style={{display:'flex',gap:8,flexWrap:'wrap',alignItems:'center'}}>
+        <input type="date" value={fuDate} onChange={e=>setFuDate(e.target.value)}
+          style={{padding:'7px 10px',borderRadius:7,border:`1.5px solid ${C.bdr}`,fontSize:13,fontFamily:'inherit',outline:'none',color:C.txt}}/>
+        <input value={fuNote} onChange={e=>setFuNote(e.target.value)} placeholder="Note (optional)"
+          style={{flex:1,minWidth:140,padding:'7px 10px',borderRadius:7,border:`1.5px solid ${C.bdr}`,fontSize:13,fontFamily:'inherit',outline:'none',color:C.txt}}/>
+        <Btn onClick={setManualFollowUp} size="sm">Set Reminder</Btn>
+      </div>
+    </div>
+
+    <div style={{borderTop:`1px solid ${C.bdr}`,paddingTop:16}}>
+      <div style={{fontSize:12,fontWeight:700,color:C.txt,marginBottom:8}}>Capture Response</div>
+      {!saved
+        ?<>
+          <textarea value={response} onChange={e=>setResponse(e.target.value)} rows={3}
+            placeholder="What did they say? e.g. Will order Monday / Not interested right now / Busy 2 days"
+            style={{width:'100%',padding:'10px 12px',borderRadius:8,border:`1.5px solid ${C.bdr}`,
+              fontSize:13,fontFamily:'inherit',resize:'none',outline:'none',boxSizing:'border-box',color:C.txt}}
+            onFocus={e=>e.target.style.borderColor=C.blue} onBlur={e=>e.target.style.borderColor=C.bdr}/>
+          {response.trim()&&(()=>{const p=parseResponse(response);return <div style={{marginTop:6,display:'flex',gap:6,flexWrap:'wrap',alignItems:'center'}}>
+            <span style={{fontSize:11,color:C.sub}}>Tag:</span>
+            {p.tags.map(t=><span key={t} style={{fontSize:11,fontWeight:700,padding:'2px 9px',borderRadius:20,background:(TAG_COLORS[t]||C.blue)+'18',color:TAG_COLORS[t]||C.blue}}>{t}</span>)}
+            {p.followUpDate&&<span style={{fontSize:11,color:C.green,fontWeight:600}}>📅 {fmtD(p.followUpDate)}</span>}
+          </div>;})()}
+          <div style={{display:'flex',justifyContent:'flex-end',marginTop:10}}>
+            <Btn onClick={saveResponse} size="sm">Save Response</Btn>
+          </div>
+        </>
+        :<div style={{padding:'10px 14px',background:C.greenSoft,borderRadius:8,fontSize:13,color:C.green,fontWeight:600}}>✓ Response saved</div>
+      }
+    </div>
+  </Modal>;
+}
+
+function SalesFollowupModule(){
+  const mobile=useIsMobile();
+  const[detail,setDetail]=useState(null);
+  const[showHidden,setShowHidden]=useState(false);
+  const[showResponses,setShowResponses]=useState(false);
+  const[_fv,_setFv]=useState(0); const forceUpdate=()=>_setFv(v=>v+1);
+  const rows=useMemo(()=>getSalesFollowupCandidates(),
+    [state.sales.length,state.followups.length,state.salesFollowupHidden.length,state.parties.length,_fv]);
+  const hiddenParties=useMemo(()=>(state.salesFollowupHidden||[])
+    .map(id=>state.parties.find(p=>p.id===id)).filter(Boolean),
+    [state.salesFollowupHidden.length,_fv]);
+  const dueCount=rows.filter(r=>r.dueFollowUp).length;
+  const unhide=id=>{unhideSalesFollowup(id);forceUpdate();};
+
+  return <div>
+    {detail&&<SalesFollowupDetail row={detail} onClose={()=>setDetail(null)} onChanged={forceUpdate}/>}
+    {showResponses&&<AllResponsesModal defaultType="sales" onClose={()=>setShowResponses(false)}/>}
+    <SectionHead title="Sales Follow-up" sub={`${rows.length} customers haven't bought in 30+ days${dueCount?` · ${dueCount} due now`:''}`}
+      action={<Btn onClick={()=>setShowResponses(true)} size="sm" variant="secondary">📋 Captured Responses</Btn>}/>
+    <div style={{fontSize:12,color:C.sub,marginBottom:12}}>Most-delayed customers first. Setting a follow-up date (or Skip) removes a customer from this list until that date — they then resurface at the top.</div>
+
+    <div style={{display:'flex',justifyContent:'flex-end',marginBottom:10}}>
+      <button onClick={()=>setShowHidden(v=>!v)} style={{background:'none',border:'none',cursor:'pointer',fontSize:12,color:C.sub,fontFamily:'inherit',textDecoration:'underline'}}>
+        {showHidden?'Hide':'Show'} hidden customers ({hiddenParties.length})
+      </button>
+    </div>
+    {showHidden&&<div style={{background:'#F6F8FA',border:`1px solid ${C.bdr}`,borderRadius:8,padding:12,marginBottom:14}}>
+      {hiddenParties.length===0?<span style={{fontSize:12,color:C.muted}}>No hidden customers</span>:
+        hiddenParties.map(p=><div key={p.id} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'6px 0',borderBottom:`1px solid ${C.bdr}`}}>
+          <span style={{fontSize:13,color:C.txt}}>{p.name}</span>
+          <Btn onClick={()=>unhide(p.id)} size="sm" variant="secondary">Unhide</Btn>
+        </div>)}
+    </div>}
+
+    <div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,overflow:'hidden'}}>
+      <CardTable mobile={mobile} rows={rows} keyFn={r=>r.partyId} emptyLabel="No customers currently due for a sales follow-up"
+        onRowClick={r=>setDetail(r)}
+        rowStyle={r=>({background:r.dueFollowUp?C.amberSoft:'transparent'})}
+        columns={[
+          {key:'party',label:'Customer',render:r=><div>
+            <div style={{fontWeight:600,color:C.blue,textDecoration:'underline',textDecorationStyle:'dotted'}}>{r.partyName}</div>
+            {r.lastNote&&<div style={{fontSize:11,color:C.sub,marginTop:2,fontStyle:'italic'}}>"{r.lastNote}"</div>}
+          </div>},
+          {key:'last',label:'Last Purchase',render:r=><span style={{color:C.sub,fontSize:12}}>{fmtD(r.lastSaleDate)}</span>},
+          {key:'days',label:'Days Since',align:'right',render:r=><span style={{fontWeight:700,color:r.daysSince>60?C.red:C.amber}}>{r.daysSince}d</span>},
+          {key:'status',label:'Status',align:'right',render:r=>r.dueFollowUp
+            ?<Badge v={'Due '+fmtD(r.dueFollowUp)} color="amber"/>
+            :<span style={{fontSize:11,color:C.muted}}>—</span>},
+        ]}/>
+    </div>
+  </div>;
+}
+
 // ── PARTY INFO CARD ───────────────────────────────────────────────────────────
 function PartyInfoCard({party}){
   const mobile=useIsMobile();
   const st=gPS(party.name);
   const ns=state.sales.filter(s=>s.partyId===party.id).reduce((s,t)=>s+t.total,0);
-  const od=getCustomerBal(party.id);
+  // 'both'-type parties get one netted outstanding figure (receivable minus
+  // payable) per the single-ledger redesign, instead of just the customer
+  // side — collapses to getCustomerBal unchanged for non-'both' parties.
+  const od=party.type==='both'?getPartyNetBal(party.id):getCustomerBal(party.id);
   const tp=(st?.ts||0)+ns;
   const grade=od>100000?'D':od>50000?'C':od<=0?'A':'B';
   const gc={A:C.green,B:C.blue,C:C.amber,D:C.red};
@@ -2004,7 +2338,7 @@ function SaleEntry({onSaved,mode='sale'}){
               style={{padding:'9px 14px',cursor:'pointer',fontSize:13,borderBottom:`1px solid ${C.bdr}`,background:pi===pIdx?C.blueSoft:'transparent'}}>
               <span style={{fontWeight:600,color:C.txt}}>{p.name}</span>
               <span style={{fontSize:11,color:C.sub,marginLeft:8}}>{p.city} · {p.route}</span>
-              {(()=>{const _od=getCustomerBal(p.id);return _od!==0&&<span style={{fontSize:11,color:_od>0?C.red:C.green,marginLeft:8,fontWeight:600}}>{_od>0?'OD '+fmt(_od):'Credit '+fmt(-_od)}</span>;})()}
+              {(()=>{const _od=p.type==='both'?getPartyNetBal(p.id):getCustomerBal(p.id);return _od!==0&&<span style={{fontSize:11,color:_od>0?C.red:C.green,marginLeft:8,fontWeight:600}}>{_od>0?'OD '+fmt(_od):'Credit '+fmt(-_od)}</span>;})()}
             </div>)}
             {pq.length>=2&&psugg.length===0&&<div onMouseDown={()=>setAddPartyName(pq)}
               style={{padding:'9px 14px',cursor:'pointer',color:C.blue,fontWeight:600,fontSize:13,background:C.blueSoft}}>
@@ -3243,16 +3577,196 @@ function PartyProfile({party,onClose}){
   </Modal>;
 }
 
+// A 'both' party (buys from AND sells to us) gets ONE merged, netted ledger —
+// not the Customer/Supplier toggle this used to show, which flipped between
+// two completely separate balances. This component builds a single
+// chronological timeline from both sides and a single running balance using
+// the SAME sign convention as getPartyNetBal (store.js): positive = party
+// owes us net; negative = we owe the party net. Note party.ob is
+// deliberately NOT applied here — getCustomerBal and getSupplierBal both add
+// the same party.ob independently, so it cancels out entirely in
+// getPartyNetBal = getCustomerBal - getSupplierBal, meaning an opening
+// balance has no net effect for a 'both' party by construction. Mirroring
+// that exactly (starting the walk at 0, live transactions only) keeps this
+// ledger's closing balance identical to getPartyNetBal everywhere else it's
+// used (Outstanding, Parties list, Dashboard tiles).
+function MergedPartyLedger({party,onClose}){
+  const mobile=useIsMobile();
+  const PAGE=20;
+  const[actPage,setActPage]=useState(0);
+  const[viewSale,setViewSale]=useState(null);
+  const[viewPurchase,setViewPurchase]=useState(null);
+  const{toast,TC}=useToast();
+
+  const custSales=useMemo(()=>state.sales.filter(s=>s.partyId===party.id).map(s=>({
+    date:s.date, side:'customer', type:s.type==='return'?'return':'sale', amount:s.total,
+    desc:(s.items||[]).slice(0,3).map(x=>(x.customerName||x.itemName)+' ×'+x.qty).join(', ')||(s.type==='return'?'Sales Return':'Sale'),
+    createdAt:s.createdAt||'', saleId:s.id,
+  })),[party.id,state.sales.length]);
+  const custPmts=useMemo(()=>state.payments.filter(p=>p.partyId===party.id).map(p=>({
+    date:p.date, side:'customer', type:'payment', amount:p.amount,
+    desc:p.notes||('Received — '+(ACC_MAP[p.account]?.short||p.account||'—')), createdAt:'',
+  })),[party.id,state.payments.length]);
+  const suppPurch=useMemo(()=>state.purchases.filter(s=>s.partyId===party.id).map(s=>({
+    date:s.date, side:'supplier', type:s.total<0?'return':'purchase', amount:s.total+(s.extraChargesTotal||0),
+    desc:(s.items||[]).slice(0,3).map(x=>(x.supplierName||x.customerName||x.itemName)+' ×'+x.qty).join(', ')||(s.total<0?'Purchase Return':'Purchase'),
+    createdAt:s.createdAt||'', purchaseId:s.id,
+  })),[party.id,state.purchases.length]);
+  const suppPmts=useMemo(()=>state.supplierPayments.filter(p=>p.partyId===party.id).map(p=>({
+    date:p.date, side:'supplier', type:'payment', amount:p.amount,
+    desc:p.notes||('Paid — '+(ACC_MAP[p.account]?.short||p.account||'—')), createdAt:'',
+  })),[party.id,state.supplierPayments.length]);
+
+  // Merge, sort chronologically, and walk ONE running balance. Customer-side
+  // entries keep their natural sign (sale:+, return:-(already negative),
+  // payment received:-); supplier-side entries are negated so they land on
+  // the same net scale (a purchase/payable-up event reduces net toward us; a
+  // payment we make to them increases net toward us) — see getPartyNetBal.
+  const rows=useMemo(()=>{
+    const tagged=[...custSales,...custPmts,...suppPurch,...suppPmts]
+      .sort((a,b)=>a.date.localeCompare(b.date)||(a.createdAt||'').localeCompare(b.createdAt||''));
+    let bal=0;
+    const withBal=tagged.map(e=>{
+      const rawDelta=e.type==='payment'?-e.amount:e.amount;
+      const delta=e.side==='supplier'?-rawDelta:rawDelta;
+      bal+=delta;
+      return {...e,delta,balance:bal};
+    });
+    return withBal.slice().reverse();
+  },[custSales,custPmts,suppPurch,suppPmts]);
+
+  const currentNet=rows.length?rows[0].balance:0; // === getPartyNetBal(party.id)
+  const totalSold=custSales.filter(e=>e.type==='sale').reduce((s,e)=>s+e.amount,0);
+  const totalReturned=Math.abs(custSales.filter(e=>e.type==='return').reduce((s,e)=>s+e.amount,0))
+    +Math.abs(suppPurch.filter(e=>e.type==='return').reduce((s,e)=>s+e.amount,0));
+  const totalReceived=custPmts.reduce((s,e)=>s+e.amount,0);
+  const totalPurchased=suppPurch.filter(e=>e.type==='purchase').reduce((s,e)=>s+e.amount,0);
+  const totalPaid=suppPmts.reduce((s,e)=>s+e.amount,0);
+
+  const typeMeta={
+    sale:{label:'Sale',color:C.blue,badge:'blue'},
+    purchase:{label:'Purchase',color:C.purple,badge:'purple'},
+    return:{label:'Return',color:C.amber,badge:'amber'},
+    payment:{label:'Payment',color:C.green,badge:'green'},
+  };
+
+  const sendPaymentReminder=()=>{
+    if(currentNet<=0)return toast('No net amount owed to us','error');
+    const msg=applyTemplate('payment',{amount:fmt(currentNet),partyName:party.name,invoiceDetails:''});
+    const ph=party.phone;
+    window.open(ph?('https://wa.me/91'+ph+'?text='+encodeURIComponent(msg)):('https://wa.me/?text='+encodeURIComponent(msg)),'_blank');
+  };
+
+  const exportLedgerExcel=()=>{
+    if(!rows.length)return toast('No transactions recorded yet','error');
+    const chrono=rows.slice().reverse();
+    const aoa=[
+      ['Upkaran ERP — Combined Party Ledger'],
+      [party.name],
+      [],
+      ['Date','Type','Particulars','Amount','Net Balance'],
+    ];
+    for(const e of chrono) aoa.push([fmtD(e.date),typeMeta[e.type].label,e.desc,e.delta,e.balance]);
+    aoa.push([]);
+    aoa.push(['','','Closing Net Balance','',currentNet]);
+    const ws=XLSX.utils.aoa_to_sheet(aoa);
+    ws['!cols']=[{wch:12},{wch:10},{wch:38},{wch:12},{wch:12}];
+    ws['!merges']=[{s:{r:0,c:0},e:{r:0,c:4}},{s:{r:1,c:0},e:{r:1,c:4}}];
+    const wb=XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb,ws,'Ledger');
+    XLSX.writeFile(wb,party.name.replace(/[^a-z0-9]+/gi,'-')+'-combined-ledger-'+today()+'.xlsx');
+    toast('Ledger exported ✓');
+  };
+
+  const exportLedgerPDF=()=>{
+    if(!rows.length)return toast('No transactions recorded yet','error');
+    const chrono=rows.slice().reverse();
+    const rs=n=>'Rs '+Number(n||0).toLocaleString('en-IN');
+    const body=chrono.map(e=>[fmtD(e.date),typeMeta[e.type].label,e.desc,rs(e.delta),rs(e.balance)]);
+    body.push(['','','Closing Net Balance','',rs(currentNet)]);
+    const doc=new jsPDF({orientation:'landscape',unit:'pt',format:'a4'});
+    doc.setFontSize(16);doc.setFont(undefined,'bold');
+    doc.text('Upkaran ERP - Combined Party Ledger',40,40);
+    doc.setFontSize(11);doc.setFont(undefined,'normal');
+    doc.text(party.name,40,58);
+    autoTable(doc,{
+      startY:76,
+      head:[['Date','Type','Particulars','Amount','Net Balance']],
+      body,
+      styles:{fontSize:8,cellPadding:4},
+      headStyles:{fillColor:[124,58,237],textColor:255,fontStyle:'bold'},
+      columnStyles:{3:{halign:'right'},4:{halign:'right'}},
+      margin:{left:40,right:40},
+    });
+    doc.save(party.name.replace(/[^a-z0-9]+/gi,'-')+'-combined-ledger-'+today()+'.pdf');
+    toast('Ledger exported ✓');
+  };
+
+  const pageRows=rows.slice(actPage*PAGE,(actPage+1)*PAGE);
+  const totalPages=Math.ceil(rows.length/PAGE);
+
+  return <Modal title={party.name+' — Combined Ledger'} onClose={onClose} width={680}>
+    <TC/>
+    {viewSale&&<SaleBillModal sale={viewSale} onClose={()=>setViewSale(null)}/>}
+    {viewPurchase&&<PurchaseViewModal purchase={viewPurchase} onClose={()=>setViewPurchase(null)}/>}
+    <div style={{marginBottom:12,padding:'6px 10px',borderRadius:6,background:C.purpleSoft,fontSize:11,color:C.purple,fontWeight:600}}>
+      🟣 BOTH — this party buys from and sells to us; this is the single combined balance across both sides.
+    </div>
+    <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16,flexWrap:'wrap',gap:12}}>
+      <div>
+        <div style={{fontSize:11,color:C.sub,textTransform:'uppercase',letterSpacing:.5}}>{currentNet===0?'Settled':currentNet>0?'Net Owed To Us':'Net We Owe'}</div>
+        <div style={{fontSize:28,fontWeight:800,color:currentNet>0?C.red:currentNet<0?C.green:C.muted,fontVariantNumeric:'tabular-nums'}}>{currentNet<0?'−':''}{fmt(Math.abs(currentNet))}</div>
+        {currentNet>0&&<button onClick={sendPaymentReminder} style={{marginTop:6,display:'flex',alignItems:'center',gap:6,padding:'5px 12px',borderRadius:7,border:'none',background:'#25D366',color:'#fff',cursor:'pointer',fontSize:11,fontWeight:700,fontFamily:'inherit'}}>📲 Send Payment Reminder</button>}
+      </div>
+      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8,textAlign:'right'}}>
+        <div><div style={{fontSize:10,color:C.sub}}>Total Sold</div><div style={{fontWeight:700,color:C.txt}}>{fmt(totalSold)}</div></div>
+        <div><div style={{fontSize:10,color:C.sub}}>Total Received</div><div style={{fontWeight:700,color:C.green}}>{fmt(totalReceived)}</div></div>
+        <div><div style={{fontSize:10,color:C.sub}}>Total Purchased</div><div style={{fontWeight:700,color:C.txt}}>{fmt(totalPurchased)}</div></div>
+        <div><div style={{fontSize:10,color:C.sub}}>Total Paid</div><div style={{fontWeight:700,color:C.green}}>{fmt(totalPaid)}</div></div>
+        {totalReturned>0&&<div style={{gridColumn:'1/-1'}}><div style={{fontSize:10,color:C.sub}}>Total Returned</div><div style={{fontWeight:700,color:C.amber}}>{fmt(totalReturned)}</div></div>}
+      </div>
+    </div>
+
+    <div style={{display:'flex',justifyContent:'flex-end',gap:8,marginBottom:16}}>
+      <Btn onClick={exportLedgerExcel} variant="secondary" size="sm" icon="⬇">Excel</Btn>
+      <Btn onClick={exportLedgerPDF} variant="secondary" size="sm" icon="⬇">PDF</Btn>
+    </div>
+
+    <div style={{fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,marginBottom:8}}>Combined Activity {rows.length>0&&`(${rows.length})`}</div>
+    <div style={{border:`1px solid ${C.bdr}`,borderRadius:8,overflow:'hidden',marginBottom:8,background:mobile?'transparent':undefined,padding:mobile?8:0}}>
+      <CardTable mobile={mobile} rows={pageRows} keyFn={(r,i)=>i} emptyLabel="No sales or purchases recorded yet"
+        onRowClick={r=>{
+          if(r.type!=='return'&&r.side==='customer'&&r.saleId){const found=state.sales.find(x=>x.id===r.saleId);if(found)setViewSale(found);}
+          else if(r.type!=='return'&&r.side==='supplier'&&r.purchaseId){const found=state.purchases.find(x=>x.id===r.purchaseId);if(found)setViewPurchase(found);}
+        }}
+        columns={[
+          {key:'date',label:'Date',render:r=><span style={{color:C.sub,whiteSpace:'nowrap'}}>{fmtD(r.date)}</span>},
+          {key:'type',label:'Type',render:r=><Badge v={typeMeta[r.type].label+(r.type==='payment'?(r.side==='customer'?' in':' out'):'')} color={typeMeta[r.type].badge}/>},
+          {key:'desc',label:'Description',render:r=>{
+            const clickable=r.type!=='return'&&((r.side==='customer'&&r.saleId)||(r.side==='supplier'&&r.purchaseId));
+            return <span style={{fontSize:12,color:clickable?C.blue:C.sub,textDecoration:clickable?'underline':'none',textDecorationStyle:'dotted'}}>{r.desc}</span>;
+          }},
+          {key:'amount',label:'Amount',align:'right',render:r=><span style={{fontWeight:700,color:r.delta>0?C.red:C.green,fontVariantNumeric:'tabular-nums'}}>{r.delta>0?'+':r.delta<0?'−':''}{fmt(Math.abs(r.delta))}</span>},
+          {key:'balance',label:'Net Balance',align:'right',render:r=><span style={{fontWeight:700,color:r.balance>0?C.red:r.balance<0?C.green:C.muted,fontVariantNumeric:'tabular-nums'}}>{r.balance<0?'−':''}{fmt(Math.abs(r.balance))}</span>},
+        ]}/>
+    </div>
+    {totalPages>1&&<div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:8,marginBottom:4}}>
+      <Btn onClick={()=>setActPage(p=>Math.max(0,p-1))} disabled={actPage===0} variant="secondary" size="sm">← Prev</Btn>
+      <span style={{fontSize:12,color:C.sub}}>Page {actPage+1} of {totalPages}</span>
+      <Btn onClick={()=>setActPage(p=>Math.min(totalPages-1,p+1))} disabled={actPage>=totalPages-1} variant="secondary" size="sm">Next →</Btn>
+    </div>}
+  </Modal>;
+}
+
 function PartyLedger({party,onClose}){
   const mobile=useIsMobile();
-  // A 'both' party has independent customer-side and supplier-side activity
-  // that this component's single isSupplier-branches-everything structure
-  // can't show merged into one view — so for a 'both' party the user picks
-  // which side to view via a toggle, defaulting to customer, and every
-  // existing isSupplier-gated calculation below is unaffected (still just
-  // reads one boolean, same as a plain 'customer'/'supplier' party).
-  const[viewAs,setViewAs]=useState('customer');
-  const isSupplier=party.type==='both'?viewAs==='supplier':party.type==='supplier';
+  // 'both'-type parties (buy from AND sell to us) get the single merged,
+  // netted ledger above instead of this component's Customer/Supplier
+  // toggle — branching here keeps every existing isSupplier-gated
+  // calculation below completely unchanged for plain customer/supplier/
+  // transporter parties (zero regression risk to the far more common case).
+  if(party.type==='both') return <MergedPartyLedger party={party} onClose={onClose}/>;
+  const isSupplier=party.type==='supplier';
   const isTransporterParty=party.type==='transporter';
   const PAGE=20;
   const[actPage,setActPage]=useState(0);
@@ -3551,10 +4065,8 @@ function PartyLedger({party,onClose}){
     {viewPurchase&&<PurchaseViewModal purchase={viewPurchase} onClose={()=>setViewPurchase(null)}/>}
     {showRepairModal&&<RepairExpenseModal party={party} onClose={()=>setShowRepairModal(false)} onSaved={()=>setShowRepairModal(false)}/>}
     {showProfit&&<PartySaleProfitModal party={party} onClose={()=>setShowProfit(false)}/>}
-    {party.type==='both'&&<div style={{display:'flex',gap:8,marginBottom:14}}>
-      <Chip v="View as Customer" active={viewAs==='customer'} onClick={()=>setViewAs('customer')}/>
-      <Chip v="View as Supplier" active={viewAs==='supplier'} onClick={()=>setViewAs('supplier')}/>
-    </div>}
+    {/* 'both'-type parties never reach this component (see the early return
+        above) — the Customer/Supplier toggle that used to live here is gone. */}
     <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}}>
       <div>
         <div style={{fontSize:11,color:C.sub,textTransform:'uppercase',letterSpacing:.5}}>{currentOD<0?'In Credit':(isSupplier||isTransporterParty)?'Current Payable':'Current Outstanding'}</div>
@@ -4134,6 +4646,10 @@ function AccountsModule() {
   const selParty = useMemo(()=>partyList.find(p=>p.id===partyId),[partyList,partyId]);
   const partyOD  = useMemo(()=>{
     if(!selParty) return 0;
+    // 'both'-type parties show the one netted balance (per the single-ledger
+    // redesign) regardless of which side of the form (sale/purchase) is open,
+    // rather than the one-sided customer/supplier figure.
+    if(selParty.type==='both') return getPartyNetBal(selParty.id);
     if(isSupplier||isTransporter) return getSupplierBal(selParty.id);
     return getCustomerBal(selParty.id);
   },[selParty?.id,isSupplier,isTransporter,state.sales.length,state.payments.length,state.txns.length,state.purchases.length,state.supplierPayments.length,state.freightCharges.length]);
@@ -4478,10 +4994,11 @@ function AccountsModule() {
                     <span style={{fontSize:11,color:C.sub,marginLeft:8}}>{p.city}</span>
                     {/* p comes from partyList, which is already picked by the
                         form's own mode (isSupplier/isTransporter) above — use
-                        that mode rather than p.type directly, since a 'both'
-                        party's p.type alone wouldn't tell us which balance
-                        the user is currently entering a payment against. */}
-                    {(()=>{const _od=(isSupplier||isTransporter)?getSupplierBal(p.id):getCustomerBal(p.id);return _od!==0&&<span style={{fontSize:11,color:_od>0?C.red:C.green,marginLeft:8,fontWeight:600}}>{_od>0?'OD '+fmt(_od):'Credit '+fmt(-_od)}</span>;})()}
+                        that mode rather than p.type directly, EXCEPT for a
+                        'both' party, which always shows its one netted
+                        balance (per the single-ledger redesign) regardless
+                        of which category/mode the user has open. */}
+                    {(()=>{const _od=p.type==='both'?getPartyNetBal(p.id):(isSupplier||isTransporter)?getSupplierBal(p.id):getCustomerBal(p.id);return _od!==0&&<span style={{fontSize:11,color:_od>0?C.red:C.green,marginLeft:8,fontWeight:600}}>{_od>0?'OD '+fmt(_od):'Credit '+fmt(-_od)}</span>;})()}
                   </div>
                 ))}
                 {showAdd&&<div onMouseDown={()=>setQuickAdd(pq)}
@@ -5090,19 +5607,25 @@ function Dashboard({navigate,reviewOrder,setReviewOrder,doneSale,setDoneSale}){
       :pendingOrdersOpen.slice(0,8).map(order=>{
         const st=computeOrderStatus(order);
         const lines=(order.items||[]).filter(l=>(l.qty||0)>0);
-        const totalAmt=lines.reduce((s,l)=>s+(l.qty||0)*(l.rate||0),0);
         return <div key={order.id} onClick={()=>setReviewOrder(order)} title="Click to review, edit, and dispatch"
-          style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'8px 16px',borderBottom:`1px solid ${C.bdr}`,gap:10,cursor:'pointer'}}>
-          <div style={{minWidth:0}}>
+          style={{padding:'8px 16px',borderBottom:`1px solid ${C.bdr}`,cursor:'pointer'}}>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:10,marginBottom:3}}>
             <div style={{fontWeight:600,color:C.txt,fontSize:12}}>{order.partyName}</div>
-            <div style={{fontSize:11,color:C.sub,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
-              {/* Pending Sales Orders board — dispatch-facing, use dispatch name (new request #1) */}
-              {lines.length===1
-                ?`${lines[0].dispatchName||lines[0].itemName} ×${lines[0].qty} @ ${fmt(lines[0].rate)}`
-                :`${lines.length} items · ${fmt(totalAmt)}`}
-            </div>
+            <Badge v={st.label} color={st.color}/>
           </div>
-          <Badge v={st.label} color={st.color}/>
+          {/* Request #4: every line of the order under the party name — rate +
+              qty per item, colored by live availability (green = available,
+              red = not available yet) rather than one collapsed summary line
+              or a single order-level badge hiding which specific item is stuck. */}
+          <div style={{display:'flex',flexDirection:'column',gap:1}}>
+            {lines.map((l,i)=>{
+              const lst=computeOrderLineStatus(l);
+              const available=lst.label==='Available';
+              return <div key={i} style={{fontSize:11,color:available?C.green:C.red,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
+                {l.dispatchName||l.itemName} ×{l.qty} @ {fmt(l.rate)}{!available?' — '+lst.label:''}
+              </div>;
+            })}
+          </div>
         </div>;
       })}
   </div>;
@@ -5174,6 +5697,21 @@ function Dashboard({navigate,reviewOrder,setReviewOrder,doneSale,setDoneSale}){
   // Reorder list (requests #5/#6 — one feature: a list of items at/below
   // their set reorder level, plus a bulk editor to set levels for all
   // items). getReorderItems() (store.js) reads item.reorderLevel.
+  // Request #5 (this batch): "Place Order" button — prefills the Purchase
+  // form (supplier from whoever most recently sold us this item, qty = the
+  // shortfall back up to the reorder level, rate = that supplier's last
+  // rate for it) via the pendingPurchasePrefill hand-off, then jumps to the
+  // Purchases page where PurchaseEntry consumes it on mount.
+  const placeOrder=it=>{
+    const lastSup=getLastSupplierForItem(it.id);
+    const shortfall=Math.max(it.reorderLevel-it.available,it.peti||1);
+    pendingPurchasePrefill={
+      partyId:lastSup?.partyId||'',partyName:lastSup?.partyName||'',
+      items:[{itemId:it.id,itemName:it.internal||it.name||'',customerName:it.customer||it.internal||'',
+        supplierName:it.supplier||it.internal||'',peti:it.peti||1,qty:shortfall,rate:lastSup?.rate||it.purch||0}],
+    };
+    navigate('purch-log');
+  };
   const reorderBlock=<div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,overflow:'hidden'}}>
     <div style={{padding:'12px 16px',borderBottom:`1px solid ${C.bdr}`,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
       <h3 style={{margin:0,fontSize:14,fontWeight:700,color:C.txt}}>🔁 Reorder List · {reorderItems.length}</h3>
@@ -5190,7 +5728,10 @@ function Dashboard({navigate,reviewOrder,setReviewOrder,doneSale,setDoneSale}){
             {it.dispatchName||it.internal||it.name}
             {it.reserved>0&&<span style={{display:'block',fontSize:10,color:C.sub,fontWeight:400}}>{it.stock||0} on hand − {it.reserved} to go out</span>}
           </div>
-          <Badge v={it.available+' / '+it.reorderLevel} color={it.available<=0?'red':'amber'}/>
+          <div style={{display:'flex',alignItems:'center',gap:8,flexShrink:0}}>
+            <Badge v={it.available+' / '+it.reorderLevel} color={it.available<=0?'red':'amber'}/>
+            <Btn onClick={()=>placeOrder(it)} size="sm" variant="secondary">Place Order</Btn>
+          </div>
         </div>)}
   </div>;
 
@@ -5241,7 +5782,7 @@ function Dashboard({navigate,reviewOrder,setReviewOrder,doneSale,setDoneSale}){
   // of pill buttons rather than a bordered card with a title. Still renders
   // as the original card grid on mobile, where there's no header real-estate
   // to dock onto.
-  const quickActions=[{l:'New Sale',i:'🧾',m:'sale',c:C.blue},{l:'New Sale Order',i:'📲',m:'orders',c:C.amber},{l:'Outstanding',i:'⏰',m:'outstanding',c:C.red},{l:'Parties',i:'🏪',m:'parties',c:C.green},{l:'Inventory',i:'📦',m:'items',c:C.purple}];
+  const quickActions=[{l:'New Sale Order',i:'📲',m:'orders',c:C.amber},{l:'Outstanding',i:'⏰',m:'outstanding',c:C.red},{l:'Parties',i:'🏪',m:'parties',c:C.green},{l:'Inventory',i:'📦',m:'items',c:C.purple}];
   const quickActionsBlock=mobile
     ?<div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,padding:'14px 16px'}}>
       <h3 style={{margin:'0 0 10px',fontSize:14,fontWeight:700,color:C.txt}}>Quick Actions</h3>
@@ -5281,7 +5822,7 @@ function Dashboard({navigate,reviewOrder,setReviewOrder,doneSale,setDoneSale}){
         <div style={{marginTop:2}}>Lighter {fmtL(monthCatSplit.lighter)} · Appliances {fmtL(monthCatSplit.appliances)}</div>
       </>:'No sales'} color={C.green} icon="🧾"/>
       {role==='owner'&&<StatCard label="Profit This Month" value={fmtL(monthProfit.profit)} sub={monthProfit.qty?`${monthProfit.qty} pcs · FIFO landed cost`:'No sales yet'} color={monthProfit.profit>=0?C.green:C.red} icon="💰"/>}
-      {role==='owner'&&<StatCard label="Net of Business Expenses" value={fmtL(netOfExpenses)} sub={monthBizExpenses?`− ${fmtL(monthBizExpenses)} business expenses`:'No expenses booked'} color={netOfExpenses>=0?C.green:C.red} icon="🧮" onClick={()=>navigate('profit')}/>}
+      {role==='owner'&&<StatCard label="Net Profit" value={fmtL(netOfExpenses)} sub={monthBizExpenses?`− ${fmtL(monthBizExpenses)} business expenses`:'No expenses booked'} color={netOfExpenses>=0?C.green:C.red} icon="🧮" onClick={()=>navigate('profit')}/>}
       <StatCard label="Pending Sale Orders" value={String(pendingOrdersCount)} sub={pendingOrdersCount?'Awaiting dispatch':'All clear'} color={pendingOrdersCount>0?C.amber:C.green} icon="📲" onClick={()=>navigate('orders')}/>
     </div>
     {/* Finance tiles — Total Receivables / Receivables Due / Total Payables
@@ -5574,7 +6115,13 @@ function QuickSellModal({item,source,onClose,onSold}){
   const[pq,setPq]=useState('');
   const[partyId,setPartyId]=useState('');
   const[qty,setQty]=useState('');
-  const[rate,setRate]=useState(item.sale||0);
+  // Damaged/repaired items can have their own default selling price set in
+  // their respective inventory lists (they're usually sold at a discount
+  // off the fresh-stock rate) — prefill from that override when selling out
+  // of that bucket, falling back to the normal item.sale rate otherwise.
+  const defaultRateFor=b=>(b==='damaged'?item.damagedSalePrice:b==='repaired'?item.repairedSalePrice:null)||item.sale||0;
+  const[rate,setRate]=useState(defaultRateFor(bucket));
+  const changeBucket=b=>{setBucket(b);setRate(defaultRateFor(b));};
   const custs=useMemo(()=>state.parties.filter(isCustomerParty).sort((a,b)=>a.name.localeCompare(b.name)),[]);
   const sel=custs.find(p=>p.id===partyId);
   const psugg=useMemo(()=>pq.length<1?[]:custs.filter(p=>p.name.toLowerCase().includes(pq.toLowerCase())).slice(0,8),[pq,custs]);
@@ -5598,7 +6145,7 @@ function QuickSellModal({item,source,onClose,onSold}){
     {buckets.length>1&&<div style={{marginBottom:12}}>
       <div style={{fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,marginBottom:6}}>Sell from</div>
       <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
-        {buckets.map(b=><Chip key={b.key} v={b.label+' ('+b.qty+')'} active={bucket===b.key} onClick={()=>setBucket(b.key)}/>)}
+        {buckets.map(b=><Chip key={b.key} v={b.label+' ('+b.qty+')'} active={bucket===b.key} onClick={()=>changeBucket(b.key)}/>)}
       </div>
     </div>}
     {buckets.length===0&&<div style={{padding:'10px 14px',background:C.redSoft,borderRadius:8,color:C.red,fontSize:12,marginBottom:12}}>No stock left in any bucket for this item.</div>}
@@ -5634,9 +6181,21 @@ function DamagedInventory(){
   const[items,setItems]=useState(()=>state.items.filter(it=>(it.damaged||0)>0));
   const[repairQty,setRepairQty]=useState({});
   const[fixQty,setFixQty]=useState({});
+  const[priceVal,setPriceVal]=useState({});
   const[sellItem,setSellItem]=useState(null);
   const{toast,TC}=useToast();
   const refresh=()=>setItems(state.items.filter(it=>(it.damaged||0)>0));
+  const doSetPrice=it=>{
+    const v=priceVal[it.id];
+    if(v===undefined||v==='')return;
+    const n=Number(v);
+    if(isNaN(n)||n<0)return toast('Enter a valid price','error');
+    state.items=state.items.map(x=>x.id===it.id?{...x,damagedSalePrice:n}:x);
+    save.items();
+    setPriceVal(p=>({...p,[it.id]:''}));
+    refresh();
+    toast('Selling price set ✓');
+  };
   // A returned-goods trail (a sales return that touched this item) means the
   // damaged qty is legitimate. Anything sitting in damaged with NO such trail
   // can only have gotten there before purchases were fixed to land in stock
@@ -5691,6 +6250,13 @@ function DamagedInventory(){
     {key:'cat',label:'Category',render:it=><span style={{color:C.sub}}>{it.cat||'—'}</span>},
     {key:'damaged',label:'Damaged (pcs)',align:'right',render:it=><span style={{fontWeight:700,color:C.amber}}>{it.damaged||0}</span>},
     {key:'value',label:'Value',align:'right',render:it=><span style={{color:C.sub}}>{fmt((it.damaged||0)*(it.purch||0))}</span>},
+    {key:'sellPrice',label:'Selling Price ₹',align:'right',render:it=>
+      <div style={{display:'flex',gap:4,justifyContent:'flex-end',alignItems:'center'}}>
+        <input type="number" value={priceVal[it.id]??''} onChange={e=>setPriceVal(p=>({...p,[it.id]:e.target.value}))}
+          placeholder={String(it.damagedSalePrice||it.sale||0)} onKeyDown={e=>{if(e.key==='Enter')doSetPrice(it);}}
+          style={{width:65,padding:'4px 6px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:12,textAlign:'right',fontFamily:'inherit'}}/>
+        <Btn onClick={()=>doSetPrice(it)} size="sm" variant="secondary">Set</Btn>
+      </div>},
     {key:'repair',label:'Repair (genuinely damaged)',align:'right',render:it=>
       <div style={{display:'flex',gap:4,justifyContent:'flex-end',alignItems:'center'}}>
         <input type="number" value={repairQty[it.id]||''} onChange={e=>setRepairQty(r=>({...r,[it.id]:e.target.value}))}
@@ -5735,9 +6301,21 @@ function RepairedInventory(){
   const[items,setItems]=useState(()=>state.items.filter(it=>(it.repaired||0)>0));
   const[editVal,setEditVal]=useState({});
   const[shiftVal,setShiftVal]=useState({});
+  const[priceVal,setPriceVal]=useState({});
   const[sellItem,setSellItem]=useState(null);
   const{toast,TC}=useToast();
   const refresh=()=>setItems(state.items.filter(it=>(it.repaired||0)>0));
+  const doSetPrice=it=>{
+    const v=priceVal[it.id];
+    if(v===undefined||v==='')return;
+    const n=Number(v);
+    if(isNaN(n)||n<0)return toast('Enter a valid price','error');
+    state.items=state.items.map(x=>x.id===it.id?{...x,repairedSalePrice:n}:x);
+    save.items();
+    setPriceVal(p=>({...p,[it.id]:''}));
+    refresh();
+    toast('Selling price set ✓');
+  };
   const doShift=it=>{
     const v=shiftVal[it.id];
     const n=Number(v);
@@ -5771,6 +6349,13 @@ function RepairedInventory(){
     {key:'cat',label:'Category',render:it=><span style={{color:C.sub}}>{it.cat||'—'}</span>},
     {key:'repaired',label:'Repaired (pcs)',align:'right',render:it=><span style={{fontWeight:700,color:C.green}}>{it.repaired||0}</span>},
     {key:'value',label:'Value',align:'right',render:it=><span style={{color:C.sub}}>{fmt((it.repaired||0)*(it.purch||0))}</span>},
+    {key:'sellPrice',label:'Selling Price ₹',align:'right',render:it=>
+      <div style={{display:'flex',gap:4,justifyContent:'flex-end',alignItems:'center'}}>
+        <input type="number" value={priceVal[it.id]??''} onChange={e=>setPriceVal(p=>({...p,[it.id]:e.target.value}))}
+          placeholder={String(it.repairedSalePrice||it.sale||0)} onKeyDown={e=>{if(e.key==='Enter')doSetPrice(it);}}
+          style={{width:65,padding:'4px 6px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:12,textAlign:'right',fontFamily:'inherit'}}/>
+        <Btn onClick={()=>doSetPrice(it)} size="sm" variant="secondary">Set</Btn>
+      </div>},
     {key:'correct',label:'Correct qty',align:'right',render:it=>
       <div style={{display:'flex',gap:4,justifyContent:'flex-end',alignItems:'center'}}>
         <input type="number" value={editVal[it.id]??''} onChange={e=>setEditVal(v=>({...v,[it.id]:e.target.value}))}
@@ -6239,13 +6824,15 @@ function MobileInventoryList({items,catF,saleOf,purchOf,marginOf,expectedMap,res
               {repaired>0&&<Row label="Repaired" value={<Badge v={repaired+' pcs'} color="green"/>}/>}
               {expected>0&&<Row label="Expected" value={<span style={{color:C.amber,fontWeight:700}}>+{expected}</span>}/>}
               {reserved>0&&<Row label="To Go Out" value={<span style={{color:C.blue,fontWeight:700}}>−{reserved}</span>}/>}
-              <div style={{display:'flex',gap:6,justifyContent:'flex-end',flexWrap:'wrap',marginTop:4}}>
-                {(it.active===false||damaged>0||repaired>0)&&(stock+damaged+repaired)>0&&
-                  <IconBtn onClick={()=>onSell(it)} title="Sell off this item's stock (incl. damaged/repaired/discontinued)">💸</IconBtn>}
-                <IconBtn onClick={()=>onShare(it)} title="Share">📤</IconBtn>
-                <IconBtn onClick={()=>onMove(it)} title="Move stock">🔀</IconBtn>
-                <IconBtn onClick={()=>onMerge(it)} title="Merge">🔗</IconBtn>
-                <IconBtn onClick={()=>onEdit(it)} title="Edit">✏️</IconBtn>
+              <div style={{display:'flex',justifyContent:'flex-end',marginTop:4}}>
+                <RowActionsMenu items={[
+                  {label:'Sell off stock',icon:'💸',onClick:()=>onSell(it),
+                    show:(it.active===false||damaged>0||repaired>0)&&(stock+damaged+repaired)>0},
+                  {label:'Share',icon:'📤',onClick:()=>onShare(it)},
+                  {label:'Move stock',icon:'🔀',onClick:()=>onMove(it)},
+                  {label:'Merge',icon:'🔗',onClick:()=>onMerge(it)},
+                  {label:'Edit',icon:'✏️',onClick:()=>onEdit(it)},
+                ]}/>
               </div>
             </div>
           </td></tr>}
@@ -6595,14 +7182,16 @@ function ItemMasters(){
             return <span style={{color:reserved>0?C.blue:C.muted,fontWeight:reserved>0?700:400}} title="Qty already committed to pending Sales Orders">{reserved>0?'−'+reserved:'—'}</span>;
           }},
           {key:'actions',label:'',cardLabel:'Actions',render:it=>
-            <div style={{display:'flex',gap:6,justifyContent:'flex-end',flexWrap:'wrap'}}>
-              {(it.active===false||(it.damaged||0)>0||(it.repaired||0)>0)&&((it.stock||0)+(it.damaged||0)+(it.repaired||0))>0&&
-                <IconBtn onClick={()=>setSellItem(it)} title="Sell off this item's stock (incl. damaged/repaired/discontinued)">💸</IconBtn>}
-              <IconBtn onClick={()=>setShareItem(it)} title="Share">📤</IconBtn>
-              <IconBtn onClick={()=>setMoveSrc(it)} title="Move stock">🔀</IconBtn>
-              <IconBtn onClick={()=>setReconcileSrc(it)} title="Reconcile stock (physical count)">🔢</IconBtn>
-              <IconBtn onClick={()=>setMergeSrc(it)} title="Merge">🔗</IconBtn>
-              <IconBtn onClick={()=>openEdit(it)} title="Edit">✏️</IconBtn>
+            <div style={{display:'flex',justifyContent:'flex-end'}}>
+              <RowActionsMenu items={[
+                {label:'Sell off stock',icon:'💸',onClick:()=>setSellItem(it),
+                  show:(it.active===false||(it.damaged||0)>0||(it.repaired||0)>0)&&((it.stock||0)+(it.damaged||0)+(it.repaired||0))>0},
+                {label:'Share',icon:'📤',onClick:()=>setShareItem(it)},
+                {label:'Move stock',icon:'🔀',onClick:()=>setMoveSrc(it)},
+                {label:'Reconcile stock',icon:'🔢',onClick:()=>setReconcileSrc(it)},
+                {label:'Merge',icon:'🔗',onClick:()=>setMergeSrc(it)},
+                {label:'Edit',icon:'✏️',onClick:()=>openEdit(it)},
+              ]}/>
             </div>},
         ].filter(c=>role==='owner'||!['purch','margin','marginPerPc'].includes(c.key))}/>}
     </div>
@@ -6907,9 +7496,8 @@ function StockReconciliationModal({item:preItem,onClose,onDone}){
   const doSave=()=>{
     if(!item)return toast('Pick an item to reconcile','error');
     if(pqNum==null||pqNum<0)return toast('Enter the physical count','error');
-    if(diff===0)return toast('No mismatch — physical count already matches book qty','error');
     reconcileItemStock(item.id,pqNum,notes);
-    toast((diff>0?'Excess of '+diff:'Shortfall of '+(-diff))+' pcs logged for "'+(item.internal||item.name)+'" ✓');
+    toast(diff===0?'Confirmed — count matches book qty, logged ✓':(diff>0?'Excess of '+diff:'Shortfall of '+(-diff))+' pcs logged for "'+(item.internal||item.name)+'" ✓');
     onDone?.();
   };
   return <Modal title="Reconcile Stock" onClose={onClose} width={440}>
@@ -6946,7 +7534,7 @@ function StockReconciliationModal({item:preItem,onClose,onDone}){
     </div>}
     <div style={{display:'flex',justifyContent:'flex-end',gap:8,marginTop:10}}>
       <Btn onClick={onClose} variant="secondary">Cancel</Btn>
-      <Btn onClick={doSave} disabled={!item||pqNum==null||diff===0} variant="primary">Log Reconciliation</Btn>
+      <Btn onClick={doSave} disabled={!item||pqNum==null} variant="primary">Log Reconciliation</Btn>
     </div>
   </Modal>;
 }
@@ -7037,7 +7625,10 @@ function PartyMasters(){
           {key:'city',label:'City',render:p=><span style={{color:C.sub,fontSize:12}}>{p.city||'—'}</span>},
           {key:'route',label:'Route',render:p=><Badge v={p.route||'—'} color={p.route==='CG North'?'blue':p.route==='CG South'?'green':p.route==='Odisha'?'amber':'gray'}/>},
           {key:'od',label:(typeF==='supplier'||typeF==='transporter')?'Payable ₹':'OD ₹',align:'right',render:p=>{
-            const od=(typeF==='supplier'||typeF==='transporter')?getSupplierBal(p.id):getCustomerBal(p.id);
+            // 'both'-type parties (buy from AND sell to) get ONE netted balance
+            // here too, per the single-ledger redesign — receivable minus
+            // payable, regardless of which type-filter chip is active.
+            const od=p.type==='both'?getPartyNetBal(p.id):(typeF==='supplier'||typeF==='transporter')?getSupplierBal(p.id):getCustomerBal(p.id);
             return <span style={{fontWeight:od!==0?700:400,color:od>0?C.red:od<0?C.green:C.muted}}>{od!==0?(od<0?'−':'')+fmt(Math.abs(od)):'—'}</span>;
           }},
           {key:'phone',label:'Phone',render:p=>
@@ -7283,6 +7874,19 @@ function PurchaseEntry({onSaved}){
   const[saving,setSaving]=useState(false);
   const{toast,TC}=useToast();
   const stepInputId='purch-step-input';
+
+  // Request #5 (Dashboard Reorder List "Place Order"): one-shot consume of
+  // pendingPurchasePrefill set by the Dashboard just before navigating here
+  // — prefills the supplier (if a past purchase gave us one) and drops the
+  // reorder item straight into `lines` so the user lands on a form that's
+  // already ready to save, rather than re-typing the item/qty/rate wizard.
+  useEffect(()=>{
+    if(!pendingPurchasePrefill)return;
+    const pf=pendingPurchasePrefill;
+    pendingPurchasePrefill=null;
+    if(pf.partyId)setPartyId(pf.partyId);
+    setLines(p=>[...p,...pf.items.map(l=>({id:uid('L'),itemId:l.itemId,itemName:l.itemName,customerName:l.customerName,supplierName:l.supplierName,peti:l.peti||1,qty:l.qty,rate:l.rate,freightPerPeti:0}))]);
+  },[]);
 
   // Named extra charges on the purchase itself (loading, packing, octroi, GST,
   // etc.) — owed to the SAME supplier, unlike freight which goes to a separate
@@ -9064,6 +9668,7 @@ function App(){
         reviewOrder={reviewOrder} setReviewOrder={setReviewOrder}
         doneSale={doneSale} setDoneSale={setDoneSale}/>;
       case'outstanding':return <Outstanding/>;
+      case'sales-followup':return <SalesFollowupModule/>;
       case'parties':   return <PartyMasters/>;
       case'items':     return <ItemMasters/>;
       case'accounts':   return role==='owner'?<AccountsModule/>:<RestrictedAccess/>;
@@ -9157,9 +9762,6 @@ function App(){
         <div style={{display:'flex',alignItems:'center',gap:mobile?8:10,minWidth:0}}>
           {mobile&&<button onClick={()=>setSideOpen(o=>!o)} style={{background:'none',border:'none',cursor:'pointer',fontSize:18,color:C.sub,flexShrink:0,padding:0}}>☰</button>}
           <span style={{fontSize:mobile?13:14,fontWeight:700,color:C.txt,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{NAV.find(n=>n.id===mod)?.label||'Dashboard'}</span>
-        </div>
-        <div style={{display:'flex',gap:8,flexShrink:0}}>
-          <button onClick={()=>nav('sale')} style={{padding:mobile?'6px 10px':'6px 14px',borderRadius:7,background:C.blue,color:'#fff',border:'none',cursor:'pointer',fontSize:mobile?11:12,fontWeight:700,fontFamily:'inherit',whiteSpace:'nowrap'}}>{mobile?'+ Sale':'+ New Sale'}</button>
         </div>
       </div>
 
