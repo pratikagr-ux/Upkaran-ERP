@@ -231,17 +231,21 @@ export function getSupplierBills(party) {
 // collect payment (FIFO-matched oldest-bill-vs-oldest-payment, weighted by amount),
 // and a grade based on that collection speed.
 export function getAllCustomerMetrics() {
-  const itemCost = new Map();
-  for (const it of state.items) {
-    if (it.internal) itemCost.set(it.internal.toLowerCase(), it.purch || 0);
-    if (it.customer) itemCost.set((it.customer || '').toLowerCase(), it.purch || 0);
-  }
-  const costOf = name => itemCost.get(String(name || '').toLowerCase()) || 0;
-
   // A 'both'-type party (customer AND supplier) counts as a customer here too
   // — mirrors isCustomerParty() in App.jsx, duplicated here since store.js
   // has no dependency on App.jsx.
   const customers = state.parties.filter(p => p.type === 'customer' || p.type === 'both');
+
+  // totalSales/profit/avgMarginPct now come from the same FIFO cost-layer,
+  // pre-ERP-inclusive engine as the "Profit & Interest Breakdown" drill-down
+  // (getSaleProfitAnalysis via getCustomerProfitSummary) instead of a flat
+  // current-purchase-rate cost basis — that mismatch between this tile and
+  // the modal underneath it was the original bug report. avgPaymentDays/
+  // grade below are a separate, already pre-ERP-inclusive FIFO payment-match
+  // and are left as-is; orderCount stays the raw bill count for the same
+  // reason.
+  const profitByParty = new Map(getCustomerProfitSummary().map(c => [c.partyId, c]));
+
   return customers.map(p => {
     const hist = PARTY_HISTORY[p.name] || {};
     const histBills = (hist.s || []).map(([d, total, items]) => ({ date: d, total, items }));
@@ -250,14 +254,10 @@ export function getAllCustomerMetrics() {
     }));
     const bills = [...histBills, ...newBills];
 
-    let totalSales = 0, totalCost = 0;
-    for (const b of bills) {
-      totalSales += b.total;
-      for (const [name, qty] of b.items) totalCost += (qty || 0) * costOf(name);
-    }
-    const profit = Math.round(totalSales - totalCost);
-    totalSales = Math.round(totalSales);
-    const avgMarginPct = totalSales > 0 ? (profit / totalSales * 100) : 0;
+    const summary = profitByParty.get(p.id);
+    const totalSales = Math.round(summary?.revenue || 0);
+    const profit = Math.round(summary?.grossProfit || 0);
+    const avgMarginPct = summary?.grossMarginPct ?? 0;
 
     const payEvents = [
       ...(hist.p || []).map(([d, amt]) => ({ date: d, amt })),
@@ -401,11 +401,27 @@ function fifoWeightedSettleDateMap(bills, payEvents) {
   return out;
 }
 
+// Pre-ERP historical bills (PARTY_HISTORY.s / SUPPLIER_HISTORY.s) used to be
+// fed into the FIFO payment-matching maps below with id:null, which
+// `fifoWeightedSettleDateMap` then silently drops from its output — so a
+// historical bill never got a traceable paid/received date, and (by
+// extension, before this change) pre-ERP sales/purchases could never be
+// matched into getSaleProfitAnalysis's interest calc at all. These two
+// helpers build a stable synthetic id per historical bill — party + date +
+// its index within that day's list, since PARTY_HISTORY/SUPPLIER_HISTORY
+// have no id of their own — so the SAME bill can be referenced consistently
+// from both the payment-date maps here and the FIFO cost layers in
+// getSaleProfitAnalysis below.
+const histSaleBillId = (partyId, date, idx) => `hist-s:${partyId}:${date}:${idx}`;
+const histPurchBillId = (partyId, date, idx) => `hist-p:${partyId}:${date}:${idx}`;
+
 export function getPurchasePaidDateMap() {
   const out = new Map();
-  for (const p of state.parties.filter(p => p.type === 'supplier')) {
+  // 'both'-type parties (buy from AND sell to) have a supplier side too —
+  // mirrors isSupplierParty() in App.jsx.
+  for (const p of state.parties.filter(p => p.type === 'supplier' || p.type === 'both')) {
     const hist = SUPPLIER_HISTORY[p.name] || {};
-    const histBills = (hist.s || []).map(([d, total]) => ({ id: null, date: d, total }));
+    const histBills = (hist.s || []).map(([d, total], idx) => ({ id: histPurchBillId(p.id, d, idx), date: d, total }));
     const newBills = state.purchases.filter(pu => pu.partyId === p.id && pu.type !== 'return')
       .map(pu => ({ id: pu.id, date: pu.date, total: pu.total + (pu.extraChargesTotal || 0) }));
     const payEvents = [
@@ -419,9 +435,11 @@ export function getPurchasePaidDateMap() {
 
 export function getSaleReceivedDateMap() {
   const out = new Map();
-  for (const p of state.parties.filter(p => p.type === 'customer')) {
+  // 'both'-type parties (buy from AND sell to) have a customer side too —
+  // mirrors isCustomerParty() in App.jsx.
+  for (const p of state.parties.filter(p => p.type === 'customer' || p.type === 'both')) {
     const hist = PARTY_HISTORY[p.name] || {};
-    const histBills = (hist.s || []).map(([d, total]) => ({ id: null, date: d, total }));
+    const histBills = (hist.s || []).map(([d, total], idx) => ({ id: histSaleBillId(p.id, d, idx), date: d, total }));
     const newBills = state.sales.filter(s => s.partyId === p.id && s.type !== 'return').map(s => ({ id: s.id, date: s.date, total: s.total }));
     const payEvents = [
       ...(hist.p || []).map(([d, amt]) => ({ date: d, amt })),
@@ -453,12 +471,101 @@ export function getSaleReceivedDateMap() {
 // from the interest-bearing base (`traceableCost`) — `cost`/`grossProfit`
 // still include it, only the interest calc does not. This is called out in
 // the UI rather than silently assumed.
+//
+// Pre-ERP data (PARTY_HISTORY.s / SUPPLIER_HISTORY.s, the bulk-imported
+// sales/purchases from before this app existed) is folded into the SAME
+// FIFO event stream as the in-app records below, name-matched to an itemId
+// (case-insensitive, against `internal`/`customer`/`mergedNames` — see
+// buildItemNameMap). Per explicit instruction this must never be excluded:
+// a historical sale draws down real FIFO cost layers (including layers
+// built from historical purchases) exactly like an in-app sale, and its
+// cost/interest figures get a profit row of their own, not just a
+// contribution to the opening-stock plug. A name that can't be resolved to
+// a current itemId (an item fully renamed/removed since) is skipped for
+// that one line only — it still can't be cost-tracked, same limitation as
+// before, just narrower now that the known case-collision duplicates are
+// deduped (see the itemsDedupeV1 migration in loadAll).
+function buildItemNameMap() {
+  const map = new Map();
+  for (const it of state.items) {
+    for (const n of [it.internal, it.customer, ...(it.mergedNames || [])]) {
+      // .trim() matters: several PARTY_HISTORY/SUPPLIER_HISTORY rows carry a
+      // trailing space on the item name (e.g. "5ltr Cook Star Chiku ") that
+      // the catalogue's own name doesn't have — same normalization
+      // getItemMetrics() already applies for its own name-matching. Without
+      // it these look unresolved and lose their FIFO cost-tracking.
+      if (n) map.set(String(n).toLowerCase().trim(), it.id);
+    }
+  }
+  return map;
+}
+
 export function getSaleProfitAnalysis() {
+  const nameToId = buildItemNameMap();
   const eventsById = {};
   const add = (id, date, seq, type, netQty, rate, meta) => {
     if (!id) return;
     (eventsById[id] ||= []).push({ date, seq: seq || '', type, netQty, rate, meta });
   };
+
+  // Pre-ERP historical purchases (SUPPLIER_HISTORY.s) become FIFO layers,
+  // oldest first, same as an in-app purchase — just name-matched instead of
+  // itemId-matched, and tagged with a synthetic purchaseId so the interest
+  // calc below can still date-match it via getPurchasePaidDateMap.
+  const histSaleRecords = []; // {id,date,partyId,partyName,revenue} for bills that get their own output row
+  for (const p of state.parties.filter(p => p.type === 'supplier' || p.type === 'both')) {
+    const hist = SUPPLIER_HISTORY[p.name] || {};
+    (hist.s || []).forEach(([date, total, items], idx) => {
+      const purchaseId = histPurchBillId(p.id, date, idx);
+      for (const [name, qty, rate] of (items || [])) {
+        const id = nameToId.get(String(name || '').toLowerCase().trim());
+        if (!id) continue;
+        add(id, date, '', 'purch', qty || 0, rate || 0, { purchaseId });
+      }
+    });
+  }
+  // Pre-ERP historical sales (PARTY_HISTORY.s). A historical return invoice
+  // can record its per-item qty as positive (only the invoice TOTAL carries
+  // the negative sign) rather than negative — same quirk splitPosNegItems()
+  // was written to normalize for getAllItemRows() below, reused here rather
+  // than re-deriving it: a mixed bill splits into a sale segment (isReturn
+  // false, consumes stock) and a return segment (isReturn true, replenishes
+  // stock), a pure invoice is one segment of whichever sign its total has. A
+  // bill with no real sale segment (a standalone return) still walks the
+  // FIFO layers to put stock back, but gets no profit row of its own, same
+  // as `if (s.type==='return') continue` would do for an in-app return.
+  for (const p of state.parties.filter(p => p.type === 'customer' || p.type === 'both')) {
+    const hist = PARTY_HISTORY[p.name] || {};
+    (hist.s || []).forEach(([date, total, items], idx) => {
+      const saleId = histSaleBillId(p.id, date, idx);
+      const segs = splitPosNegItems(total, items);
+      // Revenue for this bill is the sale segment's own recorded total — NOT
+      // reconstructed by summing only the lines that happened to resolve to
+      // a current itemId. A handful of historical line items (spare parts
+      // like "Coil"/"Infrared Wire" that were never catalogued, or a name
+      // that's since been fully retired) can't be name-matched at all; if
+      // revenue were rebuilt line-by-line, a bill where EVERY line fails to
+      // match would silently drop its whole revenue from every profit
+      // figure. That would violate "never exclude pre-ERP data in any use
+      // case", so the bill's real revenue is always kept — only the COST
+      // side is limited to whatever lines did resolve and got FIFO-tracked
+      // (an unresolved line contributes ₹0 cost, same convention the old
+      // flat-rate calc used for a name with no catalogue match).
+      let saleRevenue = 0;
+      for (const seg of segs) {
+        if (!seg.isReturn) saleRevenue += seg.total;
+        for (const it of (seg.items || [])) {
+          const [name, rawQty, rate] = Array.isArray(it) ? it : [it, 1, 0];
+          const id = nameToId.get(String(name || '').toLowerCase().trim());
+          if (!id) continue;
+          const qty = Math.abs(rawQty || 0);
+          add(id, date, '', 'sale', seg.isReturn ? qty : -qty, rate, { saleId });
+        }
+      }
+      if (segs.some(sg => !sg.isReturn)) histSaleRecords.push({ id: saleId, date, partyId: p.id, partyName: p.name, revenue: saleRevenue });
+    });
+  }
+
   for (const p of state.purchases) for (const l of (p.items || [])) add(l.itemId, p.date, p.createdAt, 'purch', l.qty || 0, l.rate || 0, { purchaseId: p.id });
   for (const s of state.sales) for (const x of (s.items || [])) add(x.itemId, s.date, s.createdAt, 'sale', -(x.qty || 0), x.rate, { saleId: s.id });
   for (const r of state.repairExpenses) add(r.itemId, r.date, r.createdAt, 'repair', -(r.qty || 0), null, {});
@@ -507,9 +614,20 @@ export function getSaleProfitAnalysis() {
   const saleReceivedMap = getSaleReceivedDateMap();
   const todayMs = msOf(today());
   const out = [];
-  for (const s of state.sales) {
-    if (s.type === 'return') continue;
-    const rec = bySale.get(s.id);
+  const allSaleRecords = [
+    ...state.sales.filter(s => s.type !== 'return').map(s => ({ id: s.id, date: s.date, partyId: s.partyId, partyName: undefined })),
+    ...histSaleRecords,
+  ];
+  for (const s of allSaleRecords) {
+    let rec = bySale.get(s.id);
+    if (s.revenue != null) {
+      // Pre-ERP bill: `s.revenue` (the bill's own recorded total) is
+      // authoritative, overriding whatever the FIFO line-walk accumulated —
+      // see the comment at the pre-ERP sale block above. This also means a
+      // bill gets a row (cost 0, full revenue as "profit") even when NONE of
+      // its lines resolved to a current item, rather than being dropped.
+      rec = { qty: rec?.qty || 0, revenue: s.revenue, cost: rec?.cost || 0, segs: rec?.segs || [] };
+    }
     if (!rec) continue;
     const party = state.parties.find(p => p.id === s.partyId);
     const grossProfit = rec.revenue - rec.cost;
@@ -1606,6 +1724,13 @@ export const state = {
   // DB.getSession() each load, never saved/synced itself.
   users:            [],
   currentUserEmail: '',
+  // Saved WhatsApp GROUP invite links ({id,name,link}) — wa.me's ?text=
+  // prefill only works for an individual contact; a group chat has no such
+  // deep link, so the only way to "share to a group" is to open a saved
+  // chat.whatsapp.com/<code> invite link and have the user paste text that
+  // was copied to the clipboard first. Saved once per group, reused on every
+  // share (ShareItemModal/CatalogueShareModal) same as a party's phone.
+  waGroups:         [],
   loaded:           false,
 };
 
@@ -1641,6 +1766,7 @@ export const save = {
   users:            mk('data:users',            () => state.users),
   dashboardHiddenOOS: mk('data:dashboardHiddenOOS', () => state.dashboardHiddenOOS),
   salesFollowupHidden: mk('data:salesFollowupHidden', () => state.salesFollowupHidden),
+  waGroups:         mk('data:waGroups',         () => state.waGroups),
 };
 
 // ── Dashboard: Out of Stock hide/unhide (request #4) ────────────────────────
@@ -1797,6 +1923,7 @@ const STORAGE_KEY_TO_STATE = {
   'data:stockAdjustments':'stockAdjustments', 'data:users':'users',
   'data:stockReconciliations':'stockReconciliations',
   'data:dashboardHiddenOOS':'dashboardHiddenOOS', 'data:salesFollowupHidden':'salesFollowupHidden',
+  'data:waGroups':'waGroups',
 };
 const liveListeners = new Set();
 export function subscribeLive(fn) { liveListeners.add(fn); return () => liveListeners.delete(fn); }
@@ -1867,7 +1994,7 @@ export function updatePartyPhone(partyId, phone) {
 export async function loadAll() {
   if (state.loaded) return;
   try {
-    const [sales,payments,pe,pt,fu,txns,parties,items,purchases,supplierPayments,freightCharges,customCategories,categoryTags,cityTransport,orders,dispatchPhone,itemCustomerNames,cityOrder,repairExpenses,stockAdjustments,users,stockReconciliations,dashboardHiddenOOS,salesFollowupHidden] = await Promise.all([
+    const [sales,payments,pe,pt,fu,txns,parties,items,purchases,supplierPayments,freightCharges,customCategories,categoryTags,cityTransport,orders,dispatchPhone,itemCustomerNames,cityOrder,repairExpenses,stockAdjustments,users,stockReconciliations,dashboardHiddenOOS,salesFollowupHidden,waGroups] = await Promise.all([
       DB.get('data:sales'), DB.get('data:payments'), DB.get('data:phoneEdits'),
       DB.get('data:partyTransport'), DB.get('data:followups'), DB.get('data:txns'),
       DB.get('data:parties'), DB.get('data:items'), DB.get('data:purchases'), DB.get('data:supplierPayments'),
@@ -1875,6 +2002,7 @@ export async function loadAll() {
       DB.get('data:cityTransport'), DB.get('data:orders'), DB.get('data:dispatchPhone'), DB.get('data:itemCustomerNames'),
       DB.get('data:cityOrder'), DB.get('data:repairExpenses'), DB.get('data:stockAdjustments'), DB.get('data:users'),
       DB.get('data:stockReconciliations'), DB.get('data:dashboardHiddenOOS'), DB.get('data:salesFollowupHidden'),
+      DB.get('data:waGroups'),
     ]);
     if (sales)    state.sales    = sales;
     if (payments) state.payments = payments;
@@ -1897,6 +2025,7 @@ export async function loadAll() {
     if (stockReconciliations) state.stockReconciliations = stockReconciliations;
     if (dashboardHiddenOOS) state.dashboardHiddenOOS = dashboardHiddenOOS;
     if (salesFollowupHidden) state.salesFollowupHidden = salesFollowupHidden;
+    if (waGroups)         state.waGroups          = waGroups;
     // One-time migration: persisted items predate two corrections in the seed
     // data — (1) `purch` used to be a flat 22% of `sale` instead of a real
     // rate, hiding per-item margins, and (2) `stock`/`stockValue` weren't yet
@@ -1929,6 +2058,67 @@ export async function loadAll() {
         state.items = [...state.items, ...SEED_ITEMS.filter(s => !existingIds.has(s.id))];
         save.items();
         await DB.set('data:itemsMigratedV9', true);
+      }
+    }
+    // One-time migration: 14 items in the seed turned out to be clerical
+    // duplicates of another item, differing only by letter case — e.g.
+    // "Pipe" (XI0148, active, real stock) vs "pipe" (XI0185, inactive,
+    // stock 0, identical purch rate and lastPurchDate to its twin). These
+    // were almost certainly created by a case-mismatched re-entry at some
+    // point and deactivated instead of cleaned up. Left in place they split
+    // one item's real transaction history across two itemIds — any
+    // case-insensitive name match (exactly what pre-ERP PARTY_HISTORY/
+    // SUPPLIER_HISTORY matching does, see getSaleProfitAnalysis below) can
+    // land on either id depending on casing, which is the likely root cause
+    // of an earlier, much larger quantity-reconciliation mismatch that was
+    // found and is documented in the getFifoStockMap comment above.
+    // Retires each dead duplicate into its live twin, re-pointing itemId
+    // everywhere it's referenced — same remap mergeItems() does for a
+    // manual merge in App.jsx — and keeps the dead name on mergedNames so
+    // name-matched historical rows still attribute to the surviving item.
+    if (items) {
+      const deduped = await DB.get('data:itemsDedupeV1');
+      if (!deduped) {
+        const DUPE_PAIRS = [
+          ['XI0033', 'XI0009'], ['XI0019', 'XI0030'], ['XI0020', 'XI0031'],
+          ['XI0024', 'XI0028'], ['XI0025', 'XI0029'], ['XI0046', 'XI0044'],
+          ['XI0071', 'XI0057'], ['XI0061', 'XI0058'], ['XI0175', 'XI0105'],
+          ['XI0134', 'XI0130'], ['XI0183', 'XI0135'], ['XI0184', 'XI0143'],
+          ['XI0185', 'XI0148'], ['XI0188', 'XI0163'],
+        ];
+        let touched = false;
+        for (const [sourceId, targetId] of DUPE_PAIRS) {
+          const source = state.items.find(x => x.id === sourceId);
+          const target = state.items.find(x => x.id === targetId);
+          if (!source || !target) continue; // not present (already clean) for this account
+          touched = true;
+          state.sales = state.sales.map(s => ({ ...s, items: (s.items || []).map(l => l.itemId === sourceId ? { ...l, itemId: targetId } : l) }));
+          state.purchases = state.purchases.map(p => ({ ...p, items: (p.items || []).map(l => l.itemId === sourceId ? { ...l, itemId: targetId } : l) }));
+          state.orders = state.orders.map(o => ({ ...o, items: (o.items || []).map(l => l.itemId === sourceId ? { ...l, itemId: targetId } : l) }));
+          state.repairExpenses = state.repairExpenses.map(r => r.itemId === sourceId ? { ...r, itemId: targetId } : r);
+          state.stockAdjustments = state.stockAdjustments.map(a => ({
+            ...a,
+            fromItemId: a.fromItemId === sourceId ? targetId : a.fromItemId,
+            toItemId: a.toItemId === sourceId ? targetId : a.toItemId,
+          }));
+          state.stockReconciliations = state.stockReconciliations.map(r => r.itemId === sourceId ? { ...r, itemId: targetId } : r);
+          const sourceNames = [source.internal, source.name, source.customer].filter(Boolean);
+          state.items = state.items
+            .map(x => x.id === targetId ? {
+              ...x,
+              stock: (x.stock || 0) + (source.stock || 0),
+              damaged: (x.damaged || 0) + (source.damaged || 0),
+              repaired: (x.repaired || 0) + (source.repaired || 0),
+              mergedNames: [...new Set([...(x.mergedNames || []), ...sourceNames, ...(source.mergedNames || [])])],
+              active: x.active !== false || source.active !== false,
+            } : x)
+            .filter(x => x.id !== sourceId);
+        }
+        if (touched) {
+          save.sales(); save.purchases(); save.orders(); save.repairExpenses();
+          save.stockAdjustments(); save.stockReconciliations(); save.items();
+        }
+        await DB.set('data:itemsDedupeV1', true);
       }
     }
     // One-time, narrowly-scoped text fix: the product line sold as "Indus

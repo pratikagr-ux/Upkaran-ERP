@@ -144,6 +144,29 @@ function mergeItems(sourceId, targetId) {
   save.items();
 }
 
+// Shared audit-log writer for every single-item stock movement that isn't a
+// sale/purchase/item-to-item transfer — damaged/repaired moves and
+// corrections below previously mutated item.stock with NO trace left behind
+// anywhere (no date, no qty, nothing), which is exactly what let the Item
+// Ledger's running-balance column drift silently: that column is computed by
+// walking every known dated row and reconciling to the item's current stock,
+// and an invisible mutation has no row to walk, so its effect either got
+// smeared backward across the entire historical ledger (corrupting every
+// older balance) or showed up as an unexplained gap with no record of why.
+// Logging these from here on (reusing state.stockAdjustments, same table
+// moveItemStock already audits to, distinguished by `type`) means every
+// future movement of this kind becomes a dated, visible ledger row — see
+// ItemDetail's transferRows below, which now reads these back in.
+function logStockAdjustment({itemId, itemName, qty, type, note}) {
+  const entry = {
+    id: uid('ADJ'), date: today(), type, itemId, itemName: itemName||'',
+    fromItemId: null, toItemId: null, fromItemName: '', toItemName: '',
+    qty, reason: note||'', createdAt: new Date().toISOString(),
+  };
+  state.stockAdjustments = [entry, ...state.stockAdjustments];
+  save.stockAdjustments();
+}
+
 // Relocates a quantity of sellable stock from one item to another, unlike
 // mergeItems: neither item is touched otherwise — no history reassignment, no
 // mergedNames, and the source item is never deleted. For cases where two
@@ -167,7 +190,7 @@ function moveItemStock(sourceId, targetId, qty, reason) {
   });
   save.items();
   const entry = {
-    id: uid('ADJ'), date: today(), fromItemId: sourceId, toItemId: targetId,
+    id: uid('ADJ'), date: today(), type: 'itemTransfer', fromItemId: sourceId, toItemId: targetId,
     fromItemName: source.internal||source.customer||source.name||'', toItemName: target.internal||target.customer||target.name||'',
     qty: move, reason: (reason||'').trim(), createdAt: new Date().toISOString(),
   };
@@ -410,6 +433,9 @@ function repairStock(itemId, qty) {
   if (move <= 0) return;
   state.items = state.items.map(x => x.id === itemId ? { ...x, damaged: (x.damaged||0)-move, repaired: (x.repaired||0)+move } : x);
   save.items();
+  // Moves between damaged/repaired, not plain stock — doesn't touch item.stock,
+  // so it has no effect on the sellable-stock running balance and isn't logged
+  // to stockAdjustments (which only tracks movements affecting item.stock).
 }
 
 // Explicit, user-initiated promotion of repaired units into plain sellable
@@ -425,6 +451,7 @@ function shiftRepairedToFresh(itemId, qty) {
   if (move <= 0) return;
   state.items = state.items.map(x => x.id === itemId ? { ...x, repaired: (x.repaired||0)-move, stock: (x.stock||0)+move } : x);
   save.items();
+  logStockAdjustment({itemId, itemName: it.internal||it.customer||it.name||'', qty: move, type: 'shiftToFresh', note: 'Repaired stock promoted to fresh'});
 }
 
 // The reverse of repairStock's damaged side — manually pull qty out of
@@ -439,6 +466,7 @@ function moveToDamaged(itemId, qty) {
   if (move <= 0) return;
   state.items = state.items.map(x => x.id === itemId ? { ...x, stock: (x.stock||0)-move, damaged: (x.damaged||0)+move } : x);
   save.items();
+  logStockAdjustment({itemId, itemName: it.internal||it.customer||it.name||'', qty: -move, type: 'toDamaged', note: 'Moved to damaged'});
 }
 
 // A correction, not a business transaction: for units that were never
@@ -454,6 +482,7 @@ function correctDamagedToStock(itemId, qty) {
   if (move <= 0) return;
   state.items = state.items.map(x => x.id === itemId ? { ...x, damaged: (x.damaged||0)-move, stock: (x.stock||0)+move } : x);
   save.items();
+  logStockAdjustment({itemId, itemName: it.internal||it.customer||it.name||'', qty: move, type: 'correction', note: 'Not actually damaged — corrected back to stock'});
 }
 
 // Reassigns an item's sub-category (subHead) within its category, and keeps
@@ -605,6 +634,7 @@ function IconBtn({onClick,title,color=C.sub,bg='transparent',children}){
 // (show:false) are simply left out of the menu, same as before.
 function RowActionsMenu({items}){
   const[open,setOpen]=useState(false);
+  const[dropUp,setDropUp]=useState(false);
   const ref=useRef(null);
   useEffect(()=>{
     if(!open)return;
@@ -614,9 +644,24 @@ function RowActionsMenu({items}){
   },[open]);
   const visible=items.filter(it=>it.show!==false);
   if(visible.length===0)return null;
+  const toggle=()=>{
+    if(!open&&ref.current){
+      // Decide drop direction before opening: estimate the menu's rendered
+      // height (each row ~37px + 1px border, same metrics as the row style
+      // below) and compare the space below the trigger button against it —
+      // if it won't fit before the viewport bottom, open upward instead.
+      // Fixes the last ~5 rows of a long list (Inventory etc.) always
+      // rendering the dropdown clipped off-screen below.
+      const rect=ref.current.getBoundingClientRect();
+      const estH=visible.length*38+8;
+      const spaceBelow=window.innerHeight-rect.bottom;
+      setDropUp(spaceBelow<estH&&rect.top>estH);
+    }
+    setOpen(o=>!o);
+  };
   return <div ref={ref} style={{position:'relative',display:'inline-block'}} onClick={e=>e.stopPropagation()}>
-    <IconBtn onClick={()=>setOpen(o=>!o)} title="Actions">⋮</IconBtn>
-    {open&&<div style={{position:'absolute',top:'calc(100% + 4px)',right:0,background:C.surf,
+    <IconBtn onClick={toggle} title="Actions">⋮</IconBtn>
+    {open&&<div style={{position:'absolute',[dropUp?'bottom':'top']:'calc(100% + 4px)',right:0,background:C.surf,
       border:`1px solid ${C.bdr}`,borderRadius:8,boxShadow:'0 8px 24px rgba(0,0,0,0.15)',zIndex:200,
       minWidth:170,overflow:'hidden'}}>
       {visible.map((it,i)=><div key={i} onClick={()=>{setOpen(false);it.onClick();}}
@@ -2974,7 +3019,7 @@ function EditSaleModal({sale,onClose,onSaved}){
                   {swapSugg.length>0&&<div style={{position:'absolute',top:'100%',left:0,right:0,background:C.surf,border:`1px solid ${C.bdr}`,borderRadius:'0 0 8px 8px',zIndex:200,boxShadow:'0 8px 24px rgba(0,0,0,0.12)',overflow:'hidden',maxHeight:180,overflowY:'auto'}}>
                     {swapSugg.map((it,si2)=><div key={it.id} onMouseDown={()=>swapItem(it)} onMouseEnter={()=>setSwapSi(si2)}
                       style={{display:'flex',alignItems:'center',padding:'7px 12px',cursor:'pointer',fontSize:12,background:si2===swapSi?C.blueSoft:'transparent',borderBottom:si2<swapSugg.length-1?`1px solid ${C.bdr}`:'none'}}>
-                      <div style={{flex:1}}><span style={{fontWeight:600,color:C.txt}}>{it.internal||it.name}</span><span style={{fontSize:10,color:C.sub,marginLeft:6}}>{it.cat}</span></div>
+                      <div style={{flex:1}}><span style={{fontWeight:600,color:C.txt}}>{it.internal||it.name}</span><span style={{fontSize:10,color:C.sub,marginLeft:6}}>{it.cat}</span><span style={{fontSize:10,color:(it.stock||0)<=0?C.red:C.sub,marginLeft:6}}>· {it.stock||0} in stock</span></div>
                     </div>)}
                   </div>}
                   <button onClick={()=>{setSwapIdx(null);setSwapQ('');}} style={{position:'absolute',right:-2,top:-22,background:'none',border:'none',cursor:'pointer',color:C.muted,fontSize:11}}>cancel</button>
@@ -3107,7 +3152,7 @@ function EditOrderModal({order,onClose,onSaved}){
           <div style={{overflowY:'auto',flex:1}}>
             {isugg.map((it,i)=><div key={it.id} id={'eosugg-'+i} onMouseDown={()=>{setSi(i);pickItem(it);}} onMouseEnter={()=>setSi(i)}
               style={{display:'flex',alignItems:'center',padding:'8px 14px',cursor:'pointer',background:i===si?C.blueSoft:'transparent',borderBottom:i<isugg.length-1?`1px solid ${C.bdr}`:'none'}}>
-              <div style={{flex:1}}><span style={{fontWeight:600,color:C.txt,fontSize:13}}>{it.internal||it.name}</span><span style={{fontSize:11,color:C.sub,marginLeft:6}}>{it.cat}</span></div>
+              <div style={{flex:1}}><span style={{fontWeight:600,color:C.txt,fontSize:13}}>{it.internal||it.name}</span><span style={{fontSize:11,color:C.sub,marginLeft:6}}>{it.cat}</span><span style={{fontSize:11,color:(it.stock||0)<=0?C.red:C.sub,marginLeft:6}}>· {it.stock||0} pcs in stock</span></div>
               <span style={{fontSize:13,fontWeight:700,color:C.blue}}>₹{selParty?getBestRate(selParty.name,it.internal||'',it.customer||'',it.sale):it.sale}/pc</span>
             </div>)}
           </div>
@@ -3130,7 +3175,7 @@ function EditOrderModal({order,onClose,onSaved}){
                   {swapSugg.length>0&&<div style={{position:'absolute',top:'100%',left:0,right:0,background:C.surf,border:`1px solid ${C.bdr}`,borderRadius:'0 0 8px 8px',zIndex:200,boxShadow:'0 8px 24px rgba(0,0,0,0.12)',overflow:'hidden',maxHeight:180,overflowY:'auto'}}>
                     {swapSugg.map((it,si2)=><div key={it.id} onMouseDown={()=>swapItem(it)} onMouseEnter={()=>setSwapSi(si2)}
                       style={{display:'flex',alignItems:'center',padding:'7px 12px',cursor:'pointer',fontSize:12,background:si2===swapSi?C.blueSoft:'transparent',borderBottom:si2<swapSugg.length-1?`1px solid ${C.bdr}`:'none'}}>
-                      <div style={{flex:1}}><span style={{fontWeight:600,color:C.txt}}>{it.internal||it.name}</span><span style={{fontSize:10,color:C.sub,marginLeft:6}}>{it.cat}</span></div>
+                      <div style={{flex:1}}><span style={{fontWeight:600,color:C.txt}}>{it.internal||it.name}</span><span style={{fontSize:10,color:C.sub,marginLeft:6}}>{it.cat}</span><span style={{fontSize:10,color:(it.stock||0)<=0?C.red:C.sub,marginLeft:6}}>· {it.stock||0} in stock</span></div>
                     </div>)}
                   </div>}
                   <button onClick={()=>{setSwapIdx(null);setSwapQ('');}} style={{position:'absolute',right:-2,top:-22,background:'none',border:'none',cursor:'pointer',color:C.muted,fontSize:11}}>cancel</button>
@@ -3140,7 +3185,10 @@ function EditOrderModal({order,onClose,onSaved}){
                   <button onClick={()=>{setSwapIdx(i);setSwapQ('');setSwapSi(0);}} title="Swap this line to a different item" style={{background:'none',border:`1px solid ${C.bdr}`,borderRadius:5,cursor:'pointer',color:C.sub,fontSize:11,padding:'2px 6px',whiteSpace:'nowrap'}}>⇄ Change</button>
                 </div>}
             </td>
-            <td style={{padding:'7px 12px',textAlign:'right'}}><input value={l.qty} onChange={e=>setLines(p=>p.map((x,j)=>j!==i?x:{...x,qty:Number(e.target.value)||0,changed:true}))} type="number" style={{width:60,padding:'3px 7px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:12,textAlign:'right',outline:'none',fontFamily:'inherit'}}/></td>
+            <td style={{padding:'7px 12px',textAlign:'right'}}>
+              <input value={l.qty} onChange={e=>setLines(p=>p.map((x,j)=>j!==i?x:{...x,qty:Number(e.target.value)||0,changed:true}))} type="number" style={{width:60,padding:'3px 7px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:12,textAlign:'right',outline:'none',fontFamily:'inherit'}}/>
+              {(()=>{const it=state.items.find(x=>x.id===l.itemId);if(!it)return null;const stk=it.stock||0;return <div style={{fontSize:10,marginTop:2,color:stk<l.qty?C.red:C.sub}}>{stk} in stock</div>;})()}
+            </td>
             <td style={{padding:'7px 12px',textAlign:'right'}}><input value={l.rate} onChange={e=>editLine(i,'rate',e.target.value)} type="number" style={{width:75,padding:'3px 7px',borderRadius:5,border:`1px solid ${C.bdr}`,fontSize:12,textAlign:'right',outline:'none',fontFamily:'inherit'}}/></td>
             <td style={{padding:'7px 12px',textAlign:'right',fontWeight:700,color:C.blue,fontVariantNumeric:'tabular-nums'}}>{fmt(l.qty*l.rate)}</td>
             <td style={{padding:'7px 12px',textAlign:'center'}}><button onClick={()=>setLines(p=>p.filter((_,j)=>j!==i))} style={{background:'none',border:'none',cursor:'pointer',color:C.muted,fontSize:15}}>×</button></td>
@@ -6585,29 +6633,95 @@ function ItemDetail({item,onClose}){
   // from a sale/purchase but still flows through the same running-balance
   // walk below.
   const transferRows=useMemo(()=>state.stockAdjustments
-    .filter(a=>a.fromItemId===item.id||a.toItemId===item.id)
-    .map(a=>a.fromItemId===item.id
-      ?{d:a.date,item:item.internal,qty:a.qty,rate:0,amount:0,dir:'transfer_out',party:'→ '+(a.toItemName||'?')+(a.reason?' · '+a.reason:''),isTransfer:true,adjId:a.id}
-      :{d:a.date,item:item.internal,qty:a.qty,rate:0,amount:0,dir:'transfer_in',party:'← '+(a.fromItemName||'?')+(a.reason?' · '+a.reason:''),isTransfer:true,adjId:a.id}),
+    .filter(a=>a.fromItemId===item.id||a.toItemId===item.id||a.itemId===item.id)
+    .map(a=>{
+      if(a.fromItemId===item.id)return{d:a.date,item:item.internal,qty:a.qty,rate:0,amount:0,dir:'transfer_out',party:'→ '+(a.toItemName||'?')+(a.reason?' · '+a.reason:''),isTransfer:true,adjId:a.id};
+      if(a.toItemId===item.id)return{d:a.date,item:item.internal,qty:a.qty,rate:0,amount:0,dir:'transfer_in',party:'← '+(a.fromItemName||'?')+(a.reason?' · '+a.reason:''),isTransfer:true,adjId:a.id};
+      // Single-item adjustment (damaged/repaired/correction, logged by
+      // logStockAdjustment — see that function's comment) — qty there is
+      // already signed: negative left sellable stock, positive returned to
+      // it, so it plugs into rowDelta below exactly like a transfer does.
+      const q=Number(a.qty||0);
+      const label=a.type==='toDamaged'?'Moved to damaged':a.type==='shiftToFresh'?'Repaired stock promoted to fresh':a.type==='correction'?'Corrected back to stock':'Stock adjustment';
+      return{d:a.date,item:item.internal,qty:Math.abs(q),rate:0,amount:0,dir:q>=0?'transfer_in':'transfer_out',party:label+(a.reason?' · '+a.reason:''),isTransfer:true,adjId:a.id};
+    }),
     [item.id,item.internal,state.stockAdjustments.length]);
-  // Running balance: walk every row (sales/returns/purchases/transfers) for
-  // this item chronologically, computing each row's stock balance AFTER it.
-  // The current `stock` is the one known-accurate anchor, so — mirroring the
-  // obGap reconciliation PartyLedger uses for party.ob — the walk's starting
-  // point is derived by subtracting the full net delta of every row from the
-  // current stock, rather than assumed to start at 0 (manual stock
-  // corrections/seed data mean the rows alone don't always net to the
-  // current figure).
+  // Physical-count reconciliations (reconcileItemStock/state.stockReconciliations
+  // — see that function's comment) are ground truth: the user counted the
+  // shelf and the book qty was overwritten to match. Each becomes its own
+  // ledger row carrying the absolute physicalQty it reset to (plus the
+  // bookQty it corrected from), used below to anchor/reset the running
+  // balance instead of just flowing through as another delta.
+  const reconcileRows=useMemo(()=>state.stockReconciliations
+    .filter(a=>a.itemId===item.id)
+    .map(a=>({d:a.date,item:item.internal,qty:Math.abs(a.diff||0),rate:0,amount:0,dir:(a.diff||0)>=0?'in':'out',party:'Physical count: book '+a.bookQty+' → counted '+a.physicalQty+(a.notes?' · '+a.notes:''),isReconcile:true,bookQty:a.bookQty,physicalQty:a.physicalQty,recId:a.id})),
+    [item.id,item.internal,state.stockReconciliations.length]);
+  // Running balance: walk every row (sales/returns/purchases/transfers/
+  // reconciliations) for this item chronologically, computing each row's
+  // stock balance AFTER it.
   const rowDelta=r=>r.dir==='in'||r.dir==='transfer_in'?Number(r.qty||0):-Number(r.qty||0);
   const allRowsWithBalance=useMemo(()=>{
-    const combined=[...metrics.rows,...transferRows].sort((a,b)=>a.d.localeCompare(b.d));
-    const net=combined.reduce((s,r)=>s+rowDelta(r),0);
-    let bal=stock-net;
-    return combined.map(r=>{ bal+=rowDelta(r); return {...r,balance:bal}; });
-  },[metrics,transferRows,stock]);
+    const combined=[...metrics.rows,...transferRows,...reconcileRows].sort((a,b)=>a.d.localeCompare(b.d));
+    const firstRecIdx=combined.findIndex(r=>r.isReconcile);
+    let out;
+    if(firstRecIdx===-1){
+      // No physical count ever recorded for this item — fall back to
+      // anchoring on current stock (mirroring the obGap reconciliation
+      // PartyLedger uses for party.ob), since it's the one known-accurate
+      // point we have. Any stock-affecting event with no logged row (a
+      // damaged/repair/correction move made before logStockAdjustment
+      // started tracking these) has no date to sit on, so its effect is
+      // unavoidably smeared across the whole history below — there's no
+      // ground-truth checkpoint here to detect or isolate it against. Doing
+      // a physical count (Inventory → Reconcile Stock) is what turns this
+      // into the exact, honest math in the branch below.
+      const net=combined.reduce((s,r)=>s+rowDelta(r),0);
+      let bal=stock-net;
+      out=combined.map(r=>{ bal+=rowDelta(r); return{...r,balance:bal}; });
+    } else {
+      // At least one physical count exists — treat it (and every later one)
+      // as an absolute reset rather than a delta, so a reconciliation
+      // actually fixes the ledger, not just item.stock in isolation.
+      const before=combined.slice(0,firstRecIdx);
+      const from=combined.slice(firstRecIdx);
+      const firstRec=combined[firstRecIdx];
+      // Backward segment: walk from the first reconciliation's recorded
+      // bookQty (the balance the system believed right before that count)
+      // back through every earlier row.
+      const beforeWithBalance=new Array(before.length);
+      let runningAfter=firstRec.bookQty;
+      for(let i=before.length-1;i>=0;i--){
+        beforeWithBalance[i]={...before[i],balance:runningAfter};
+        runningAfter-=rowDelta(before[i]);
+      }
+      // Forward segment: start at the first reconciliation's physicalQty and
+      // walk forward by delta, re-snapping to physicalQty (not delta) at
+      // every later reconciliation encountered along the way.
+      const fromWithBalance=[];
+      let bal=null;
+      for(const r of from){
+        if(r.isReconcile){ bal=r.physicalQty; fromWithBalance.push({...r,balance:bal}); }
+        else { bal+=rowDelta(r); fromWithBalance.push({...r,balance:bal}); }
+      }
+      out=[...beforeWithBalance,...fromWithBalance];
+      // If the final computed balance still doesn't match current stock,
+      // something moved item.stock after the last reconciliation with no
+      // matching dated row (again, a pre-logStockAdjustment damaged/repair/
+      // correction move) — surface it honestly as its own row instead of
+      // hiding the gap or corrupting earlier balances to paper over it.
+      const residual=stock-bal;
+      if(residual!==0){
+        out.push({d:today(),item:item.internal,qty:Math.abs(residual),rate:0,amount:0,
+          dir:residual>=0?'transfer_in':'transfer_out',
+          party:'Unexplained stock change since last count — no matching record found',
+          isResidual:true,balance:stock});
+      }
+    }
+    return out;
+  },[metrics,transferRows,reconcileRows,stock]);
   const rows=useMemo(()=>allRowsWithBalance
     .filter(r=>!search||(r.party||'').toLowerCase().includes(search.toLowerCase()))
-    .filter(r=>typeF==='all'||(typeF==='sale'?r.dir==='out':typeF==='purch'?r.dir==='in':(r.dir==='transfer_out'||r.dir==='transfer_in')))
+    .filter(r=>typeF==='all'||(typeF==='sale'?r.dir==='out':typeF==='purch'?r.dir==='in':(r.dir==='transfer_out'||r.dir==='transfer_in'||r.isReconcile||r.isResidual)))
     .sort((a,b)=>b.d.localeCompare(a.d)),[allRowsWithBalance,search,typeF]);
   const pageRows=rows.slice(page*PAGE,(page+1)*PAGE);
   const totalPages=Math.ceil(rows.length/PAGE);
@@ -6719,7 +6833,7 @@ function ItemDetail({item,onClose}){
       <Chip v="All" active={typeF==='all'} onClick={()=>{setTypeF('all');setPage(0);}}/>
       <Chip v="Sales only" active={typeF==='sale'} onClick={()=>{setTypeF('sale');setPage(0);}}/>
       <Chip v="Purchases only" active={typeF==='purch'} onClick={()=>{setTypeF('purch');setPage(0);}}/>
-      <Chip v="Transfers only" active={typeF==='transfer'} onClick={()=>{setTypeF('transfer');setPage(0);}}/>
+      <Chip v="Adjustments only" active={typeF==='transfer'} onClick={()=>{setTypeF('transfer');setPage(0);}}/>
     </div>
     <div style={{background:C.surf,borderRadius:7,border:`1px solid ${C.bdr}`,padding:'7px 11px',marginBottom:12}}>
       <input value={search} onChange={e=>{setSearch(e.target.value);setPage(0);}} placeholder="Search by party…" style={{width:'100%',border:'none',outline:'none',fontSize:13,color:C.txt,fontFamily:'inherit',background:'transparent'}}/>
@@ -6737,10 +6851,10 @@ function ItemDetail({item,onClose}){
             return <span style={{fontWeight:500,color:clickable?C.blue:C.txt,textDecoration:clickable?'underline':'none',textDecorationStyle:'dotted'}}>{r.party||'—'}</span>;
           }},
           {key:'qty',label:'Qty',align:'right',render:r=>Math.abs(r.qty||0)},
-          {key:'rate',label:'Rate',align:'right',render:r=>r.isTransfer?<span style={{color:C.muted}}>—</span>:<span style={{color:C.sub}}>{fmt(r.rate)}</span>},
-          {key:'amount',label:'Amount',align:'right',render:r=>r.isTransfer?<span style={{color:C.muted}}>—</span>:<span style={{fontWeight:700,color:C.blue}}>{fmt(Math.abs(r.amount||0))}</span>},
+          {key:'rate',label:'Rate',align:'right',render:r=>r.isTransfer||r.isReconcile||r.isResidual?<span style={{color:C.muted}}>—</span>:<span style={{color:C.sub}}>{fmt(r.rate)}</span>},
+          {key:'amount',label:'Amount',align:'right',render:r=>r.isTransfer||r.isReconcile||r.isResidual?<span style={{color:C.muted}}>—</span>:<span style={{fontWeight:700,color:C.blue}}>{fmt(Math.abs(r.amount||0))}</span>},
           {key:'margin',label:'Margin',align:'right',render:r=>{
-            if(r.dir!=='out'||r.isReturn)return<span style={{color:C.muted}}>—</span>;
+            if(r.dir!=='out'||r.isReturn||r.isReconcile||r.isResidual)return<span style={{color:C.muted}}>—</span>;
             const m=r.saleId&&fifoSaleCosts[r.saleId];
             if(!m)return<span style={{color:C.muted}} title="No FIFO cost data — historical sale predating in-app tracking">—</span>;
             return<span title="FIFO-costed margin at the time of this sale">
@@ -6749,7 +6863,9 @@ function ItemDetail({item,onClose}){
             </span>;
           }},
           {key:'type',label:'Type',align:'center',render:r=>
-            r.dir==='transfer_out'?<Badge v="Transferred Out" color="amber"/>
+            r.isResidual?<Badge v="Unreconciled" color="red"/>
+            :r.isReconcile?<Badge v="Physical Count" color="blue"/>
+            :r.dir==='transfer_out'?<Badge v="Transferred Out" color="amber"/>
             :r.dir==='transfer_in'?<Badge v="Transferred In" color="green"/>
             :<Badge v={r.isReturn?'Return':r.dir==='in'?'Purchased':'Sold'} color={r.isReturn?'amber':r.dir==='in'?'green':'blue'}/>},
           {key:'balance',label:'Balance',align:'right',render:r=><span style={{fontWeight:700,color:r.balance<=0?C.red:C.txt,fontVariantNumeric:'tabular-nums'}}>{r.balance}</span>},
@@ -7312,6 +7428,60 @@ function PartyPickBox({value,onPick}){
   </>;
 }
 
+// Saved WhatsApp GROUP invite links (state.waGroups: {id,name,link}) picker,
+// parallel to PartyPickBox above. wa.me's ?text= prefill only works for an
+// individual contact — a group chat has no equivalent deep link — so the
+// workaround is: save each group's chat.whatsapp.com invite link once here,
+// then on every share just copy the message text to the clipboard and open
+// the saved link, with a toast reminding the user to paste it in. `toast` is
+// passed down from the parent modal rather than calling useToast() again
+// here, so there's only ever one toast container per modal.
+function WaGroupPickBox({value,onPick,toast}){
+  const[adding,setAdding]=useState(false);
+  const[name,setName]=useState('');
+  const[link,setLink]=useState('');
+  const groups=state.waGroups||[];
+  const addGroup=()=>{
+    if(!name.trim())return toast('Enter a group name','error');
+    if(!/^https:\/\/chat\.whatsapp\.com\//.test(link.trim()))return toast('Paste a valid chat.whatsapp.com invite link','error');
+    const g={id:'wag_'+Date.now(),name:name.trim(),link:link.trim()};
+    state.waGroups=[...groups,g];
+    save.waGroups();
+    setName('');setLink('');setAdding(false);
+    onPick(g);
+  };
+  const removeGroup=(e,id)=>{
+    e.stopPropagation();
+    state.waGroups=groups.filter(x=>x.id!==id);
+    save.waGroups();
+  };
+  if(value)return <div style={{padding:'10px 14px',borderRadius:8,border:`1.5px solid ${C.green}`,background:C.greenSoft,marginBottom:14}}>
+    <div style={{fontSize:11,color:C.sub}}>Sharing to group</div>
+    <div style={{fontWeight:700,color:C.txt,fontSize:14}}>{value.name}</div>
+    <button onClick={()=>onPick(null)} style={{marginTop:4,background:'none',border:'none',color:C.blue,cursor:'pointer',fontSize:11,textDecoration:'underline',fontFamily:'inherit'}}>Change</button>
+  </div>;
+  return <div style={{marginBottom:14}}>
+    {groups.length>0&&!adding&&<div style={{marginBottom:8}}>
+      {groups.map(g=><div key={g.id} onClick={()=>onPick(g)} style={{padding:'8px 12px',borderRadius:7,cursor:'pointer',border:`1px solid ${C.bdr}`,marginBottom:6,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+        <span style={{fontWeight:600,color:C.txt,fontSize:13}}>👥 {g.name}</span>
+        <button onClick={e=>removeGroup(e,g.id)} style={{background:'none',border:'none',color:C.red,cursor:'pointer',fontSize:11,fontFamily:'inherit'}}>Remove</button>
+      </div>)}
+    </div>}
+    {!adding?<button onClick={()=>setAdding(true)} style={{background:'none',border:`1px dashed ${C.bdr}`,borderRadius:7,padding:'8px 12px',width:'100%',cursor:'pointer',color:C.blue,fontSize:12,fontFamily:'inherit'}}>+ Save a new group link</button>:
+      <div style={{border:`1px solid ${C.bdr}`,borderRadius:7,padding:10}}>
+        <input value={name} onChange={e=>setName(e.target.value)} placeholder="Group name (e.g. Raipur Dealers)" autoFocus
+          style={{width:'100%',padding:'7px 10px',borderRadius:6,border:`1.5px solid ${C.bdr}`,fontSize:12,outline:'none',fontFamily:'inherit',marginBottom:6,boxSizing:'border-box'}}/>
+        <input value={link} onChange={e=>setLink(e.target.value)} placeholder="Paste chat.whatsapp.com invite link"
+          style={{width:'100%',padding:'7px 10px',borderRadius:6,border:`1.5px solid ${C.bdr}`,fontSize:12,outline:'none',fontFamily:'inherit',marginBottom:8,boxSizing:'border-box'}}/>
+        <div style={{display:'flex',gap:8,justifyContent:'flex-end'}}>
+          <Btn onClick={()=>setAdding(false)} variant="secondary" size="sm">Cancel</Btn>
+          <Btn onClick={addGroup} size="sm">Save</Btn>
+        </div>
+        <div style={{fontSize:10,color:C.muted,marginTop:6}}>In WhatsApp: open the group → group name → Invite via link → Copy link, then paste it here. One-time setup per group.</div>
+      </div>}
+  </div>;
+}
+
 // Builds the WhatsApp text block for one item: customer-facing name,
 // dimensions, and every spec row — same free-form specs the catalogue
 // editor in ItemMasters writes to item.specs.
@@ -7331,7 +7501,9 @@ function buildItemShareText(item){
 // anything automatic, since only one image can sit on the clipboard at a time.
 function ShareItemModal({item,onClose}){
   const{toast,TC}=useToast();
+  const[shareMode,setShareMode]=useState('contact');
   const[party,setParty]=useState(null);
+  const[group,setGroup]=useState(null);
   const[photoIdx,setPhotoIdx]=useState(0);
   const[copying,setCopying]=useState(false);
   const photos=item.photos||[];
@@ -7339,6 +7511,16 @@ function ShareItemModal({item,onClose}){
   const sendText=()=>{
     const ph=party?.phone;
     window.open(ph?('https://wa.me/91'+ph+'?text='+encodeURIComponent(text)):('https://wa.me/?text='+encodeURIComponent(text)),'_blank');
+  };
+  const sendToGroup=async()=>{
+    if(!group)return toast('Pick or save a group first','error');
+    try{
+      await navigator.clipboard.writeText(text);
+      toast('Text copied — paste it in the group chat that just opened');
+    }catch(e){
+      toast('Could not copy text — copy it manually from the box above','error');
+    }
+    window.open(group.link,'_blank');
   };
   const copyPhoto=async()=>{
     const url=photos[photoIdx];
@@ -7358,7 +7540,11 @@ function ShareItemModal({item,onClose}){
   };
   return <Modal title={'Share "'+(item.customer||item.internal||item.name)+'"'} onClose={onClose} width={460}>
     <TC/>
-    <PartyPickBox value={party} onPick={setParty}/>
+    <div style={{display:'flex',gap:6,marginBottom:10}}>
+      <button onClick={()=>setShareMode('contact')} style={{flex:1,padding:'6px 10px',borderRadius:7,border:`1.5px solid ${shareMode==='contact'?C.blue:C.bdr}`,background:shareMode==='contact'?C.blueSoft:'transparent',color:shareMode==='contact'?C.blue:C.sub,fontSize:12,fontWeight:600,cursor:'pointer',fontFamily:'inherit'}}>👤 Contact</button>
+      <button onClick={()=>setShareMode('group')} style={{flex:1,padding:'6px 10px',borderRadius:7,border:`1.5px solid ${shareMode==='group'?C.blue:C.bdr}`,background:shareMode==='group'?C.blueSoft:'transparent',color:shareMode==='group'?C.blue:C.sub,fontSize:12,fontWeight:600,cursor:'pointer',fontFamily:'inherit'}}>👥 Group</button>
+    </div>
+    {shareMode==='contact'?<PartyPickBox value={party} onPick={setParty}/>:<WaGroupPickBox value={group} onPick={setGroup} toast={toast}/>}
     <div style={{background:'#F6F8FA',borderRadius:9,border:`1px solid ${C.bdr}`,padding:14,marginBottom:14,
       fontFamily:'monospace',fontSize:12,lineHeight:1.9,whiteSpace:'pre-wrap',color:C.txt}}>{text}</div>
     {photos.length>0&&<div style={{marginBottom:14}}>
@@ -7374,7 +7560,7 @@ function ShareItemModal({item,onClose}){
     </div>}
     <div style={{display:'flex',justifyContent:'flex-end',gap:8}}>
       <Btn onClick={onClose} variant="secondary">Close</Btn>
-      <Btn onClick={sendText}>📲 Send on WhatsApp</Btn>
+      {shareMode==='group'?<Btn onClick={sendToGroup}>📋 Copy text & open group</Btn>:<Btn onClick={sendText}>📲 Send on WhatsApp</Btn>}
     </div>
   </Modal>;
 }
@@ -7387,7 +7573,9 @@ function ShareItemModal({item,onClose}){
 // spec-sheet message for v1 — per-item photo sharing stays on ShareItemModal.
 function CatalogueShareModal({onClose}){
   const{toast,TC}=useToast();
+  const[shareMode,setShareMode]=useState('contact');
   const[party,setParty]=useState(null);
+  const[group,setGroup]=useState(null);
   const activeItems=useMemo(()=>state.items.filter(it=>it.active!==false)
     .sort((a,b)=>(a.cat||'').localeCompare(b.cat||'')||(a.internal||'').localeCompare(b.internal||'')),[]);
   const[checked,setChecked]=useState(()=>new Set(activeItems.map(it=>it.id)));
@@ -7399,9 +7587,24 @@ function CatalogueShareModal({onClose}){
     const ph=party?.phone;
     window.open(ph?('https://wa.me/91'+ph+'?text='+encodeURIComponent(text)):('https://wa.me/?text='+encodeURIComponent(text)),'_blank');
   };
+  const sendToGroup=async()=>{
+    if(!selectedItems.length)return toast('Select at least one item','error');
+    if(!group)return toast('Pick or save a group first','error');
+    try{
+      await navigator.clipboard.writeText(text);
+      toast('Text copied — paste it in the group chat that just opened');
+    }catch(e){
+      toast('Could not copy text — copy it manually from the box above','error');
+    }
+    window.open(group.link,'_blank');
+  };
   return <Modal title="Share Catalogue" onClose={onClose} width={520}>
     <TC/>
-    <PartyPickBox value={party} onPick={setParty}/>
+    <div style={{display:'flex',gap:6,marginBottom:10}}>
+      <button onClick={()=>setShareMode('contact')} style={{flex:1,padding:'6px 10px',borderRadius:7,border:`1.5px solid ${shareMode==='contact'?C.blue:C.bdr}`,background:shareMode==='contact'?C.blueSoft:'transparent',color:shareMode==='contact'?C.blue:C.sub,fontSize:12,fontWeight:600,cursor:'pointer',fontFamily:'inherit'}}>👤 Contact</button>
+      <button onClick={()=>setShareMode('group')} style={{flex:1,padding:'6px 10px',borderRadius:7,border:`1.5px solid ${shareMode==='group'?C.blue:C.bdr}`,background:shareMode==='group'?C.blueSoft:'transparent',color:shareMode==='group'?C.blue:C.sub,fontSize:12,fontWeight:600,cursor:'pointer',fontFamily:'inherit'}}>👥 Group</button>
+    </div>
+    {shareMode==='contact'?<PartyPickBox value={party} onPick={setParty}/>:<WaGroupPickBox value={group} onPick={setGroup} toast={toast}/>}
     <div style={{fontSize:12,color:C.sub,marginBottom:8}}>{selectedItems.length} of {activeItems.length} items selected — uncheck any you don't want to send. Text only (photos aren't included in a bulk share — share a single item for its photo).</div>
     <div style={{border:`1px solid ${C.bdr}`,borderRadius:8,maxHeight:260,overflowY:'auto',marginBottom:14}}>
       {activeItems.map(it=><label key={it.id} style={{display:'flex',alignItems:'center',gap:8,padding:'7px 12px',borderBottom:`1px solid ${C.bdr}`,fontSize:13,cursor:'pointer'}}>
@@ -7412,7 +7615,7 @@ function CatalogueShareModal({onClose}){
     </div>
     <div style={{display:'flex',justifyContent:'flex-end',gap:8}}>
       <Btn onClick={onClose} variant="secondary">Close</Btn>
-      <Btn onClick={sendText} disabled={!selectedItems.length}>📲 Send on WhatsApp</Btn>
+      {shareMode==='group'?<Btn onClick={sendToGroup} disabled={!selectedItems.length}>📋 Copy text & open group</Btn>:<Btn onClick={sendText} disabled={!selectedItems.length}>📲 Send on WhatsApp</Btn>}
     </div>
   </Modal>;
 }
@@ -7577,9 +7780,11 @@ function PartyMasters(){
   const[ledgerParty,setLedgerParty]=useState(null);
   const[mergeSrc,setMergeSrc]=useState(null);
   const{toast,TC}=useToast();
-  // A 'both' party shows up under either the Customers or Suppliers chip
-  // filter (it's genuinely both), not just a literal p.type===typeF match.
-  const filtered=parties.filter(p=>(typeF==='customer'?isCustomerParty(p):typeF==='supplier'?isSupplierParty(p):p.type===typeF)&&(!routeF||p.route===routeF)&&(!search||p.name.toLowerCase().includes(search.toLowerCase())||p.city?.toLowerCase().includes(search.toLowerCase())));
+  // A 'both' party (buy from AND sell to) gets its OWN "Both" chip and is
+  // excluded from the plain Customers/Suppliers lists — it has one merged
+  // ledger/identity (see MergedPartyLedger), so it should appear in exactly
+  // one place in this list too, not show up twice under two role filters.
+  const filtered=parties.filter(p=>(typeF==='customer'?p.type==='customer':typeF==='supplier'?p.type==='supplier':p.type===typeF)&&(!routeF||p.route===routeF)&&(!search||p.name.toLowerCase().includes(search.toLowerCase())||p.city?.toLowerCase().includes(search.toLowerCase())));
   const openEdit=p=>{setForm({...p});setModal('edit');};
   const doSave=()=>{
     if(!form.name?.trim())return toast('Name required','error');
@@ -7612,6 +7817,7 @@ function PartyMasters(){
     <div style={{display:'flex',gap:8,marginBottom:12,flexWrap:'wrap'}}>
       <Chip v="Customers" active={typeF==='customer'} onClick={()=>setTypeF('customer')}/>
       <Chip v="Suppliers" active={typeF==='supplier'} onClick={()=>setTypeF('supplier')}/>
+      <Chip v="🟣 Both" active={typeF==='both'} onClick={()=>setTypeF('both')}/>
       <Chip v="Transporters" active={typeF==='transporter'} onClick={()=>setTypeF('transporter')}/>
       {typeF==='customer'&&ROUTES.map(r=><Chip key={r} v={r} active={routeF===r} onClick={()=>setRouteF(routeF===r?'':r)}/>)}
     </div>
@@ -7624,7 +7830,7 @@ function PartyMasters(){
           {key:'name',label:'Name',render:p=><span onClick={()=>setLedgerParty(p)} style={{fontWeight:600,color:C.blue,cursor:'pointer',textDecoration:'underline',textDecorationStyle:'dotted'}}>{p.name}{p.type==='both'&&<span style={{marginLeft:6,fontSize:10,fontWeight:700,color:C.purple,background:C.purple+'15',padding:'2px 6px',borderRadius:4,textDecoration:'none',display:'inline-block'}}>BOTH</span>}</span>},
           {key:'city',label:'City',render:p=><span style={{color:C.sub,fontSize:12}}>{p.city||'—'}</span>},
           {key:'route',label:'Route',render:p=><Badge v={p.route||'—'} color={p.route==='CG North'?'blue':p.route==='CG South'?'green':p.route==='Odisha'?'amber':'gray'}/>},
-          {key:'od',label:(typeF==='supplier'||typeF==='transporter')?'Payable ₹':'OD ₹',align:'right',render:p=>{
+          {key:'od',label:typeF==='both'?'Net ₹':(typeF==='supplier'||typeF==='transporter')?'Payable ₹':'OD ₹',align:'right',render:p=>{
             // 'both'-type parties (buy from AND sell to) get ONE netted balance
             // here too, per the single-ledger redesign — receivable minus
             // payable, regardless of which type-filter chip is active.
