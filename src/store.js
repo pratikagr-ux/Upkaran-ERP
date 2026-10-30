@@ -395,8 +395,20 @@ function fifoWeightedSettleDateMap(bills, payEvents) {
   }
   for (const bill of billQueue) {
     if (!bill.id) continue; // only ERP bills are traceable back to a FIFO cost/sale layer
+    // settled = fully paid off BEFORE folding the unpaid remainder in below —
+    // once that happens bill.rem is force-zeroed, so this has to be captured
+    // first or every bill would look "settled."
+    const settled = bill.rem <= 0.01;
+    const remaining = Math.max(0, Math.round(bill.rem * 100) / 100);
     if (bill.rem > 0.01) { bill.weightedSum += todayMs * bill.rem; bill.matched += bill.rem; }
-    out.set(bill.id, bill.matched > 0 ? bill.weightedSum / bill.matched : todayMs);
+    // ms stays the matched-cash-weighted date (blends in "today" for any
+    // still-open remainder, which is right for the INTEREST calc — capital
+    // tied up in an unpaid balance keeps accruing against today every day).
+    // settled/remaining let a consumer that wants a literal "days until this
+    // bill was fully paid" figure (not a blended interest-style average)
+    // distinguish a fully-settled bill from a partially/un-paid one instead
+    // of silently blending the two into one misleading number.
+    out.set(bill.id, { ms: bill.matched > 0 ? bill.weightedSum / bill.matched : todayMs, settled, remaining });
   }
   return out;
 }
@@ -552,17 +564,29 @@ export function getSaleProfitAnalysis() {
       // (an unresolved line contributes ₹0 cost, same convention the old
       // flat-rate calc used for a name with no catalogue match).
       let saleRevenue = 0;
+      // costUnknown: true when this bill has a real sale segment but NOT A
+      // SINGLE one of its lines resolved to a current catalogue item — so
+      // bySale ends up with zero cost for it not because the cost was
+      // genuinely ₹0, but because there's no data to compute a cost from at
+      // all (old/renamed/never-catalogued item name). Previously this
+      // silently rendered as "100% margin, ₹0 interest lost," which looks
+      // like a real (great) number instead of "we don't know." A bill where
+      // SOME lines resolved still gets a real (partial) cost and isn't
+      // flagged — only the all-lines-unresolved case is undiagnosable.
+      let anySaleLine = false, anyLineResolved = false;
       for (const seg of segs) {
         if (!seg.isReturn) saleRevenue += seg.total;
         for (const it of (seg.items || [])) {
           const [name, rawQty, rate] = Array.isArray(it) ? it : [it, 1, 0];
           const id = nameToId.get(String(name || '').toLowerCase().trim());
+          if (!seg.isReturn) anySaleLine = true;
           if (!id) continue;
+          if (!seg.isReturn) anyLineResolved = true;
           const qty = Math.abs(rawQty || 0);
           add(id, date, '', 'sale', seg.isReturn ? qty : -qty, rate, { saleId });
         }
       }
-      if (segs.some(sg => !sg.isReturn)) histSaleRecords.push({ id: saleId, date, partyId: p.id, partyName: p.name, revenue: saleRevenue });
+      if (segs.some(sg => !sg.isReturn)) histSaleRecords.push({ id: saleId, date, partyId: p.id, partyName: p.name, revenue: saleRevenue, costUnknown: anySaleLine && !anyLineResolved });
     });
   }
 
@@ -571,6 +595,13 @@ export function getSaleProfitAnalysis() {
   for (const r of state.repairExpenses) add(r.itemId, r.date, r.createdAt, 'repair', -(r.qty || 0), null, {});
 
   const bySale = new Map(); // saleId -> { qty, revenue, cost, segs:[{purchaseId,amt}] }
+  // bySaleItem: saleId -> [{itemId,itemName,cat,qty,revenue,cost,segs}] — same
+  // FIFO walk as bySale above, just kept split per item instead of merged
+  // across every item on the bill, for the item-wise/category-wise margin
+  // breakdowns (request #126/#127). Built alongside bySale rather than
+  // derived from it, since bySale has already thrown away which item each
+  // seg/qty/revenue belonged to by the time it's aggregated.
+  const bySaleItem = new Map();
   for (const it of state.items) {
     const events = (eventsById[it.id] || []).slice().sort((a, b) => a.date.localeCompare(b.date) || a.seq.localeCompare(b.seq));
     const netFromEvents = events.reduce((s, e) => s + e.netQty, 0);
@@ -603,6 +634,14 @@ export function getSaleProfitAnalysis() {
           rec.qty += qty; rec.revenue += qty * (e.rate || 0); rec.cost += cost;
           rec.segs.push(...segs.map(g => ({ purchaseId: g.purchaseId, amt: g.qty * g.rate })));
           bySale.set(e.meta.saleId, rec);
+
+          const itemArr = bySaleItem.get(e.meta.saleId) || [];
+          itemArr.push({
+            itemId: it.id, itemName: it.internal || it.name || '', cat: it.cat || 'Uncategorised',
+            qty, revenue: qty * (e.rate || 0), cost,
+            segs: segs.map(g => ({ purchaseId: g.purchaseId, amt: g.qty * g.rate })),
+          });
+          bySaleItem.set(e.meta.saleId, itemArr);
         } else if (e.netQty > 1e-9) {
           layers.push({ qty: e.netQty, rate: it.purch || 0, purchaseId: null }); // sales return, back at current cost
         }
@@ -647,10 +686,13 @@ export function getSaleProfitAnalysis() {
     const landedCost = rec.cost + transportCost;
     const grossProfitLanded = rec.revenue - landedCost;
     const grossMarginLandedPct = rec.revenue > 0 ? Math.round(grossProfitLanded / rec.revenue * 1000) / 10 : 0;
+    const saleRec = saleReceivedMap.get(s.id); // {ms, settled, remaining} | undefined
+    const saleSettled = saleRec ? saleRec.settled : true; // no map entry (e.g. historical bill w/ no id) => treat as settled, no blended-with-today figure
+    const saleUnsettledAmt = saleRec && !saleRec.settled ? saleRec.remaining : 0;
     let interestLoad = 0;
     if (traceableCost > 1e-6) {
-      const weightedPurchMs = traceableSegs.reduce((s2, g) => s2 + (purchasePaidMap.get(g.purchaseId) ?? todayMs) * g.amt, 0) / traceableCost;
-      const saleRecMs = saleReceivedMap.get(s.id) ?? todayMs;
+      const weightedPurchMs = traceableSegs.reduce((s2, g) => s2 + ((purchasePaidMap.get(g.purchaseId)?.ms) ?? todayMs) * g.amt, 0) / traceableCost;
+      const saleRecMs = saleRec?.ms ?? todayMs;
       const months = (saleRecMs - weightedPurchMs) / (1000 * 60 * 60 * 24 * 30);
       interestLoad = Math.round(traceableCost * 0.01 * months);
     }
@@ -661,8 +703,34 @@ export function getSaleProfitAnalysis() {
     // supplier's weighted PAID date, not the sale date, since that's the
     // actual capital-gap the interest load represents). This is the simpler,
     // literal collection-days figure the user asked to see alongside it.
-    const saleRecMsForDays = saleReceivedMap.get(s.id) ?? todayMs;
+    // When the sale isn't fully settled yet, `ms` is blended with "today" for
+    // the interest calc above (that's intentional — unpaid capital still
+    // costs interest right now) but showing that blended figure as a literal
+    // "days to payment" is misleading since payment hasn't happened. So this
+    // field is only a real day-count when `saleSettled` is true; callers
+    // should treat `daysToPayment` as "days outstanding so far" otherwise.
+    const saleRecMsForDays = saleRec?.ms ?? todayMs;
     const daysToPayment = Math.round((saleRecMsForDays - msOf(s.date)) / (1000 * 60 * 60 * 24));
+    // Per-item breakdown within this sale (request #126/#127) — the item's
+    // own share of traceableCost decides its share of this sale's
+    // interestLoad (apportioned, since interest is computed once for the
+    // whole bill from a cost-weighted average purchase date, not per line).
+    // A line whose name didn't resolve to a current item (old/renamed,
+    // pre-ERP only) simply has no entry here, same convention as cost/
+    // interest elsewhere in this function.
+    const items = (bySaleItem.get(s.id) || []).map(ib => {
+      const ibTraceable = ib.segs.filter(g => g.purchaseId).reduce((s2, g) => s2 + g.amt, 0);
+      const ibInterestShare = traceableCost > 1e-6 ? interestLoad * (ibTraceable / traceableCost) : 0;
+      const ibGross = ib.revenue - ib.cost;
+      const ibNet = ibGross - ibInterestShare;
+      return {
+        itemId: ib.itemId, itemName: ib.itemName, cat: ib.cat, qty: Math.round(ib.qty * 100) / 100,
+        revenue: Math.round(ib.revenue), cost: Math.round(ib.cost),
+        grossProfit: Math.round(ibGross), interestLoad: Math.round(ibInterestShare), netProfit: Math.round(ibNet),
+        grossMarginPct: ib.revenue > 0 ? Math.round(ibGross / ib.revenue * 1000) / 10 : 0,
+        netMarginPct: ib.revenue > 0 ? Math.round(ibNet / ib.revenue * 1000) / 10 : 0,
+      };
+    });
     out.push({
       saleId: s.id, date: s.date, partyId: s.partyId, partyName: party?.name || s.partyName || '—',
       qty: Math.round(rec.qty * 100) / 100, revenue: Math.round(rec.revenue), cost: Math.round(rec.cost),
@@ -670,9 +738,60 @@ export function getSaleProfitAnalysis() {
       traceableCost: Math.round(traceableCost), interestLoad, netProfit, netMarginPct, daysToPayment,
       transportCost: Math.round(transportCost), landedCost: Math.round(landedCost),
       grossProfitLanded: Math.round(grossProfitLanded), grossMarginLandedPct,
+      settled: saleSettled, unsettledAmt: Math.round(saleUnsettledAmt),
+      costUnknown: !!s.costUnknown,
+      items,
     });
   }
   return out.sort((a, b) => b.date.localeCompare(a.date));
+}
+
+// Aggregates getSaleProfitAnalysis()'s per-sale `items` breakdown across every
+// sale for one party, grouped by item (request #126) and by category
+// (request #127) — same revenue/cost/grossProfit/interestLoad/netProfit
+// figures already computed per line above, just rolled up two different
+// ways instead of recomputed. `byItem`/`byCategory` are both pre-sorted by
+// netProfit descending (most profitable first) since that's the natural
+// reading order for "where is this party's margin actually coming from."
+export function getItemMarginByParty(partyId) {
+  const rows = getSaleProfitAnalysis().filter(r => r.partyId === partyId);
+  const byItemMap = new Map(); // itemId -> agg
+  const byCatMap = new Map(); // cat -> agg
+  for (const r of rows) {
+    for (const it of (r.items || [])) {
+      const ikey = it.itemId;
+      const iAgg = byItemMap.get(ikey) || { itemId: it.itemId, itemName: it.itemName, cat: it.cat, qty: 0, revenue: 0, cost: 0, grossProfit: 0, interestLoad: 0, netProfit: 0, costUnknownQty: 0 };
+      iAgg.qty += it.qty; iAgg.revenue += it.revenue; iAgg.cost += it.cost;
+      iAgg.grossProfit += it.grossProfit; iAgg.interestLoad += it.interestLoad; iAgg.netProfit += it.netProfit;
+      byItemMap.set(ikey, iAgg);
+
+      const ckey = it.cat || 'Uncategorised';
+      const cAgg = byCatMap.get(ckey) || { cat: ckey, qty: 0, revenue: 0, cost: 0, grossProfit: 0, interestLoad: 0, netProfit: 0 };
+      cAgg.qty += it.qty; cAgg.revenue += it.revenue; cAgg.cost += it.cost;
+      cAgg.grossProfit += it.grossProfit; cAgg.interestLoad += it.interestLoad; cAgg.netProfit += it.netProfit;
+      byCatMap.set(ckey, cAgg);
+    }
+    // A costUnknown bill's revenue is real but has NO item-level entries at
+    // all (see getSaleProfitAnalysis) — surfaced separately so the per-item/
+    // per-category totals below don't silently look smaller than the
+    // party's real total revenue without explanation.
+    if (r.costUnknown) {
+      const u = byItemMap.get('__unknown__') || { itemId: '__unknown__', itemName: 'Unmatched / unknown item', cat: 'Unknown', qty: 0, revenue: 0, cost: 0, grossProfit: 0, interestLoad: 0, netProfit: 0, costUnknownQty: 0 };
+      u.revenue += r.revenue; u.costUnknownQty += 1;
+      byItemMap.set('__unknown__', u);
+    }
+  }
+  const finish = agg => ({
+    ...agg,
+    qty: Math.round(agg.qty * 100) / 100, revenue: Math.round(agg.revenue), cost: Math.round(agg.cost),
+    grossProfit: Math.round(agg.grossProfit), interestLoad: Math.round(agg.interestLoad), netProfit: Math.round(agg.netProfit),
+    perPc: agg.qty > 1e-9 ? Math.round(agg.netProfit / agg.qty) : 0,
+    grossMarginPct: agg.revenue > 0 ? Math.round(agg.grossProfit / agg.revenue * 1000) / 10 : 0,
+    netMarginPct: agg.revenue > 0 ? Math.round(agg.netProfit / agg.revenue * 1000) / 10 : 0,
+  });
+  const byItem = [...byItemMap.values()].map(finish).sort((a, b) => b.netProfit - a.netProfit);
+  const byCategory = [...byCatMap.values()].map(finish).sort((a, b) => b.netProfit - a.netProfit);
+  return { byItem, byCategory };
 }
 
 // Whole-business profit breakdown for an arbitrary date range (request #26)
@@ -877,9 +996,15 @@ export function getItemMetrics(item, allRows) {
 
 // All active items' metrics in one pass, sharing a single getAllItemRows() call
 // so the per-item filtering (O(items × rows)) only happens once per render.
-export function getAllItemMetrics() {
+// `includeInactive` (request #137): Category Analytics wants discontinued
+// items folded into its totals too (their stock/damaged/historical revenue
+// still belong to the business), while every other caller of this function
+// (Inventory list metrics, Item Detail, dashboards) intentionally keeps
+// excluding them — so this defaults to the existing filtered behavior and
+// only Category Analytics passes true.
+export function getAllItemMetrics(includeInactive) {
   const allRows = getAllItemRows();
-  return state.items.filter(it => it.active !== false).map(it => ({ item: it, ...getItemMetrics(it, allRows) }));
+  return state.items.filter(it => includeInactive || it.active !== false).map(it => ({ item: it, ...getItemMetrics(it, allRows) }));
 }
 
 // Profit & Loss: Revenue (all customer sales, historical + ERP) minus COGS (each
@@ -1094,7 +1219,7 @@ export function getItemLandingCost(itemId) {
     if (p && p.total > 0 && p.extraChargesTotal) {
       transport += lineCost * (p.extraChargesTotal / p.total);
     }
-    const paidMs = purchasePaidMap.get(l.purchaseId) ?? todayMs;
+    const paidMs = purchasePaidMap.get(l.purchaseId)?.ms ?? todayMs;
     const months = (todayMs - paidMs) / (1000 * 60 * 60 * 24 * 30);
     if (months > 0) interest += lineCost * 0.01 * months;
   }
@@ -1746,6 +1871,13 @@ export const state = {
   // was copied to the clipboard first. Saved once per group, reused on every
   // share (ShareItemModal/CatalogueShareModal) same as a party's phone.
   waGroups:         [],
+  // Category Analytics: categories the user has chosen to hide from that
+  // view entirely (task #133) — e.g. a junk/"Other" bucket, or a category
+  // they just don't want cluttering the table. Soft hide only, same spirit
+  // as dashboardHiddenOOS above: items in a hidden category are untouched,
+  // they just don't get a row (or count toward totals) in Category
+  // Analytics until unhidden from the same screen's "Hidden (n)" sub-view.
+  hiddenCategories: [],
   loaded:           false,
 };
 
@@ -1782,6 +1914,7 @@ export const save = {
   dashboardHiddenOOS: mk('data:dashboardHiddenOOS', () => state.dashboardHiddenOOS),
   salesFollowupHidden: mk('data:salesFollowupHidden', () => state.salesFollowupHidden),
   waGroups:         mk('data:waGroups',         () => state.waGroups),
+  hiddenCategories: mk('data:hiddenCategories', () => state.hiddenCategories),
 };
 
 // ── Dashboard: Out of Stock hide/unhide (request #4) ────────────────────────
@@ -1793,6 +1926,17 @@ export function hideFromDashboardOOS(itemId) {
 export function unhideFromDashboardOOS(itemId) {
   state.dashboardHiddenOOS = state.dashboardHiddenOOS.filter(id => id !== itemId);
   save.dashboardHiddenOOS();
+}
+
+// ── Category Analytics: hide/unhide a category (request #133) ──────────────
+export function hideCategoryFromAnalytics(cat) {
+  if (state.hiddenCategories.includes(cat)) return;
+  state.hiddenCategories = [...state.hiddenCategories, cat];
+  save.hiddenCategories();
+}
+export function unhideCategoryFromAnalytics(cat) {
+  state.hiddenCategories = state.hiddenCategories.filter(c => c !== cat);
+  save.hiddenCategories();
 }
 
 // ── Sales Follow-up module (request #2) ─────────────────────────────────────
@@ -1938,7 +2082,7 @@ const STORAGE_KEY_TO_STATE = {
   'data:stockAdjustments':'stockAdjustments', 'data:users':'users',
   'data:stockReconciliations':'stockReconciliations',
   'data:dashboardHiddenOOS':'dashboardHiddenOOS', 'data:salesFollowupHidden':'salesFollowupHidden',
-  'data:waGroups':'waGroups',
+  'data:waGroups':'waGroups', 'data:hiddenCategories':'hiddenCategories',
 };
 const liveListeners = new Set();
 export function subscribeLive(fn) { liveListeners.add(fn); return () => liveListeners.delete(fn); }
@@ -2009,7 +2153,7 @@ export function updatePartyPhone(partyId, phone) {
 export async function loadAll() {
   if (state.loaded) return;
   try {
-    const [sales,payments,pe,pt,fu,txns,parties,items,purchases,supplierPayments,freightCharges,customCategories,categoryTags,cityTransport,orders,dispatchPhone,itemCustomerNames,cityOrder,repairExpenses,stockAdjustments,users,stockReconciliations,dashboardHiddenOOS,salesFollowupHidden,waGroups] = await Promise.all([
+    const [sales,payments,pe,pt,fu,txns,parties,items,purchases,supplierPayments,freightCharges,customCategories,categoryTags,cityTransport,orders,dispatchPhone,itemCustomerNames,cityOrder,repairExpenses,stockAdjustments,users,stockReconciliations,dashboardHiddenOOS,salesFollowupHidden,waGroups,hiddenCategories] = await Promise.all([
       DB.get('data:sales'), DB.get('data:payments'), DB.get('data:phoneEdits'),
       DB.get('data:partyTransport'), DB.get('data:followups'), DB.get('data:txns'),
       DB.get('data:parties'), DB.get('data:items'), DB.get('data:purchases'), DB.get('data:supplierPayments'),
@@ -2017,7 +2161,7 @@ export async function loadAll() {
       DB.get('data:cityTransport'), DB.get('data:orders'), DB.get('data:dispatchPhone'), DB.get('data:itemCustomerNames'),
       DB.get('data:cityOrder'), DB.get('data:repairExpenses'), DB.get('data:stockAdjustments'), DB.get('data:users'),
       DB.get('data:stockReconciliations'), DB.get('data:dashboardHiddenOOS'), DB.get('data:salesFollowupHidden'),
-      DB.get('data:waGroups'),
+      DB.get('data:waGroups'), DB.get('data:hiddenCategories'),
     ]);
     if (sales)    state.sales    = sales;
     if (payments) state.payments = payments;
@@ -2041,6 +2185,7 @@ export async function loadAll() {
     if (dashboardHiddenOOS) state.dashboardHiddenOOS = dashboardHiddenOOS;
     if (salesFollowupHidden) state.salesFollowupHidden = salesFollowupHidden;
     if (waGroups)         state.waGroups          = waGroups;
+    if (hiddenCategories) state.hiddenCategories  = hiddenCategories;
     // One-time migration: persisted items predate two corrections in the seed
     // data — (1) `purch` used to be a flat 22% of `sale` instead of a real
     // rate, hiding per-item margins, and (2) `stock`/`stockValue` weren't yet

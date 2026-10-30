@@ -12,7 +12,7 @@ import * as XLSX from 'xlsx';
 import { C, fmt, fmtL, fmtD, today, uid, ROUTES, ACCOUNTS, ACC_MAP, TXN_CATEGORIES, HISTORICAL_EXPENSES, TAG_COLORS, APP_VERSION } from './constants.js';
 import { DB } from './db.js';
 import { supabase } from './supabaseClient.js';
-import { state, save, loadAll, updatePartyPhone, getBestRate, gPS, getPrevItems, parseQty, parseResponse, getAccBal, getSupplierBal, getCustomerBal, getPartyNetBal, getPartyBills, getSupplierBills, getBestPurchRate, getAllCustomerMetrics, getAllVendorMetrics, getExpenseReport, setCategoryBiz, getCategorySubLedger, getAllItemRows, getItemMetrics, getAllItemMetrics, getExpectedStockMap, getReservedStockMap, getFifoStockMap, getItemLandingCost, getFifoSaleMarginMap, getFifoSaleCosts, getFifoProfitInRange, getExpensesInRange, hideFromDashboardOOS, unhideFromDashboardOOS, getReorderItems, setReorderLevel, getSaleProfitAnalysis, getProfitBreakdownInRange, getCustomerProfitSummary, getRecentModeSaleRate, getMonthlyBI, getMonthlyBIByCategory, getSalesProfitByCategory, getPnL, getBalanceSheet, getRepairExpenseTotal, splitPosNegItems, recordCityTransport, getTopTransportersForCity, getAllTransporterNames, subscribeLive, getItemCustomerName, setItemCustomerName, PARTY_INVOICES, PARTY_HISTORY, SUPPLIER_HISTORY, ACCOUNT_OB, ACCOUNT_HISTORY, applyTemplate, DEFAULT_TEMPLATES, describeOrder, getSalesFollowupCandidates, hideSalesFollowup, unhideSalesFollowup, getLastSupplierForItem } from './store.js';
+import { state, save, loadAll, updatePartyPhone, getBestRate, gPS, getPrevItems, parseQty, parseResponse, getAccBal, getSupplierBal, getCustomerBal, getPartyNetBal, getPartyBills, getSupplierBills, getBestPurchRate, getAllCustomerMetrics, getAllVendorMetrics, getExpenseReport, setCategoryBiz, getCategorySubLedger, getAllItemRows, getItemMetrics, getAllItemMetrics, getExpectedStockMap, getReservedStockMap, getFifoStockMap, getItemLandingCost, getFifoSaleMarginMap, getFifoSaleCosts, getFifoProfitInRange, getExpensesInRange, hideFromDashboardOOS, unhideFromDashboardOOS, getReorderItems, setReorderLevel, getSaleProfitAnalysis, getItemMarginByParty, getProfitBreakdownInRange, getCustomerProfitSummary, getRecentModeSaleRate, getMonthlyBI, getMonthlyBIByCategory, getSalesProfitByCategory, getPnL, getBalanceSheet, getRepairExpenseTotal, splitPosNegItems, recordCityTransport, getTopTransportersForCity, getAllTransporterNames, subscribeLive, getItemCustomerName, setItemCustomerName, PARTY_INVOICES, PARTY_HISTORY, SUPPLIER_HISTORY, ACCOUNT_OB, ACCOUNT_HISTORY, applyTemplate, DEFAULT_TEMPLATES, describeOrder, getSalesFollowupCandidates, hideSalesFollowup, unhideSalesFollowup, getLastSupplierForItem, hideCategoryFromAnalytics, unhideCategoryFromAnalytics } from './store.js';
 
 // ── CONVENIENT ALIASES (same pattern as monolith) ─────────────────────────────
 const _p  = () => state.parties;
@@ -157,10 +157,26 @@ function mergeItems(sourceId, targetId) {
 // moveItemStock already audits to, distinguished by `type`) means every
 // future movement of this kind becomes a dated, visible ledger row — see
 // ItemDetail's transferRows below, which now reads these back in.
+// Bucket-movement types (same item, moving between fresh/damaged/repaired
+// pools, as opposed to moveItemStock's inter-item transfer) previously left
+// fromItemId/toItemId/fromItemName/toItemName hardcoded to null/'' no matter
+// what was passed in — StockAdjustmentLog's "From Item"/"To Item" columns
+// then rendered as bare dashes with no indication anything useful even
+// happened to the named item. Fixed by describing which bucket the same
+// item moved from/to for each known type, so the log row reads e.g.
+// "Item X (Fresh) → Item X (Damaged)" instead of "— → —".
+const BUCKET_LABELS = {
+  toDamaged: { from: 'Fresh', to: 'Damaged' },
+  shiftToFresh: { from: 'Repaired', to: 'Fresh' },
+  correction: { from: 'Damaged', to: 'Fresh' },
+};
 function logStockAdjustment({itemId, itemName, qty, type, note}) {
+  const buckets = BUCKET_LABELS[type];
   const entry = {
     id: uid('ADJ'), date: today(), type, itemId, itemName: itemName||'',
-    fromItemId: null, toItemId: null, fromItemName: '', toItemName: '',
+    fromItemId: itemId, toItemId: itemId,
+    fromItemName: buckets ? `${itemName||''} (${buckets.from})` : '',
+    toItemName: buckets ? `${itemName||''} (${buckets.to})` : '',
     qty, reason: note||'', createdAt: new Date().toISOString(),
   };
   state.stockAdjustments = [entry, ...state.stockAdjustments];
@@ -349,6 +365,56 @@ const WARRANTY_OPTIONS = ['1yr warranty','1yr glass warranty','6 months warranty
 // rather than a full routing-params system, since this is the only
 // cross-module filter hand-off anywhere in the app.
 let pendingItemsFilter = null;
+
+// Same pattern as pendingItemsFilter above, for a different problem: App()'s
+// `key={mod+'#'+liveTick}` remount trick (see App() for why — it exists so a
+// save ANYWHERE, including same-tab, guarantees a fresh re-render) wipes
+// every bit of local React state in whichever module is currently mounted,
+// not just its data. For ItemMasters that meant typing one sub-category
+// reassignment in the Sub-Categories tab (SubHeadManager, whose own save
+// calls save.items() like everything else) immediately remounted ItemMasters
+// from scratch the instant it saved — kicking the user back to the "Item
+// List" tab/"All categories" filter after every single entry (request
+// #131), since those are just initial useState values with nothing else
+// keeping them alive across a remount. Mirroring pendingItemsFilter's fix:
+// stash the handful of pure-navigation values (which tab/filter the user is
+// looking at, not data) in a module-level object that survives the
+// remount, and seed each useState from it instead of a hardcoded default.
+// Backed by sessionStorage (request #130) so the same values also survive a
+// real browser refresh, not just a same-tab liveTick remount — a plain
+// module-level variable alone is wiped when the whole JS bundle
+// re-executes on F5, sessionStorage is not.
+const ITEM_MASTERS_UI_KEY = 'uk:tab:items.ui';
+let itemMastersUIState = (() => {
+  try {
+    const raw = sessionStorage.getItem(ITEM_MASTERS_UI_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch {}
+  return { view: 'list', catF: '', search: '', statusF: 'active', discInStockOnly: false };
+})();
+const persistItemMastersUIState = () => {
+  try { sessionStorage.setItem(ITEM_MASTERS_UI_KEY, JSON.stringify(itemMastersUIState)); } catch {}
+};
+
+// Request #132 — "stale UI, needs a manual refresh" traced to a concrete
+// repro in Inventory: ItemDetail's own stock-moving actions (doRepair/
+// doMoveDamaged/doCorrect — "Move to damaged", "Repair", "Not damaged →
+// stock") call repairStock()/moveToDamaged()/correctDamagedToStock(),
+// which (like every stock mutation) ends in save.items() -> notifyLive()
+// -> bumps liveTick in App() -> remounts the whole ItemMasters module (see
+// itemMastersUIState above for the same mechanism). `detailItem` held the
+// actual item OBJECT in plain useState, so that remount reset it to null —
+// the ledger modal you were just looking at silently closed out from under
+// the click, and the toast confirming the move never got to render either
+// (both were part of the subtree that just got torn down). Reopening the
+// item afterwards DOES show the correct, fresh number — which reads
+// exactly like "nothing updated until I went back in", i.e. the reported
+// bug. Fix mirrors pendingItemsFilter/itemMastersUIState: stash just the
+// open item's ID here (survives the remount since it's module-level), and
+// have ItemMasters re-derive the detail item fresh from state.items on
+// (re)mount instead of carrying a stale object snapshot — so the ledger
+// modal stays open, showing the just-updated numbers, instead of vanishing.
+let pendingDetailItemId = null;
 
 // One-shot hand-off from the Dashboard Reorder List's "Place Order" button
 // (request #5) into PurchaseEntry — same pattern as pendingItemsFilter above:
@@ -594,6 +660,39 @@ function useIsMobile(bp = MOBILE_BREAKPOINT){
   return mobile;
 }
 
+// Request #130 — "App-wide: preserve current page/view across refresh".
+// The top-level nav module (`mod` in App()) already survives a real browser
+// refresh via window.location.hash, but sub-navigation INSIDE a module
+// (which tab of Reports you were on, which view of Profit Analysis, which
+// tab of Inventory) is plain useState — gone the instant the JS bundle
+// re-executes from scratch on F5. This hook is the one place that fixes
+// that for every call site at once: same useState-shaped return value
+// (`const[tab,setTab]=usePersistedTab('reports.tab','expenses')`), but
+// backed by sessionStorage so a refresh (or even closing/reopening the tab
+// in the same browser session) restores exactly where the user was. Scoped
+// to sessionStorage rather than localStorage deliberately — it should not
+// outlive the browser session/device the way cloud-synced business data
+// does, it's just "don't lose my place on this device right now".
+// `key` must be unique per call site (e.g. 'module.fieldName') since all
+// persisted values share one storage namespace.
+function usePersistedTab(key, initial){
+  const storageKey = 'uk:tab:' + key;
+  const [val, setValRaw] = useState(() => {
+    try {
+      const raw = sessionStorage.getItem(storageKey);
+      return raw !== null ? JSON.parse(raw) : initial;
+    } catch { return initial; }
+  });
+  const setVal = (next) => {
+    setValRaw(prev => {
+      const resolved = typeof next === 'function' ? next(prev) : next;
+      try { sessionStorage.setItem(storageKey, JSON.stringify(resolved)); } catch {}
+      return resolved;
+    });
+  };
+  return [val, setVal];
+}
+
 // ── SHARED UI ──────────────────────────────────────────────────────────────────
 function Badge({v,color='blue'}){
   const m={blue:[C.blueSoft,C.blue],green:[C.greenSoft,C.green],red:[C.redSoft,C.red],
@@ -710,6 +809,7 @@ function Sel({label,value,onChange,options,placeholder,required}){
   </div>;
 }
 
+let modalIdCounter = 0;
 function Modal({title,onClose,children,width=560}){
   const mobile = useIsMobile();
   // Make the hardware/browser Back button close this modal instead of
@@ -721,12 +821,32 @@ function Modal({title,onClose,children,width=560}){
   // history.back() so it doesn't sit there requiring a second back-press
   // later. onCloseRef keeps the popstate listener calling the latest
   // onClose without having to re-run the effect.
+  //
+  // Nested modals (e.g. PartySaleProfitModal opened from inside PartyLedger,
+  // both of which render their own <Modal>) used to all close together: the
+  // inner modal's × click calls onClose() directly, which unmounts it; that
+  // unmount's cleanup below calls history.back() to pop ITS OWN dummy entry
+  // — but history.back() fires `popstate` asynchronously, and by the time
+  // it fires the OUTER modal's popstate listener is still attached and
+  // treated ANY popstate as "close me," cascading the close upward and
+  // dropping the user all the way back to the page behind both modals.
+  // Fix: tag each modal's pushed entry with its own id, and only close when
+  // the entry that's now active (event.state) is NOT this modal's own —
+  // i.e. this modal's entry was the one actually left/popped. If the active
+  // entry IS still this modal's own (e.g. a deeper, unrelated modal's entry
+  // was the one popped), this modal must stay open.
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
   const closedByPopRef = useRef(false);
+  const idRef = useRef(null);
+  if (idRef.current === null) idRef.current = ++modalIdCounter;
   useEffect(() => {
-    window.history.pushState({ modalOpen: true }, '');
-    const onPop = () => { closedByPopRef.current = true; onCloseRef.current(); };
+    window.history.pushState({ modalOpen: true, modalId: idRef.current }, '');
+    const onPop = (e) => {
+      if (e.state && e.state.modalId === idRef.current) return; // our entry is still the active one — not for us
+      closedByPopRef.current = true;
+      onCloseRef.current();
+    };
     window.addEventListener('popstate', onPop);
     return () => {
       window.removeEventListener('popstate', onPop);
@@ -3641,14 +3761,28 @@ function PartyProfile({party,onClose}){
 // two completely separate balances. This component builds a single
 // chronological timeline from both sides and a single running balance using
 // the SAME sign convention as getPartyNetBal (store.js): positive = party
-// owes us net; negative = we owe the party net. Note party.ob is
-// deliberately NOT applied here — getCustomerBal and getSupplierBal both add
-// the same party.ob independently, so it cancels out entirely in
-// getPartyNetBal = getCustomerBal - getSupplierBal, meaning an opening
-// balance has no net effect for a 'both' party by construction. Mirroring
-// that exactly (starting the walk at 0, live transactions only) keeps this
-// ledger's closing balance identical to getPartyNetBal everywhere else it's
-// used (Outstanding, Parties list, Dashboard tiles).
+// owes us net; negative = we owe the party net.
+//
+// Pre-ERP historical sales/purchases/payments (PARTY_HISTORY/SUPPLIER_HISTORY,
+// keyed by party name — same source the single-type PartyLedger pulls from)
+// are folded into this same timeline and walk. Earlier this intentionally
+// started the walk at 0 with in-app records ONLY and left party.ob out
+// entirely — reasoned at the time as "safe" because getCustomerBal and
+// getSupplierBal both add the same party.ob independently, cancelling it out
+// of getPartyNetBal by construction. That reasoning only covers the `ob`
+// SCALAR; it never accounted for pre-ERP historical TRANSACTION ROWS, which
+// this view dropped completely — a real party with years of pre-ERP sales
+// history showed an empty/near-empty ledger and a balance with most of its
+// own transaction record missing. Fixed (per explicit user direction) by
+// pulling in the actual historical rows from both sides and walking them
+// into the same balance — this sidesteps the `ob`-scalar double-count
+// bug entirely (customer-side and supplier-side history come from two
+// separate, independently-sourced arrays, not one shared number), so the
+// result is a real combined balance built from every known transaction,
+// which may now differ from getPartyNetBal elsewhere in the app for a party
+// whose pre-ERP history sits on only one side (that discrepancy is the
+// correct outcome, not a new bug — see getPartyNetBal's own ob-cancellation
+// note in store.js for why the dashboard-wide figure still excludes it).
 function MergedPartyLedger({party,onClose}){
   const mobile=useIsMobile();
   const PAGE=20;
@@ -3660,21 +3794,47 @@ function MergedPartyLedger({party,onClose}){
   const custSales=useMemo(()=>state.sales.filter(s=>s.partyId===party.id).map(s=>({
     date:s.date, side:'customer', type:s.type==='return'?'return':'sale', amount:s.total,
     desc:(s.items||[]).slice(0,3).map(x=>(x.customerName||x.itemName)+' ×'+x.qty).join(', ')||(s.type==='return'?'Sales Return':'Sale'),
-    createdAt:s.createdAt||'', saleId:s.id,
+    createdAt:s.createdAt||'', saleId:s.id, hist:false,
   })),[party.id,state.sales.length]);
   const custPmts=useMemo(()=>state.payments.filter(p=>p.partyId===party.id).map(p=>({
     date:p.date, side:'customer', type:'payment', amount:p.amount,
-    desc:p.notes||('Received — '+(ACC_MAP[p.account]?.short||p.account||'—')), createdAt:'',
+    desc:p.notes||('Received — '+(ACC_MAP[p.account]?.short||p.account||'—')), createdAt:'', hist:false,
   })),[party.id,state.payments.length]);
   const suppPurch=useMemo(()=>state.purchases.filter(s=>s.partyId===party.id).map(s=>({
     date:s.date, side:'supplier', type:s.total<0?'return':'purchase', amount:s.total+(s.extraChargesTotal||0),
     desc:(s.items||[]).slice(0,3).map(x=>(x.supplierName||x.customerName||x.itemName)+' ×'+x.qty).join(', ')||(s.total<0?'Purchase Return':'Purchase'),
-    createdAt:s.createdAt||'', purchaseId:s.id,
+    createdAt:s.createdAt||'', purchaseId:s.id, hist:false,
   })),[party.id,state.purchases.length]);
   const suppPmts=useMemo(()=>state.supplierPayments.filter(p=>p.partyId===party.id).map(p=>({
     date:p.date, side:'supplier', type:'payment', amount:p.amount,
-    desc:p.notes||('Paid — '+(ACC_MAP[p.account]?.short||p.account||'—')), createdAt:'',
+    desc:p.notes||('Paid — '+(ACC_MAP[p.account]?.short||p.account||'—')), createdAt:'', hist:false,
   })),[party.id,state.supplierPayments.length]);
+
+  // Pre-ERP historical rows — same sources/shape as PartyLedger's
+  // histSalesRaw/histPmtsRaw below, just tagged with `side` here since both
+  // customer and supplier history can coexist for one 'both' party.
+  const histCustRaw=PARTY_HISTORY[party.name]?.s||[];
+  const histCustPmtsRaw=PARTY_HISTORY[party.name]?.p||[];
+  const histSuppRaw=SUPPLIER_HISTORY[party.name]?.s||[];
+  const histSuppPmtsRaw=SUPPLIER_HISTORY[party.name]?.p||[];
+  const histCustSales=useMemo(()=>histCustRaw.flatMap(s=>splitPosNegItems(s[1],s[2]).map(seg=>({
+    date:s[0], side:'customer', type:seg.isReturn?'return':'sale', amount:seg.total,
+    desc:seg.items.slice(0,3).map(x=>Array.isArray(x)?x[0]+' ×'+x[1]:x).join(', ')||(seg.isReturn?'Sales Return':'Sale'),
+    createdAt:'', hist:true,
+  }))),[party.name]);
+  const histCustPmts=useMemo(()=>histCustPmtsRaw.map(p=>({
+    date:p[0], side:'customer', type:'payment', amount:p[1],
+    desc:'Received — '+(p[2]||'Cash/Bank'), createdAt:'', hist:true,
+  })),[party.name]);
+  const histSuppPurch=useMemo(()=>histSuppRaw.map(s=>({
+    date:s[0], side:'supplier', type:'purchase', amount:s[1],
+    desc:(s[2]||[]).slice(0,3).map(x=>Array.isArray(x)?x[0]+' ×'+x[1]:x).join(', ')||'Purchase',
+    createdAt:'', hist:true,
+  })),[party.name]);
+  const histSuppPmts=useMemo(()=>histSuppPmtsRaw.map(p=>({
+    date:p[0], side:'supplier', type:'payment', amount:p[1],
+    desc:'Paid — '+(p[2]||'Cash/Bank'), createdAt:'', hist:true,
+  })),[party.name]);
 
   // Merge, sort chronologically, and walk ONE running balance. Customer-side
   // entries keep their natural sign (sale:+, return:-(already negative),
@@ -3682,7 +3842,8 @@ function MergedPartyLedger({party,onClose}){
   // the same net scale (a purchase/payable-up event reduces net toward us; a
   // payment we make to them increases net toward us) — see getPartyNetBal.
   const rows=useMemo(()=>{
-    const tagged=[...custSales,...custPmts,...suppPurch,...suppPmts]
+    const tagged=[...custSales,...custPmts,...suppPurch,...suppPmts,
+      ...histCustSales,...histCustPmts,...histSuppPurch,...histSuppPmts]
       .sort((a,b)=>a.date.localeCompare(b.date)||(a.createdAt||'').localeCompare(b.createdAt||''));
     let bal=0;
     const withBal=tagged.map(e=>{
@@ -3692,15 +3853,15 @@ function MergedPartyLedger({party,onClose}){
       return {...e,delta,balance:bal};
     });
     return withBal.slice().reverse();
-  },[custSales,custPmts,suppPurch,suppPmts]);
+  },[custSales,custPmts,suppPurch,suppPmts,histCustSales,histCustPmts,histSuppPurch,histSuppPmts]);
 
-  const currentNet=rows.length?rows[0].balance:0; // === getPartyNetBal(party.id)
-  const totalSold=custSales.filter(e=>e.type==='sale').reduce((s,e)=>s+e.amount,0);
-  const totalReturned=Math.abs(custSales.filter(e=>e.type==='return').reduce((s,e)=>s+e.amount,0))
-    +Math.abs(suppPurch.filter(e=>e.type==='return').reduce((s,e)=>s+e.amount,0));
-  const totalReceived=custPmts.reduce((s,e)=>s+e.amount,0);
-  const totalPurchased=suppPurch.filter(e=>e.type==='purchase').reduce((s,e)=>s+e.amount,0);
-  const totalPaid=suppPmts.reduce((s,e)=>s+e.amount,0);
+  const currentNet=rows.length?rows[0].balance:0; // may now differ from getPartyNetBal — see comment above
+  const totalSold=[...custSales,...histCustSales].filter(e=>e.type==='sale').reduce((s,e)=>s+e.amount,0);
+  const totalReturned=Math.abs([...custSales,...histCustSales].filter(e=>e.type==='return').reduce((s,e)=>s+e.amount,0))
+    +Math.abs([...suppPurch,...histSuppPurch].filter(e=>e.type==='return').reduce((s,e)=>s+e.amount,0));
+  const totalReceived=[...custPmts,...histCustPmts].reduce((s,e)=>s+e.amount,0);
+  const totalPurchased=[...suppPurch,...histSuppPurch].filter(e=>e.type==='purchase').reduce((s,e)=>s+e.amount,0);
+  const totalPaid=[...suppPmts,...histSuppPmts].reduce((s,e)=>s+e.amount,0);
 
   const typeMeta={
     sale:{label:'Sale',color:C.blue,badge:'blue'},
@@ -4269,7 +4430,10 @@ function PartyLedger({party,onClose}){
 function PartySaleProfitModal({party,onClose}){
   const mobile=useIsMobile();
   const[viewSale,setViewSale]=useState(null);
+  const[tab,setTab]=useState('sale'); // 'sale' | 'item' | 'cat'
   const rows=useMemo(()=>getSaleProfitAnalysis().filter(r=>r.partyId===party.id),
+    [party.id,state.sales.length,state.payments.length,state.purchases.length,state.supplierPayments.length]);
+  const{byItem,byCategory}=useMemo(()=>getItemMarginByParty(party.id),
     [party.id,state.sales.length,state.payments.length,state.purchases.length,state.supplierPayments.length]);
 
   const totals=rows.reduce((a,r)=>({
@@ -4280,6 +4444,13 @@ function PartySaleProfitModal({party,onClose}){
   const intPct=totals.revenue>0?Math.round(totals.interestLoad/totals.revenue*1000)/10:0;
   const netPct=totals.revenue>0?Math.round(totals.netProfit/totals.revenue*1000)/10:0;
   const hasUntraceable=rows.some(r=>r.traceableCost<r.cost-1);
+  // costUnknown: pre-ERP sale whose line items didn't resolve to any
+  // current catalogue item at all — cost/interest show as 0 and margin as
+  // 100% not because that's really true, but because there's no cost data.
+  // Flagged separately from hasUntraceable (which covers opening-stock/
+  // no-purchase-date cases where cost IS known, just not its paid date).
+  const hasCostUnknown=rows.some(r=>r.costUnknown);
+  const unsettled=rows.filter(r=>!r.settled);
 
   return <Modal title={party.name+' — Profit & Interest Breakdown'} onClose={onClose} width={780}>
     {viewSale&&<SaleBillModal sale={viewSale} onClose={()=>setViewSale(null)}/>}
@@ -4300,22 +4471,60 @@ function PartySaleProfitModal({party,onClose}){
         <div style={{fontSize:11,color:C.sub}}>{netPct}% of revenue</div>
       </div>
     </div>
+    <div style={{display:'flex',gap:6,marginBottom:12}}>
+      {[['sale','Per-Sale'],['item','By Item'],['cat','By Category']].map(([k,label])=>
+        <button key={k} onClick={()=>setTab(k)} style={{padding:'6px 14px',borderRadius:7,border:`1.5px solid ${tab===k?C.blue:C.bdr}`,background:tab===k?C.blueSoft:'transparent',color:tab===k?C.blue:C.sub,fontWeight:700,fontSize:12,cursor:'pointer',fontFamily:'inherit'}}>{label}</button>)}
+    </div>
+    {tab==='sale'&&<>
     <div style={{fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,marginBottom:8}}>Per-Sale Breakdown ({rows.length})</div>
     <div style={{border:`1px solid ${C.bdr}`,borderRadius:8,overflow:'hidden',background:mobile?'transparent':undefined,padding:mobile?8:0,marginBottom:8}}>
       <CardTable mobile={mobile} rows={rows} keyFn={r=>r.saleId} emptyLabel="No sales recorded yet"
         onRowClick={r=>{const found=state.sales.find(x=>x.id===r.saleId);if(found)setViewSale(found);}}
         columns={[
-          {key:'date',label:'Date',render:r=><span style={{color:C.sub,whiteSpace:'nowrap'}}>{fmtD(r.date)}</span>},
+          {key:'date',label:'Date',render:r=><span style={{color:C.sub,whiteSpace:'nowrap'}}>{fmtD(r.date)}{r.costUnknown&&<span title="Cost unknown — old/renamed item not matched to catalogue" style={{marginLeft:4,color:C.red,fontWeight:700}}>*</span>}</span>},
           {key:'revenue',label:'Revenue',align:'right',render:r=><span style={{fontWeight:600}}>{fmt(r.revenue)}</span>},
-          {key:'gross',label:'Gross Margin',align:'right',render:r=><span style={{fontWeight:700,color:C.blue}}>{fmt(r.grossProfit)}<span style={{fontSize:10,color:C.sub,fontWeight:400}}> ({r.grossMarginPct}%)</span></span>},
-          {key:'days',label:'Days to Payment',align:'right',render:r=><span style={{color:C.sub}}>{r.daysToPayment}d</span>},
-          {key:'interest',label:'Interest Lost',align:'right',render:r=><span style={{fontWeight:700,color:r.interestLoad>0?C.red:r.interestLoad<0?C.green:C.sub}}>{r.interestLoad>0?'−':r.interestLoad<0?'+':''}{fmt(Math.abs(r.interestLoad))}</span>},
-          {key:'net',label:'True Margin',align:'right',render:r=><span style={{fontWeight:700,color:r.netProfit>=0?C.green:C.red}}>{fmt(r.netProfit)}<span style={{fontSize:10,color:C.sub,fontWeight:400}}> ({r.netMarginPct}%)</span></span>},
+          {key:'gross',label:'Gross Margin',align:'right',render:r=>r.costUnknown?<span style={{color:C.muted,fontStyle:'italic'}}>unknown</span>:<span style={{fontWeight:700,color:C.blue}}>{fmt(r.grossProfit)}<span style={{fontSize:10,color:C.sub,fontWeight:400}}> ({r.grossMarginPct}%)</span></span>},
+          {key:'days',label:'Days to Payment',align:'right',render:r=>r.settled?<span style={{color:C.sub}}>{r.daysToPayment}d</span>:<span style={{color:C.amber||'#B45309'}}>{r.daysToPayment}d so far<span style={{display:'block',fontSize:9,color:C.sub}}>₹{fmt(r.unsettledAmt)} still unpaid</span></span>},
+          {key:'interest',label:'Interest Lost',align:'right',render:r=>r.costUnknown?<span style={{color:C.muted,fontStyle:'italic'}}>unknown</span>:<span style={{fontWeight:700,color:r.interestLoad>0?C.red:r.interestLoad<0?C.green:C.sub}}>{r.interestLoad>0?'−':r.interestLoad<0?'+':''}{fmt(Math.abs(r.interestLoad))}{!r.settled&&<span style={{fontSize:9,color:C.sub,fontWeight:400}}> (so far)</span>}</span>},
+          {key:'net',label:'True Margin',align:'right',render:r=>r.costUnknown?<span style={{color:C.muted,fontStyle:'italic'}}>unknown</span>:<span style={{fontWeight:700,color:r.netProfit>=0?C.green:C.red}}>{fmt(r.netProfit)}<span style={{fontSize:10,color:C.sub,fontWeight:400}}> ({r.netMarginPct}%)</span></span>},
         ]}/>
     </div>
-    {hasUntraceable&&<div style={{fontSize:11,color:C.muted}}>
-      * A sale drawing from stock with no traceable purchase date (opening stock, or a sales return put back at cost) has its interest load computed only on the traceable portion of its cost.
+    {(hasUntraceable||hasCostUnknown||unsettled.length>0)&&<div style={{fontSize:11,color:C.muted,display:'grid',gap:4}}>
+      {hasCostUnknown&&<div><span style={{color:C.red,fontWeight:700}}>*</span> Cost unknown for this sale — it's a pre-app bill whose item name(s) don't match anything in the current catalogue, so there's no purchase data to compute cost/margin/interest from (not a real 100% margin or ₹0 interest — it's unmeasured).</div>}
+      {hasUntraceable&&<div>A sale drawing from stock with no traceable purchase date (opening stock, or a sales return put back at cost) has its interest load computed only on the traceable portion of its cost.</div>}
+      {unsettled.length>0&&<div>{unsettled.length} sale{unsettled.length>1?'s':''} above {unsettled.length>1?'are':'is'} not fully paid yet — "days to payment" and "interest lost" for those are running totals as of today, not final figures.</div>}
     </div>}
+    </>}
+    {tab==='item'&&<>
+    <div style={{fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,marginBottom:8}}>Item-wise Margin ({byItem.length})</div>
+    <div style={{border:`1px solid ${C.bdr}`,borderRadius:8,overflow:'hidden',background:mobile?'transparent':undefined,padding:mobile?8:0,marginBottom:8}}>
+      <CardTable mobile={mobile} rows={byItem} keyFn={r=>r.itemId} emptyLabel="No item data yet"
+        columns={[
+          {key:'item',label:'Item',render:r=><span style={{fontWeight:600}}>{r.itemName}{r.costUnknownQty>0&&<span title="Cost unknown for some bills under this label" style={{marginLeft:4,color:C.red,fontWeight:700}}>*</span>}</span>},
+          {key:'qty',label:'Qty',align:'right',render:r=><span style={{color:C.sub}}>{r.qty}</span>},
+          {key:'revenue',label:'Revenue',align:'right',render:r=><span style={{fontWeight:600}}>{fmt(r.revenue)}</span>},
+          {key:'gross',label:'Gross Margin',align:'right',render:r=>r.itemId==='__unknown__'?<span style={{color:C.muted,fontStyle:'italic'}}>unknown</span>:<span style={{fontWeight:700,color:C.blue}}>{fmt(r.grossProfit)}<span style={{fontSize:10,color:C.sub,fontWeight:400}}> ({r.grossMarginPct}%)</span></span>},
+          {key:'net',label:'True Margin',align:'right',render:r=>r.itemId==='__unknown__'?<span style={{color:C.muted,fontStyle:'italic'}}>unknown</span>:<span style={{fontWeight:700,color:r.netProfit>=0?C.green:C.red}}>{fmt(r.netProfit)}<span style={{fontSize:10,color:C.sub,fontWeight:400}}> ({r.netMarginPct}%)</span></span>},
+          {key:'perpc',label:'Per Pc',align:'right',render:r=>r.itemId==='__unknown__'?<span style={{color:C.muted}}>—</span>:<span style={{color:C.sub}}>{fmt(r.perPc)}</span>},
+        ]}/>
+    </div>
+    <div style={{fontSize:11,color:C.muted}}>Sorted by true margin earned, highest first. {byItem.some(i=>i.itemId==='__unknown__')&&<span><span style={{color:C.red,fontWeight:700}}>*</span> "Unmatched / unknown item" groups pre-app bills whose line items don't match any current catalogue item — revenue is real, margin can't be computed.</span>}</div>
+    </>}
+    {tab==='cat'&&<>
+    <div style={{fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5,marginBottom:8}}>Category-wise Margin ({byCategory.length})</div>
+    <div style={{border:`1px solid ${C.bdr}`,borderRadius:8,overflow:'hidden',background:mobile?'transparent':undefined,padding:mobile?8:0,marginBottom:8}}>
+      <CardTable mobile={mobile} rows={byCategory} keyFn={r=>r.cat} emptyLabel="No category data yet"
+        columns={[
+          {key:'cat',label:'Category',render:r=><span style={{fontWeight:600}}>{r.cat}</span>},
+          {key:'qty',label:'Qty',align:'right',render:r=><span style={{color:C.sub}}>{r.qty}</span>},
+          {key:'revenue',label:'Revenue',align:'right',render:r=><span style={{fontWeight:600}}>{fmt(r.revenue)}</span>},
+          {key:'gross',label:'Gross Margin',align:'right',render:r=><span style={{fontWeight:700,color:C.blue}}>{fmt(r.grossProfit)}<span style={{fontSize:10,color:C.sub,fontWeight:400}}> ({r.grossMarginPct}%)</span></span>},
+          {key:'net',label:'True Margin',align:'right',render:r=><span style={{fontWeight:700,color:r.netProfit>=0?C.green:C.red}}>{fmt(r.netProfit)}<span style={{fontSize:10,color:C.sub,fontWeight:400}}> ({r.netMarginPct}%)</span></span>},
+          {key:'perpc',label:'Per Pc',align:'right',render:r=><span style={{color:C.sub}}>{fmt(r.perPc)}</span>},
+        ]}/>
+    </div>
+    <div style={{fontSize:11,color:C.muted}}>Sorted by true margin earned, highest first. Bills with no item-level match (pre-app, unmatched names) aren't included here — see the "By Item" tab's unmatched row.</div>
+    </>}
   </Modal>;
 }
 
@@ -5970,7 +6179,11 @@ function CategoryDetail({cat,items,onClose}){
   const[search,setSearch]=useState('');
   const[page,setPage]=useState(0);
   const PAGE=20;
-  const metrics=useMemo(()=>getAllItemMetrics(),[state.sales.length,state.purchases.length,state.items.length]);
+  // includeInactive=true (request #137): this drill-down is reached from
+  // CategoryAnalytics, which now folds discontinued items into its totals
+  // too — keeping this at the old filtered default would make the detail
+  // view's item list/totals disagree with the summary row that opened it.
+  const metrics=useMemo(()=>getAllItemMetrics(true),[state.sales.length,state.purchases.length,state.items.length]);
   const expectedMap=useMemo(()=>getExpectedStockMap(),[state.purchases.length]);
   // FIFO-costed stock value — item.purch is a flat rate only refreshed by the
   // offline seed/import script, so it goes stale the moment an in-app
@@ -6036,8 +6249,15 @@ function CategoryDetail({cat,items,onClose}){
 
 function CategoryAnalytics(){
   const[catDetail,setCatDetail]=useState(null);
-  const rows=useMemo(()=>{
-    const metrics=getAllItemMetrics();
+  const[showHidden,setShowHidden]=useState(false);
+  const allRows=useMemo(()=>{
+    // Request #137: includeInactive=true — discontinued items' stock,
+    // damaged pcs, and historical sold/revenue/profit used to vanish from
+    // these totals the moment an item was marked inactive, understating
+    // the category's real numbers. Every OTHER caller of getAllItemMetrics
+    // still gets the filtered (active-only) default — this is the one view
+    // that explicitly wants the fuller picture.
+    const metrics=getAllItemMetrics(true);
     const expectedMap=getExpectedStockMap();
     // See getFifoStockMap in store.js — replaces the flat, easily-stale
     // item.purch×stock estimate with FIFO-costed layers built from real
@@ -6047,12 +6267,22 @@ function CategoryAnalytics(){
     const byCat={};
     for(const m of metrics){
       const cat=m.item.cat||'Other';
-      if(!byCat[cat])byCat[cat]={cat,count:0,stock:0,stockValue:0,damaged:0,totalSoldQty:0,totalRevenue:0,profit:0,expected:0};
+      if(!byCat[cat])byCat[cat]={cat,count:0,stock:0,stockValue:0,damaged:0,totalSoldQty:0,totalRevenue:0,profit:0,expected:0,petis:0,loose:0};
       const b=byCat[cat];
       const stock=m.item.stock||0;
       const fifo=fifoMap[m.item.id];
       b.count++; b.stock+=stock; b.stockValue+=fifo?fifo.value:(stock*(m.item.purch||0)); b.damaged+=(m.item.damaged||0);
       b.totalSoldQty+=m.totalSoldQty; b.totalRevenue+=m.totalRevenue; b.profit+=m.profit; b.expected+=(expectedMap[m.item.id]||0);
+      // Request #135: peti+loose breakdown. Each item has its own peti
+      // (carton) size — same usesPeti convention as formatStockQty/
+      // ItemDetail elsewhere (a peti size of 1 means "sold loose", except
+      // the Lighter category where 1 is a real peti) — summed per category
+      // using each item's own size, so a category mixing box sizes still
+      // gets a sensible "N full petis + M loose pcs" total.
+      const peti=m.item.peti||1;
+      const usesPeti=m.item.cat==='Lighter'||peti>1;
+      if(usesPeti){ b.petis+=Math.floor(stock/peti); b.loose+=stock%peti; }
+      else { b.loose+=stock; }
     }
     return Object.values(byCat).map(b=>({
       ...b,
@@ -6060,37 +6290,63 @@ function CategoryAnalytics(){
       shareOfBusiness: grandRevenue>0?Math.round(b.totalRevenue/grandRevenue*1000)/10:0,
     })).sort((a,b)=>b.totalRevenue-a.totalRevenue);
   },[state.sales.length,state.purchases.length,state.items.length,state.repairExpenses.length]);
-  const totals=useMemo(()=>rows.reduce((s,r)=>({count:s.count+r.count,stock:s.stock+r.stock,stockValue:s.stockValue+r.stockValue,damaged:s.damaged+r.damaged,totalRevenue:s.totalRevenue+r.totalRevenue,profit:s.profit+r.profit,expected:s.expected+r.expected}),{count:0,stock:0,stockValue:0,damaged:0,totalRevenue:0,profit:0,expected:0}),[rows]);
+  // Request #133: categories the user has chosen to hide from this view —
+  // soft dismissal only (hideCategoryFromAnalytics/unhideCategoryFromAnalytics
+  // in store.js), same "Hidden (n)" collapsible pattern already used for
+  // Dashboard's Out of Stock list.
+  const hiddenSet=new Set(state.hiddenCategories||[]);
+  const visibleRows=useMemo(()=>allRows.filter(r=>!hiddenSet.has(r.cat)),[allRows,state.hiddenCategories.length]);
+  const hiddenRows=useMemo(()=>allRows.filter(r=>hiddenSet.has(r.cat)),[allRows,state.hiddenCategories.length]);
+  const totals=useMemo(()=>visibleRows.reduce((s,r)=>({count:s.count+r.count,stock:s.stock+r.stock,stockValue:s.stockValue+r.stockValue,damaged:s.damaged+r.damaged,totalSoldQty:s.totalSoldQty+r.totalSoldQty,totalRevenue:s.totalRevenue+r.totalRevenue,profit:s.profit+r.profit,expected:s.expected+r.expected,petis:s.petis+r.petis,loose:s.loose+r.loose,shareOfBusiness:s.shareOfBusiness+r.shareOfBusiness}),{count:0,stock:0,stockValue:0,damaged:0,totalSoldQty:0,totalRevenue:0,profit:0,expected:0,petis:0,loose:0,shareOfBusiness:0}),[visibleRows]);
   const mobile=useIsMobile();
+  // Request #134 fix: the old footer was a hand-built flex row with only 5
+  // of the 11 columns, laid out with justifyContent:'space-between' — it
+  // was never actually aligned under the table's real column grid (whose
+  // widths are driven by content, not fixed %), so it visibly drifted out
+  // of alignment. Appending a real "Total" row through the exact same
+  // columns/render path as every other row guarantees pixel-perfect
+  // alignment, since it's the same <td> grid, not a separate layout.
+  const totalRow={cat:'__TOTAL__',...totals,avgProfitPct:totals.totalRevenue>0?Math.round(totals.profit/totals.totalRevenue*1000)/10:0};
+  const tableRows=visibleRows.length>0?[...visibleRows,totalRow]:visibleRows;
   const columns=[
-    {key:'cat',label:'Category',render:r=><Badge v={r.cat} color="blue"/>},
-    {key:'count',label:'Items',align:'right',render:r=><span style={{color:C.sub}}>{r.count}</span>},
-    {key:'stock',label:'Stock (pcs)',align:'right',render:r=><span style={{color:C.sub}}>{r.stock}</span>},
-    {key:'expected',label:'Expected',align:'right',render:r=><span style={{color:r.expected>0?C.amber:C.muted}}>{r.expected>0?'+'+r.expected:'—'}</span>},
+    {key:'cat',label:'Category',render:r=>r.cat==='__TOTAL__'?<span style={{fontWeight:800,color:C.txt}}>Total</span>:<Badge v={r.cat} color="blue"/>},
+    {key:'count',label:'Items',align:'right',render:r=><span style={{color:C.sub,fontWeight:r.cat==='__TOTAL__'?700:400}}>{r.count}</span>},
+    {key:'stock',label:'Stock (Peti+Pcs)',align:'right',render:r=>
+      <span style={{color:C.sub,fontWeight:r.cat==='__TOTAL__'?700:400}}>
+        {r.petis>0?`${r.petis} peti${r.petis===1?'':'s'} + ${r.loose} pc${r.loose===1?'':'s'}`:`${r.loose} pc${r.loose===1?'':'s'}`}
+        <span style={{color:C.muted}}> ({r.stock})</span>
+      </span>},
+    {key:'expected',label:'Expected',align:'right',render:r=><span style={{color:r.expected>0?C.amber:C.muted,fontWeight:r.cat==='__TOTAL__'?700:400}}>{r.expected>0?'+'+r.expected:'—'}</span>},
     {key:'stockValue',label:'Stock Value',align:'right',render:r=><span style={{fontWeight:600,color:C.txt}}>{fmt(r.stockValue)}</span>},
-    {key:'sold',label:'Sold (pcs)',align:'right',render:r=><span style={{color:C.sub}}>{r.totalSoldQty}</span>},
+    {key:'sold',label:'Sold (pcs)',align:'right',render:r=><span style={{color:C.sub,fontWeight:r.cat==='__TOTAL__'?700:400}}>{r.totalSoldQty}</span>},
     {key:'revenue',label:'Revenue',align:'right',render:r=><span style={{fontWeight:600,color:C.txt}}>{fmt(r.totalRevenue)}</span>},
     {key:'profit',label:'Profit',align:'right',render:r=><span style={{fontWeight:600,color:r.profit>=0?C.blue:C.red}}>{fmt(r.profit)}</span>},
     {key:'profitPct',label:'Profit %',align:'right',render:r=><Badge v={r.avgProfitPct+'%'} color={r.avgProfitPct>25?'green':r.avgProfitPct>15?'amber':'red'}/>},
-    {key:'share',label:'Share of Biz',align:'right',render:r=><span style={{color:C.sub}}>{r.shareOfBusiness}%</span>},
-    {key:'damaged',label:'Damaged',align:'right',render:r=><span style={{color:r.damaged>0?C.amber:C.sub}}>{r.damaged}</span>},
+    {key:'share',label:'Share of Biz',align:'right',render:r=><span style={{color:C.sub,fontWeight:r.cat==='__TOTAL__'?700:400}}>{r.shareOfBusiness}%</span>},
+    {key:'damaged',label:'Damaged',align:'right',render:r=><span style={{color:r.damaged>0?C.amber:C.sub,fontWeight:r.cat==='__TOTAL__'?700:400}}>{r.damaged}</span>},
+    {key:'hide',label:'',align:'right',render:r=>r.cat==='__TOTAL__'?null:
+      <span onClick={e=>e.stopPropagation()}><IconBtn onClick={()=>hideCategoryFromAnalytics(r.cat)} title="Hide this category">🙈</IconBtn></span>},
   ];
-  const footer=rows.length>0&&<div style={{display:'flex',flexWrap:'wrap',gap:14,justifyContent:'space-between',
-    padding:mobile?'10px 14px':'9px 12px',background:'#F6F8FA',fontWeight:700,fontSize:13,
-    borderTop:mobile?`1px solid ${C.bdr}`:'none',borderRadius:mobile?9:0}}>
-    <span>Total</span>
-    <span style={{display:'flex',gap:14,flexWrap:'wrap'}}>
-      <span>{totals.count} items</span><span>{totals.stock} pcs</span><span>{fmt(totals.stockValue)}</span>
-      <span>{fmt(totals.profit)} profit</span><span>{totals.damaged} damaged</span>
-    </span>
-  </div>;
   return <div>
     {catDetail&&<CategoryDetail cat={catDetail} onClose={()=>setCatDetail(null)}/>}
-    <SectionHead title="Category Analytics" sub={`${totals.count} active items · ${fmt(totals.stockValue)} total stock value · click a category for item-level detail`}/>
+    <SectionHead title="Category Analytics" sub={`${totals.count} items (incl. discontinued) · ${fmt(totals.stockValue)} total stock value · click a category for item-level detail`}/>
     <div style={{background:mobile?'transparent':C.surf,borderRadius:8,border:mobile?'none':`1px solid ${C.bdr}`,overflow:'hidden'}}>
-      <CardTable mobile={mobile} columns={columns} rows={rows} keyFn={(r,i)=>i}
-        onRowClick={r=>setCatDetail(r.cat)} footer={footer}/>
+      <CardTable mobile={mobile} columns={columns} rows={tableRows} keyFn={(r,i)=>r.cat+i}
+        rowStyle={r=>r.cat==='__TOTAL__'?{background:'#F6F8FA',borderTop:`2px solid ${C.bdr}`}:null}
+        onRowClick={r=>{if(r.cat!=='__TOTAL__')setCatDetail(r.cat);}} emptyLabel="No categories to show"/>
     </div>
+    {hiddenRows.length>0&&<div style={{marginTop:10}}>
+      <button onClick={()=>setShowHidden(v=>!v)} style={{width:'100%',textAlign:'left',padding:'8px 12px',background:'none',border:'none',cursor:'pointer',fontSize:11,color:C.sub,fontWeight:600,fontFamily:'inherit'}}>
+        {showHidden?'▾':'▸'} Hidden categories ({hiddenRows.length})
+      </button>
+      {showHidden&&<div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,overflow:'hidden'}}>
+        {hiddenRows.map(r=>
+          <div key={r.cat} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'8px 16px',borderBottom:`1px solid ${C.bdr}`,gap:10}}>
+            <div style={{minWidth:0,fontSize:12,color:C.muted,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{r.cat} · {r.count} items · {fmt(r.stockValue)}</div>
+            <IconBtn onClick={()=>unhideCategoryFromAnalytics(r.cat)} title="Unhide">👁️</IconBtn>
+          </div>)}
+      </div>}
+    </div>}
   </div>;
 }
 
@@ -6244,7 +6500,15 @@ function QuickSellModal({item,source,onClose,onSold}){
 // makes that damaged-but-discontinued stock something you actually notice
 // here, instead of easy to scroll past unlabeled.
 function DamagedInventory(){
-  const sortItems=list=>[...list].sort((a,b)=>(a.active===false?1:0)-(b.active===false?1:0));
+  // Request #136 — group by category (with a per-category pcs+value
+  // subtotal banner, same visual convention as ItemMasters' groupHeader)
+  // instead of one flat list, so "which categories are actually carrying
+  // the damaged stock" is visible at a glance rather than needing to scan
+  // every row's Category column and add it up by hand. Sort by category
+  // first so adjacent-row comparison in groupHeader works; keep the
+  // existing "discontinued items last" ordering as the tie-break within
+  // a category.
+  const sortItems=list=>[...list].sort((a,b)=>(a.cat||'Other').localeCompare(b.cat||'Other')||((a.active===false?1:0)-(b.active===false?1:0)));
   const[items,setItems]=useState(()=>sortItems(state.items.filter(it=>(it.damaged||0)>0)));
   const[repairQty,setRepairQty]=useState({});
   const[fixQty,setFixQty]=useState({});
@@ -6306,6 +6570,16 @@ function DamagedInventory(){
   const totalDamaged=items.reduce((s,it)=>s+(it.damaged||0),0);
   const totalValue=items.reduce((s,it)=>s+(it.damaged||0)*(it.purch||0),0);
   const discontinuedCount=items.filter(it=>it.active===false).length;
+  // Per-category subtotal for the groupHeader banner below (request #136).
+  const catTotals=useMemo(()=>{
+    const map={};
+    for(const it of items){
+      const cat=it.cat||'Other';
+      const b=map[cat]||(map[cat]={pcs:0,value:0});
+      b.pcs+=(it.damaged||0); b.value+=(it.damaged||0)*(it.purch||0);
+    }
+    return map;
+  },[items]);
   const mobile=useIsMobile();
   const columns=[
     {key:'item',label:'Item',render:it=>{
@@ -6361,6 +6635,18 @@ function DamagedInventory(){
     <div style={{background:mobile?'transparent':C.surf,borderRadius:8,border:mobile?'none':`1px solid ${C.bdr}`,overflow:'hidden'}}>
       <CardTable mobile={mobile} columns={columns} rows={items} keyFn={it=>it.id} emptyLabel="No damaged stock ✓"
         renderSubRow={renderSubRow}
+        groupHeader={(it,prev)=>{
+          const cat=it.cat||'Other';
+          const prevCat=prev?(prev.cat||'Other'):null;
+          if(cat===prevCat)return null;
+          const b=catTotals[cat]||{pcs:0,value:0};
+          return <div style={{padding:'10px 12px',background:C.blueSoft,fontSize:13,fontWeight:800,color:C.blue,
+            borderTop:prev?`2px solid ${C.blue}`:'none',borderRadius:mobile?7:0,marginTop:mobile&&prev?10:0,
+            display:'flex',justifyContent:'space-between',alignItems:'baseline'}}>
+            <span>{cat}</span>
+            <span style={{fontSize:12,fontWeight:700,color:C.sub}}>{b.pcs} pcs · {fmt(b.value)}</span>
+          </div>;
+        }}
         rowStyle={it=>!hasReturnHistory.has(it.id)?{background:C.amberSoft}:null}/>
     </div>
   </div>;
@@ -6467,7 +6753,7 @@ function StockAdjustmentLog(){
   ];
   return <div>
     <SectionHead title="Stock Adjustments" sub={`${rows.length} adjustment${rows.length===1?'':'s'} logged`}/>
-    <div style={{fontSize:12,color:C.sub,marginBottom:12}}>Every stock transfer between two items (via "Move" in Inventory) is logged here with the reason given, so a correction is always explainable later.</div>
+    <div style={{fontSize:12,color:C.sub,marginBottom:12}}>Every stock transfer between two items (via "Move" in Inventory), plus damaged/repaired/fresh bucket movements for a single item, is logged here with the reason given, so a correction is always explainable later.</div>
     <div style={{background:mobile?'transparent':C.surf,borderRadius:8,border:mobile?'none':`1px solid ${C.bdr}`,overflow:'hidden'}}>
       <CardTable mobile={mobile} columns={columns} rows={rows} keyFn={r=>r.id} emptyLabel="No stock adjustments yet"/>
     </div>
@@ -6991,15 +7277,34 @@ function ItemMasters(){
   // so navigating here again normally (nav menu, etc.) doesn't re-apply it.
   const[quickFilter,setQuickFilter]=useState(()=>{const f=pendingItemsFilter;pendingItemsFilter=null;return f;});
   const[items,setItems]=useState(state.items);
-  const[search,setSearch]=useState('');
-  const[catF,setCatF]=useState('');
-  const[statusF,setStatusF]=useState('active');
-  const[discInStockOnly,setDiscInStockOnly]=useState(false); // Discontinued view: only items with any fresh/damaged/repaired stock left to sell off
+  // search/catF/statusF/discInStockOnly/view below seed from, and write
+  // back into, itemMastersUIState (see its declaration above) rather than
+  // a plain literal default — so a liveTick remount triggered by ANY save
+  // (including this screen's own) restores exactly where the user was
+  // instead of resetting to Item List/All categories (request #131), AND
+  // (request #130) a real browser refresh restores the same, since
+  // itemMastersUIState itself is sessionStorage-backed.
+  const[search,setSearchRaw]=useState(()=>itemMastersUIState.search);
+  const setSearch=v=>{itemMastersUIState.search=v;persistItemMastersUIState();setSearchRaw(v);};
+  const[catF,setCatFRaw]=useState(()=>itemMastersUIState.catF);
+  const setCatF=v=>{itemMastersUIState.catF=v;persistItemMastersUIState();setCatFRaw(v);};
+  const[statusF,setStatusFRaw]=useState(()=>itemMastersUIState.statusF);
+  const setStatusF=v=>{itemMastersUIState.statusF=v;persistItemMastersUIState();setStatusFRaw(v);};
+  const[discInStockOnly,setDiscInStockOnlyRaw]=useState(()=>itemMastersUIState.discInStockOnly); // Discontinued view: only items with any fresh/damaged/repaired stock left to sell off
+  const setDiscInStockOnly=v=>{itemMastersUIState.discInStockOnly=v;persistItemMastersUIState();setDiscInStockOnlyRaw(v);};
   const[page,setPage]=useState(0);
   const[modal,setModal]=useState(null);
   const[form,setForm]=useState({});
-  const[view,setView]=useState('list');
-  const[detailItem,setDetailItem]=useState(null);
+  const[view,setViewRaw]=useState(()=>itemMastersUIState.view);
+  const setView=v=>{itemMastersUIState.view=v;persistItemMastersUIState();setViewRaw(v);};
+  // Seeded from pendingDetailItemId (see its declaration above) rather than
+  // a plain null default, and always looked up fresh from state.items (not
+  // carried as a stale object snapshot) — so a liveTick remount triggered
+  // by an action taken INSIDE this very modal (move to damaged/repair/
+  // correct) restores it open with the just-updated numbers instead of
+  // silently closing it with no visible confirmation (request #132).
+  const[detailItem,setDetailItemRaw]=useState(()=>pendingDetailItemId?(state.items.find(i=>i.id===pendingDetailItemId)||null):null);
+  const setDetailItem=v=>{pendingDetailItemId=v?v.id:null;setDetailItemRaw(v?(state.items.find(i=>i.id===v.id)||v):null);};
   const[mergeSrc,setMergeSrc]=useState(null);
   const[moveSrc,setMoveSrc]=useState(null);
   const[reconcileSrc,setReconcileSrc]=useState(null); // null=closed, true=blank picker, or an item object
@@ -9376,7 +9681,7 @@ function BalanceSheetReport(){
 }
 
 function ReportsModule(){
-  const[tab,setTab]=useState('expenses');
+  const[tab,setTab]=usePersistedTab('reports.tab','expenses'); // request #130: survive a refresh
   return <div>
     <div style={{display:'flex',gap:8,marginBottom:16}}>
       <Chip v="Expenses" active={tab==='expenses'} onClick={()=>setTab('expenses')}/>
@@ -9597,6 +9902,9 @@ function BusinessIntelligence(){
 // and a negative load is a real float-benefit result, not an error).
 function ProfitAnalysisModule(){
   const mobile=useIsMobile();
+  const[ledgerParty,setLedgerParty]=useState(null);
+  const[tab,setTab]=usePersistedTab('profit.tab','customer'); // 'customer' | 'sale' — request #144: these were one long page, split into tabs; persisted per request #130
+  const[custSort,setCustSort]=usePersistedTab('profit.custSort','netMarginPct'); // 'netMarginPct' | 'netProfit' — request #143
   // Whole-business gross/net/true profit breakdown for a chosen date range
   // (request #26) — defaults to the current calendar month. Recomputed from
   // getProfitBreakdownInRange in store.js, which layers landed-cost gross
@@ -9615,6 +9923,14 @@ function ProfitAnalysisModule(){
     revenue:s.revenue+r.revenue, grossProfit:s.grossProfit+r.grossProfit,
     interestLoad:s.interestLoad+r.interestLoad, netProfit:s.netProfit+r.netProfit,
   }),{revenue:0,grossProfit:0,interestLoad:0,netProfit:0}),[sales]);
+  // Request #128: sales still awaiting payment — their interest load is a
+  // running figure (blended with "today"), not a final number, so surface
+  // them separately with a running total rather than burying them in the
+  // same list as fully-settled sales.
+  const unsettledSales=useMemo(()=>sales.filter(s=>!s.settled),[sales]);
+  const unsettledInterest=useMemo(()=>unsettledSales.reduce((s,r)=>s+r.interestLoad,0),[unsettledSales]);
+  const unsettledRevenue=useMemo(()=>unsettledSales.reduce((s,r)=>s+r.revenue,0),[unsettledSales]);
+  const unsettledInterestPct=unsettledRevenue>0?Math.round(unsettledInterest/unsettledRevenue*1000)/10:0;
   const bestCustomers=useMemo(()=>customers.filter(c=>c.orderCount>0).slice(0,8)
     .map(c=>({label:c.partyName,value:c.netMarginPct})),[customers]);
   const worstCustomers=useMemo(()=>[...customers].filter(c=>c.orderCount>0).reverse().slice(0,8)
@@ -9622,26 +9938,39 @@ function ProfitAnalysisModule(){
 
   const saleCols=[
     {key:'date',label:'Date',render:r=>fmtD(r.date)},
-    {key:'partyName',label:'Party'},
+    {key:'partyName',label:'Party',render:r=>{
+      const p=state.parties.find(x=>x.id===r.partyId);
+      return p?<span style={{color:C.blue,cursor:'pointer',textDecoration:'underline'}} onClick={e=>{e.stopPropagation();setLedgerParty(p);}}>{r.partyName}</span>:r.partyName;
+    }},
     {key:'qty',label:'Qty',align:'right',render:r=>r.qty+' pcs',hideOnMobile:true},
     {key:'revenue',label:'Revenue',align:'right',render:r=>fmt(r.revenue)},
-    {key:'grossProfit',label:'Gross Profit',align:'right',render:r=><span style={{color:r.grossProfit>=0?C.green:C.red}}>{fmt(r.grossProfit)}</span>,hideOnMobile:true},
-    {key:'grossMarginPct',label:'Gross %',align:'right',render:r=><Badge v={r.grossMarginPct+'%'} color={r.grossMarginPct>25?'green':r.grossMarginPct>10?'amber':'red'}/>,hideOnMobile:true},
-    {key:'interestLoad',label:'Interest Load',align:'right',render:r=><span style={{color:r.interestLoad>0?C.red:r.interestLoad<0?C.green:C.sub}}>{r.interestLoad===0?'—':fmt(r.interestLoad)}</span>},
-    {key:'netProfit',label:'Net Profit',align:'right',render:r=><b style={{color:r.netProfit>=0?C.green:C.red}}>{fmt(r.netProfit)}</b>},
-    {key:'netMarginPct',label:'Net %',align:'right',render:r=><Badge v={r.netMarginPct+'%'} color={r.netMarginPct>25?'green':r.netMarginPct>10?'amber':'red'}/>},
+    {key:'grossProfit',label:'Gross Profit',align:'right',render:r=>r.costUnknown?<span style={{color:C.muted,fontStyle:'italic'}}>unknown</span>:<span style={{color:r.grossProfit>=0?C.green:C.red}}>{fmt(r.grossProfit)}</span>,hideOnMobile:true},
+    {key:'grossMarginPct',label:'Gross %',align:'right',render:r=>r.costUnknown?'—':<Badge v={r.grossMarginPct+'%'} color={r.grossMarginPct>25?'green':r.grossMarginPct>10?'amber':'red'}/>,hideOnMobile:true},
+    {key:'interestLoad',label:'Interest Load',align:'right',render:r=>r.costUnknown?<span style={{color:C.muted,fontStyle:'italic'}}>unknown</span>:<span style={{color:r.interestLoad>0?C.red:r.interestLoad<0?C.green:C.sub}}>{r.interestLoad===0?'—':fmt(r.interestLoad)}{!r.settled&&<span style={{fontSize:9}}> (so far)</span>}</span>},
+    {key:'netProfit',label:'Net Profit',align:'right',render:r=>r.costUnknown?<span style={{color:C.muted,fontStyle:'italic'}}>unknown</span>:<b style={{color:r.netProfit>=0?C.green:C.red}}>{fmt(r.netProfit)}</b>},
+    {key:'netMarginPct',label:'Net %',align:'right',render:r=>r.costUnknown?'—':<Badge v={r.netMarginPct+'%'} color={r.netMarginPct>25?'green':r.netMarginPct>10?'amber':'red'}/>},
   ];
 
+  // Request #143: toggle sort between net margin % and net margin ₹ amount.
+  const sortedCustomers=useMemo(()=>[...customers].sort((a,b)=>
+    custSort==='netProfit'?b.netProfit-a.netProfit:b.netMarginPct-a.netMarginPct),[customers,custSort]);
+
   const custCols=[
-    {key:'partyName',label:'Customer'},
+    {key:'partyName',label:'Customer',render:c=>{
+      const p=state.parties.find(x=>x.id===c.partyId);
+      return p?<span style={{color:C.blue,cursor:'pointer',textDecoration:'underline'}} onClick={e=>{e.stopPropagation();setLedgerParty(p);}}>{c.partyName}</span>:c.partyName;
+    }},
     {key:'orderCount',label:'Sales',align:'right',render:c=>c.orderCount},
     {key:'revenue',label:'Revenue',align:'right',render:c=>fmt(c.revenue),hideOnMobile:true},
+    {key:'grossProfit',label:'Margin Earned',align:'right',render:c=><span style={{color:c.grossProfit>=0?C.green:C.red}}>{fmt(c.grossProfit)}</span>,hideOnMobile:true},
     {key:'grossMarginPct',label:'Gross %',align:'right',render:c=>c.grossMarginPct+'%',hideOnMobile:true},
     {key:'interestLoad',label:'Interest Load',align:'right',render:c=><span style={{color:c.interestLoad>0?C.red:c.interestLoad<0?C.green:C.sub}}>{c.interestLoad===0?'—':fmt(c.interestLoad)}</span>},
-    {key:'netMarginPct',label:'Net Margin',align:'right',render:c=><Badge v={c.netMarginPct+'%'} color={c.netMarginPct>25?'green':c.netMarginPct>10?'amber':'red'}/>},
+    {key:'netProfit',label:'True Margin',align:'right',render:c=><b style={{color:c.netProfit>=0?C.green:C.red}}>{fmt(c.netProfit)}</b>},
+    {key:'netMarginPct',label:'Net Margin %',align:'right',render:c=><Badge v={c.netMarginPct+'%'} color={c.netMarginPct>25?'green':c.netMarginPct>10?'amber':'red'}/>},
   ];
 
   return <div>
+    {ledgerParty&&<PartyLedger party={ledgerParty} onClose={()=>setLedgerParty(null)}/>}
     <SectionHead title="Profit Analysis" sub="Per-sale FIFO profit, adjusted for the financing cost of payment timing"/>
 
     <div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,padding:'16px 18px',marginBottom:16}}>
@@ -9712,19 +10041,56 @@ function ProfitAnalysisModule(){
       </div>
     </div>
 
-    <div style={{fontSize:16,fontWeight:800,color:C.txt,marginBottom:10}}>Profit per Customer</div>
-    <div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,overflow:'hidden',marginBottom:24}}>
-      <CardTable columns={custCols} rows={customers} mobile={mobile} keyFn={c=>c.partyId} emptyLabel="No sales yet"/>
+    {unsettledSales.length>0&&<div style={{background:'#FFFBEB',borderRadius:8,border:`1px solid ${C.amber||'#F59E0B'}40`,padding:'14px 18px',marginBottom:20}}>
+      <div style={{fontSize:13,fontWeight:800,color:C.txt,marginBottom:6}}>Unsettled Sales — Running Interest Loss</div>
+      <div style={{fontSize:11,color:C.sub,marginBottom:10}}>
+        {unsettledSales.length} sale{unsettledSales.length>1?'s':''} (₹{fmtL(unsettledRevenue)} revenue) still awaiting full payment. Interest loss below is a live running total — it grows every day these stay unpaid, valued as if settled today.
+      </div>
+      <div style={{display:'flex',gap:18,flexWrap:'wrap',marginBottom:10}}>
+        <div><div style={{fontSize:9,color:C.sub,textTransform:'uppercase',letterSpacing:.4}}>Interest Lost So Far</div><div style={{fontSize:18,fontWeight:800,color:C.red}}>{fmtL(unsettledInterest)}</div></div>
+        <div><div style={{fontSize:9,color:C.sub,textTransform:'uppercase',letterSpacing:.4}}>Interest Cost %</div><div style={{fontSize:18,fontWeight:800,color:C.red}}>{unsettledInterestPct}%</div><div style={{fontSize:10,color:C.sub}}>of unsettled revenue</div></div>
+      </div>
+      <CardTable mobile={mobile} rows={unsettledSales} keyFn={r=>r.saleId} emptyLabel=""
+        onRowClick={r=>{const p=state.parties.find(x=>x.id===r.partyId);if(p)setLedgerParty(p);}}
+        columns={[
+          {key:'date',label:'Date',render:r=>fmtD(r.date)},
+          {key:'partyName',label:'Party'},
+          {key:'revenue',label:'Revenue',align:'right',render:r=>fmt(r.revenue)},
+          {key:'unsettledAmt',label:'Still Unpaid',align:'right',render:r=><span style={{color:C.amber||'#B45309'}}>{fmt(r.unsettledAmt)}</span>},
+          {key:'daysToPayment',label:'Days Outstanding',align:'right',render:r=>r.daysToPayment+'d'},
+          {key:'interestLoad',label:'Interest Lost (so far)',align:'right',render:r=><span style={{color:C.red,fontWeight:700}}>{fmt(r.interestLoad)}</span>},
+        ]}/>
+    </div>}
+
+    <div style={{display:'flex',gap:4,borderBottom:`1.5px solid ${C.bdr}`,marginBottom:16}}>
+      <button onClick={()=>setTab('customer')} style={{padding:'10px 18px',border:'none',background:'transparent',cursor:'pointer',fontFamily:'inherit',fontSize:14,fontWeight:tab==='customer'?700:400,color:tab==='customer'?C.blue:C.sub,borderBottom:tab==='customer'?`2px solid ${C.blue}`:'2px solid transparent',marginBottom:-1}}>Profit per Customer</button>
+      <button onClick={()=>setTab('sale')} style={{padding:'10px 18px',border:'none',background:'transparent',cursor:'pointer',fontFamily:'inherit',fontSize:14,fontWeight:tab==='sale'?700:400,color:tab==='sale'?C.blue:C.sub,borderBottom:tab==='sale'?`2px solid ${C.blue}`:'2px solid transparent',marginBottom:-1}}>Profit per Sale</button>
     </div>
 
-    <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:10,flexWrap:'wrap',gap:8}}>
-      <div style={{fontSize:16,fontWeight:800,color:C.txt}}>Profit per Sale</div>
-      <div style={{width:200}}><Inp placeholder="Search customer…" value={search} onChange={setSearch}/></div>
-    </div>
-    <div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,overflow:'hidden'}}>
-      <CardTable columns={saleCols} rows={filtered.slice(0,200)} mobile={mobile} keyFn={r=>r.saleId} emptyLabel="No sales yet"/>
-    </div>
-    {filtered.length>200&&<div style={{fontSize:11,color:C.sub,marginTop:8,textAlign:'center'}}>Showing most recent 200 of {filtered.length} sales — narrow with search to see older ones.</div>}
+    {tab==='customer'&&<>
+      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:10,flexWrap:'wrap',gap:8}}>
+        <div style={{fontSize:16,fontWeight:800,color:C.txt}}>Profit per Customer</div>
+        <div style={{display:'flex',gap:6,alignItems:'center'}}>
+          <span style={{fontSize:11,color:C.sub}}>Sort by</span>
+          <Btn onClick={()=>setCustSort('netMarginPct')} variant={custSort==='netMarginPct'?'primary':'secondary'} size="sm">Net %</Btn>
+          <Btn onClick={()=>setCustSort('netProfit')} variant={custSort==='netProfit'?'primary':'secondary'} size="sm">Net ₹</Btn>
+        </div>
+      </div>
+      <div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,overflow:'hidden',marginBottom:24}}>
+        <CardTable columns={custCols} rows={sortedCustomers} mobile={mobile} keyFn={c=>c.partyId} emptyLabel="No sales yet"/>
+      </div>
+    </>}
+
+    {tab==='sale'&&<>
+      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:10,flexWrap:'wrap',gap:8}}>
+        <div style={{fontSize:16,fontWeight:800,color:C.txt}}>Profit per Sale</div>
+        <div style={{width:200}}><Inp placeholder="Search customer…" value={search} onChange={setSearch}/></div>
+      </div>
+      <div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,overflow:'hidden'}}>
+        <CardTable columns={saleCols} rows={filtered.slice(0,200)} mobile={mobile} keyFn={r=>r.saleId} emptyLabel="No sales yet"/>
+      </div>
+      {filtered.length>200&&<div style={{fontSize:11,color:C.sub,marginTop:8,textAlign:'center'}}>Showing most recent 200 of {filtered.length} sales — narrow with search to see older ones.</div>}
+    </>}
   </div>;
 }
 
