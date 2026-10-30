@@ -1355,7 +1355,12 @@ export function getBalanceSheet() {
   // (getPartyNetBal only for type==='both', plain getCustomerBal/
   // getSupplierBal otherwise) -- mirrored here now so all three agree.
   const receivables = state.parties.filter(p => p.type === 'customer' || p.type === 'both').reduce((s, p) => { const net = p.type === 'both' ? getPartyNetBal(p.id) : getCustomerBal(p.id); return s + (net > 0 ? net : 0); }, 0);
-  const payables = state.parties.filter(p => p.type === 'supplier' || p.type === 'transporter' || p.type === 'both').reduce((s, p) => { const net = p.type === 'both' ? getPartyNetBal(p.id) : getSupplierBal(p.id); return s + (net < 0 ? -net : 0); }, 0);
+  // NOTE: getPartyNetBal is a *net* value (positive = they owe us, negative =
+  // we owe them), so "-net" is the payable amount for 'both' parties. But
+  // getSupplierBal is already a *direct* amount (positive = we owe them) --
+  // NOT net-signed the same way. Applying "-net" to it (as a first attempt
+  // did) silently zeroed out every normal supplier with a positive balance.
+  const payables = state.parties.filter(p => p.type === 'supplier' || p.type === 'transporter' || p.type === 'both').reduce((s, p) => { const amt = p.type === 'both' ? -getPartyNetBal(p.id) : getSupplierBal(p.id); return s + (amt > 0 ? amt : 0); }, 0);
   const assets = cash + inventoryValue + receivables;
   const equity = assets - payables;
   return { cash, inventoryValue, receivables, assets, payables, equity };
