@@ -6225,14 +6225,22 @@ function QuickSellModal({item,source,onClose,onSold}){
   </Modal>;
 }
 
+// Discontinued items keep their damaged stock on the books (going inactive
+// doesn't clear it), and the only path to actually clear it out — repair,
+// correct back to stock, or sell off — lives on this one screen. Sorting
+// active items first and discontinued items into their own block below (vs.
+// just interleaving them in whatever order state.items happens to be in)
+// makes that damaged-but-discontinued stock something you actually notice
+// here, instead of easy to scroll past unlabeled.
 function DamagedInventory(){
-  const[items,setItems]=useState(()=>state.items.filter(it=>(it.damaged||0)>0));
+  const sortItems=list=>[...list].sort((a,b)=>(a.active===false?1:0)-(b.active===false?1:0));
+  const[items,setItems]=useState(()=>sortItems(state.items.filter(it=>(it.damaged||0)>0)));
   const[repairQty,setRepairQty]=useState({});
   const[fixQty,setFixQty]=useState({});
   const[priceVal,setPriceVal]=useState({});
   const[sellItem,setSellItem]=useState(null);
   const{toast,TC}=useToast();
-  const refresh=()=>setItems(state.items.filter(it=>(it.damaged||0)>0));
+  const refresh=()=>setItems(sortItems(state.items.filter(it=>(it.damaged||0)>0)));
   const doSetPrice=it=>{
     const v=priceVal[it.id];
     if(v===undefined||v==='')return;
@@ -6286,12 +6294,14 @@ function DamagedInventory(){
   };
   const totalDamaged=items.reduce((s,it)=>s+(it.damaged||0),0);
   const totalValue=items.reduce((s,it)=>s+(it.damaged||0)*(it.purch||0),0);
+  const discontinuedCount=items.filter(it=>it.active===false).length;
   const mobile=useIsMobile();
   const columns=[
     {key:'item',label:'Item',render:it=>{
       const suspect=!hasReturnHistory.has(it.id);
       return <div>
         <span style={{fontWeight:600,color:C.txt}}>{it.internal||it.name}</span>
+        {it.active===false&&<span style={{marginLeft:6,fontSize:10,fontWeight:700,color:C.muted,border:`1px solid ${C.bdr}`,borderRadius:4,padding:'1px 5px'}}>DISCONTINUED</span>}
         {suspect&&<div title="No sales-return on record for this item — likely a purchase that landed here before that bug was fixed, not real damage" style={{fontSize:10,color:C.amberBright,fontWeight:700,marginTop:2}}>⚠ No return on record</div>}
       </div>;
     }},
@@ -6336,7 +6346,7 @@ function DamagedInventory(){
   return <div>
     <TC/>
     {sellItem&&<QuickSellModal item={sellItem} source="damaged" onClose={()=>setSellItem(null)} onSold={refresh}/>}
-    <SectionHead title="Damaged Inventory" sub={`${items.length} items · ${totalDamaged} pcs · ${fmt(totalValue)} value`}/>
+    <SectionHead title="Damaged Inventory" sub={`${items.length} items${discontinuedCount?` (${discontinuedCount} discontinued)`:''} · ${totalDamaged} pcs · ${fmt(totalValue)} value`}/>
     <div style={{background:mobile?'transparent':C.surf,borderRadius:8,border:mobile?'none':`1px solid ${C.bdr}`,overflow:'hidden'}}>
       <CardTable mobile={mobile} columns={columns} rows={items} keyFn={it=>it.id} emptyLabel="No damaged stock ✓"
         renderSubRow={renderSubRow}
