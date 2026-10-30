@@ -687,6 +687,17 @@ function Inp({id,label,value,onChange,placeholder,type='text',required,hint,auto
   </div>;
 }
 
+// Read-only stand-in for Inp — used by the item Edit form's stock/damaged/
+// repaired fields once an item exists, so a quick "fix the number" edit here
+// can't silently desync item.stock from its ledger (see call site comment).
+function StockFieldLocked({label,value,hint}){
+  return <div style={{display:'flex',flexDirection:'column',gap:3}}>
+    {label&&<label style={{fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5}}>{label}</label>}
+    <div style={{padding:'8px 12px',borderRadius:7,border:`1.5px solid ${C.bdr}`,fontSize:13,color:C.muted,background:C.bg||'#F6F8FA'}}>{value}</div>
+    {hint&&<span style={{fontSize:11,color:C.muted}}>{hint}</span>}
+  </div>;
+}
+
 function Sel({label,value,onChange,options,placeholder,required}){
   return <div style={{display:'flex',flexDirection:'column',gap:3}}>
     {label&&<label style={{fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.5}}>
@@ -7177,9 +7188,23 @@ function ItemMasters(){
         <Inp label="Peti Size (pcs)" value={form.peti||1} onChange={v=>setForm(f=>({...f,peti:Number(v)}))} type="number"/>
         <Inp label="Sale Rate ₹/pc" value={form.sale||0} onChange={v=>setForm(f=>({...f,sale:Number(v)}))} type="number"/>
         <Inp label="Purchase Rate ₹/pc" value={form.purch||0} onChange={v=>setForm(f=>({...f,purch:Number(v)}))} type="number"/>
-        <Inp label="Stock on Hand (pcs)" value={form.stock||0} onChange={v=>setForm(f=>({...f,stock:Number(v)}))} type="number" hint="Current qty available"/>
-        <Inp label="Damaged Stock (pcs)" value={form.damaged||0} onChange={v=>setForm(f=>({...f,damaged:Number(v)}))} type="number" hint="Unsellable / spoiled qty"/>
-        <Inp label="Repaired Stock (pcs)" value={form.repaired||0} onChange={v=>setForm(f=>({...f,repaired:Number(v)}))} type="number" hint="Fixed from damaged, tracked separately"/>
+        {modal==='add'
+          ? <Inp label="Stock on Hand (pcs)" value={form.stock||0} onChange={v=>setForm(f=>({...f,stock:Number(v)}))} type="number" hint="Current qty available"/>
+          // Editing an EXISTING item: stock must only move through a dated,
+          // ledger-visible event (sale/purchase/transfer/reconciliation) —
+          // typing a new number straight into this form silently overwrites
+          // item.stock with no row to explain the change, which is exactly
+          // what produced the "implied opening stock"/negative-balance bugs
+          // this whole reconciliation effort just fixed. Locked read-only
+          // post-creation; "Reconcile Stock" is the one legitimate, logged
+          // path for correcting it.
+          : <StockFieldLocked label="Stock on Hand (pcs)" value={form.stock||0} hint="Use “Reconcile Stock” (Inventory toolbar) to correct this — keeps the ledger honest"/>}
+        {modal==='add'
+          ? <Inp label="Damaged Stock (pcs)" value={form.damaged||0} onChange={v=>setForm(f=>({...f,damaged:Number(v)}))} type="number" hint="Unsellable / spoiled qty"/>
+          : <StockFieldLocked label="Damaged Stock (pcs)" value={form.damaged||0} hint="Use the Damaged Inventory tab (Repair / Correct / Sell) to change this"/>}
+        {modal==='add'
+          ? <Inp label="Repaired Stock (pcs)" value={form.repaired||0} onChange={v=>setForm(f=>({...f,repaired:Number(v)}))} type="number" hint="Fixed from damaged, tracked separately"/>
+          : <StockFieldLocked label="Repaired Stock (pcs)" value={form.repaired||0} hint="Use the Repaired Inventory tab to change this"/>}
         <Inp label="Dimensions" value={form.dimensions||''} onChange={v=>setForm(f=>({...f,dimensions:v}))} placeholder="e.g. 30x30x12 cm"/>
       </Grid2>
       <label style={{display:'flex',alignItems:'center',gap:8,marginTop:16,fontSize:13,color:C.txt,cursor:'pointer',fontWeight:600}}>
