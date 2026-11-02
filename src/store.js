@@ -133,13 +133,43 @@ export function getCustomerBal(partyId) {
 // For a party.type==='both' (a party we both buy from and sell to), the business
 // wants ONE ledger with ONE combined balance, not a receivable and a payable
 // tracked side by side — this is that single net figure. Positive = party owes
-// us (net receivable); negative = we owe the party (net payable). For a plain
-// customer, getSupplierBal is 0 (no purchases/freight/payments tied to that
-// partyId), so this collapses to getCustomerBal unchanged — and symmetrically
-// for a plain supplier/transporter — so it's safe to use as a drop-in anywhere
-// a single "how much is outstanding with this party" figure is needed.
+// us (net receivable); negative = we owe the party (net payable).
+//
+// BUG FIXED (request #146): this used to be `getCustomerBal(id) -
+// getSupplierBal(id)`. Both of those add the SAME party.ob scalar, so it
+// cancelled out of the subtraction — which looked "safe" in isolation, but a
+// 'both' party's customer-side and supplier-side pre-ERP history
+// (PARTY_HISTORY/SUPPLIER_HISTORY) are two separate transaction arrays, not
+// one shared scalar. Cancelling `ob` silently dropped BOTH of those arrays
+// from the result entirely, so this function (and every screen reading it —
+// Party Masters list "Net ₹" column, Dashboard Receivables/Payables tiles)
+// showed a balance built from in-app transactions only, while
+// MergedPartyLedger (the ledger modal itself) correctly walked the full
+// in-app + historical timeline — the two numbers visibly disagreed (e.g.
+// Gopi Cooker: ledger modal settled at ₹0, party list still showed -₹11,200).
+// Fixed by mirroring MergedPartyLedger's own walk exactly: sum each side's
+// in-app AND historical rows separately, then net the two sides. For a plain
+// customer/supplier/transporter (no 'both' type), this still just returns
+// getCustomerBal - getSupplierBal, same as before (cheap, and correct since
+// those parties only ever have one side populated).
 export function getPartyNetBal(partyId) {
-  return getCustomerBal(partyId) - getSupplierBal(partyId);
+  const party = state.parties.find(p => p.id === partyId);
+  if (!party || party.type !== 'both') return getCustomerBal(partyId) - getSupplierBal(partyId);
+  const custSales = state.sales.filter(s => s.partyId === partyId).reduce((s, t) => s + t.total, 0);
+  const custPaid = state.payments.filter(p => p.partyId === partyId).reduce((s, p) => s + p.amount, 0);
+  const suppPurch = state.purchases.filter(p => p.partyId === partyId).reduce((s, p) => s + p.total + (p.extraChargesTotal || 0), 0);
+  const suppPaid = state.supplierPayments.filter(p => p.partyId === partyId).reduce((s, p) => s + p.amount, 0);
+  const histCustRaw = PARTY_HISTORY[party.name]?.s || [];
+  const histCustPmtsRaw = PARTY_HISTORY[party.name]?.p || [];
+  const histSuppRaw = SUPPLIER_HISTORY[party.name]?.s || [];
+  const histSuppPmtsRaw = SUPPLIER_HISTORY[party.name]?.p || [];
+  const histCustSales = histCustRaw.flatMap(s => splitPosNegItems(s[1], s[2])).reduce((s, seg) => s + seg.total, 0);
+  const histCustPaid = histCustPmtsRaw.reduce((s, p) => s + p[1], 0);
+  const histSuppPurch = histSuppRaw.reduce((s, p) => s + p[1], 0);
+  const histSuppPaid = histSuppPmtsRaw.reduce((s, p) => s + p[1], 0);
+  const custNet = (custSales + histCustSales) - (custPaid + histCustPaid);
+  const suppNet = (suppPurch + histSuppPurch) - (suppPaid + histSuppPaid);
+  return custNet - suppNet;
 }
 
 // FIFO bill queue for a customer: historical PARTY_INVOICES rows + new ERP sales,
@@ -590,7 +620,15 @@ export function getSaleProfitAnalysis() {
     });
   }
 
-  for (const p of state.purchases) for (const l of (p.items || [])) add(l.itemId, p.date, p.createdAt, 'purch', l.qty || 0, l.rate || 0, { purchaseId: p.id });
+  // Only a RECEIVED purchase has actually added stock — a still-Pending
+  // purchase is booked (a real liability, tracked separately by
+  // getSupplierBal/getPartyNetBal) but hasn't physically arrived, so it must
+  // not be treated as an "already happened" FIFO layer here. Without this
+  // gate a pending purchase's full qty gets costed into the layer stack as
+  // if it were on the shelf, which both skews margin for sales that
+  // shouldn't see that cost yet and (via the shared eventsById/plug
+  // mechanism) corrupts the Item Ledger's running-balance walk the same way.
+  for (const p of state.purchases) { if (!p.receivedDate) continue; for (const l of (p.items || [])) add(l.itemId, p.date, p.createdAt, 'purch', l.qty || 0, l.rate || 0, { purchaseId: p.id }); }
   for (const s of state.sales) for (const x of (s.items || [])) add(x.itemId, s.date, s.createdAt, 'sale', -(x.qty || 0), x.rate, { saleId: s.id });
   for (const r of state.repairExpenses) add(r.itemId, r.date, r.createdAt, 'repair', -(r.qty || 0), null, {});
 
@@ -606,29 +644,65 @@ export function getSaleProfitAnalysis() {
     const events = (eventsById[it.id] || []).slice().sort((a, b) => a.date.localeCompare(b.date) || a.seq.localeCompare(b.seq));
     const netFromEvents = events.reduce((s, e) => s + e.netQty, 0);
     const plug = (it.stock || 0) - netFromEvents;
+    // request #146 (Shankar Metals margin): `plug` is stock that existed
+    // before the earliest tracked purchase event for this item — e.g. a
+    // pre-ERP sale dated earlier than any known purchase of that item. That
+    // used to always cost out at the item's CURRENT static `it.purch` rate
+    // with no date attached (purchaseId:null), which (a) can be badly wrong
+    // if the rate has moved since, and (b) always shows ₹0 interest load for
+    // that sale since there's no date to measure a capital gap from — even
+    // though the item itself resolved fine and its margin should be
+    // calculable. Per the user's explicit ask ("take up the rate of the
+    // items from purchase around that date"), fall back to the CLOSEST
+    // dated purchase on record for this exact item (in-app or pre-ERP
+    // historical, whichever `purchEvents` already contains — see the
+    // eventsById construction above) instead of the flat current rate. This
+    // also makes the segment traceable (carries that purchase's real id), so
+    // the interest calc picks up a real date too, not just the cost. Only
+    // falls through to the old flat it.purch/no-date behavior when the item
+    // has NO purchase record at all, anywhere, ever (nothing to be "near").
+    const purchEvents = events.filter(e => e.type === 'purch').map(e => ({ date: e.date, rate: e.rate, purchaseId: e.meta.purchaseId }));
+    const nearestPurch = dateStr => {
+      if (!purchEvents.length) return null;
+      const t = msOf(dateStr);
+      let best = purchEvents[0], bestDiff = Math.abs(msOf(best.date) - t);
+      for (const pe of purchEvents) {
+        const diff = Math.abs(msOf(pe.date) - t);
+        if (diff < bestDiff) { best = pe; bestDiff = diff; }
+      }
+      return best;
+    };
     const layers = [];
-    if (plug > 1e-9) layers.push({ qty: plug, rate: it.purch || 0, purchaseId: null });
-    const withdrawDetailed = qty => {
+    if (plug > 1e-9) layers.push({ qty: plug, rate: it.purch || 0, purchaseId: null, isPlug: true });
+    const withdrawDetailed = (qty, date) => {
       let need = qty; const segs = [];
       while (need > 1e-9 && layers.length) {
         const l = layers[0]; const take = Math.min(l.qty, need);
-        segs.push({ qty: take, rate: l.rate, purchaseId: l.purchaseId });
+        if (l.isPlug) {
+          const np = nearestPurch(date);
+          segs.push({ qty: take, rate: np ? np.rate : l.rate, purchaseId: np ? np.purchaseId : null });
+        } else {
+          segs.push({ qty: take, rate: l.rate, purchaseId: l.purchaseId });
+        }
         l.qty -= take; need -= take;
         if (l.qty <= 1e-9) layers.shift();
       }
-      if (need > 1e-9) segs.push({ qty: need, rate: it.purch || 0, purchaseId: null });
+      if (need > 1e-9) {
+        const np = nearestPurch(date);
+        segs.push({ qty: need, rate: np ? np.rate : (it.purch || 0), purchaseId: np ? np.purchaseId : null });
+      }
       return segs;
     };
     for (const e of events) {
       if (e.type === 'purch') {
         if (e.netQty > 1e-9) layers.push({ qty: e.netQty, rate: e.rate, purchaseId: e.meta.purchaseId });
-        else if (e.netQty < -1e-9) withdrawDetailed(-e.netQty);
+        else if (e.netQty < -1e-9) withdrawDetailed(-e.netQty, e.date);
       } else if (e.type === 'repair') {
-        if (e.netQty < -1e-9) withdrawDetailed(-e.netQty);
+        if (e.netQty < -1e-9) withdrawDetailed(-e.netQty, e.date);
       } else if (e.type === 'sale') {
         if (e.netQty < -1e-9) {
           const qty = -e.netQty;
-          const segs = withdrawDetailed(qty);
+          const segs = withdrawDetailed(qty, e.date);
           const cost = segs.reduce((s, g) => s + g.qty * g.rate, 0);
           const rec = bySale.get(e.meta.saleId) || { qty: 0, revenue: 0, cost: 0, segs: [] };
           rec.qty += qty; rec.revenue += qty * (e.rate || 0); rec.cost += cost;
@@ -958,6 +1032,20 @@ export function getAllItemRows() {
     }
   }
   for (const p of state.purchases) {
+    // A purchase that hasn't been marked Received yet has NOT moved any
+    // stock — item.stock is only ever incremented by markPurchaseReceived's
+    // adjustStock() call, never at booking time (see getExpectedStockMap,
+    // which already treats unreceived qty as a separate "incoming" bucket,
+    // not as a completed stock-in event). This function used to push every
+    // purchase row unconditionally regardless of receivedDate, which made a
+    // still-Pending purchase look like a completed delivery in the Item
+    // Ledger's movement log — corrupting the backward-anchored running
+    // balance walk in ItemDetail (a pending qty subtracted on the way back
+    // past a physical-count reconciliation produces an impossible negative
+    // historical balance, e.g. "-45" on a date that long predates the
+    // purchase even being placed). Gated to match reality: only a received
+    // purchase is a real movement row here.
+    if (!p.receivedDate) continue;
     for (const x of (p.items || [])) {
       // purchaseId mirrors saleId above — lets the Item Ledger drill into the
       // full PurchaseViewModal for this row, same pattern PartyLedger already uses.
@@ -1092,6 +1180,12 @@ export function getFifoStockMap() {
     (eventsById[id] ||= []).push({ date, seq: seq || '', netQty, rate });
   };
   for (const p of state.purchases) {
+    // Still-Pending (not yet received) purchases haven't actually added
+    // stock — item.stock only moves on markPurchaseReceived's adjustStock()
+    // call. Counting a pending purchase here would create a FIFO layer for
+    // stock that isn't on the shelf yet, same bug class fixed in
+    // getAllItemRows/getSaleProfitAnalysis above.
+    if (!p.receivedDate) continue;
     for (const l of (p.items || [])) {
       // l.qty is already signed: positive for a normal purchase line,
       // negative for a purchase-return line — l.rate is the real entered
@@ -1169,6 +1263,7 @@ export function getItemLandingCost(itemId) {
   const events = [];
   for (const p of state.purchases) for (const l of (p.items || [])) {
     if (l.itemId !== itemId) continue;
+    if (!p.receivedDate) continue; // still-Pending purchase — no stock on hand yet, see getFifoStockMap note
     events.push({ date: p.date, seq: p.createdAt || '', netQty: l.qty || 0, rate: l.rate || 0, purchaseId: p.id });
   }
   for (const s of state.sales) for (const x of (s.items || [])) {
@@ -1250,7 +1345,7 @@ export function getFifoSaleMarginMap() {
     if (!id) return;
     (eventsById[id] ||= []).push({ date, seq: seq || '', type, netQty, rate });
   };
-  for (const p of state.purchases) for (const l of (p.items || [])) add(l.itemId, p.date, p.createdAt, 'purch', l.qty || 0, l.rate || 0);
+  for (const p of state.purchases) { if (!p.receivedDate) continue; for (const l of (p.items || [])) add(l.itemId, p.date, p.createdAt, 'purch', l.qty || 0, l.rate || 0); }
   for (const s of state.sales) for (const x of (s.items || [])) add(x.itemId, s.date, s.createdAt, 'sale', -(x.qty || 0), x.rate);
   for (const r of state.repairExpenses) add(r.itemId, r.date, r.createdAt, 'repair', -(r.qty || 0), null);
 
@@ -1307,7 +1402,7 @@ export function getFifoProfitInRange(fromDate, toDate) {
     if (!id) return;
     (eventsById[id] ||= []).push({ date, seq: seq || '', type, netQty, rate });
   };
-  for (const p of state.purchases) for (const l of (p.items || [])) add(l.itemId, p.date, p.createdAt, 'purch', l.qty || 0, l.rate || 0);
+  for (const p of state.purchases) { if (!p.receivedDate) continue; for (const l of (p.items || [])) add(l.itemId, p.date, p.createdAt, 'purch', l.qty || 0, l.rate || 0); }
   for (const s of state.sales) for (const x of (s.items || [])) add(x.itemId, s.date, s.createdAt, 'sale', -(x.qty || 0), x.rate);
   for (const r of state.repairExpenses) add(r.itemId, r.date, r.createdAt, 'repair', -(r.qty || 0), null);
 
@@ -1383,6 +1478,7 @@ export function getFifoSaleCosts(itemId) {
   const events = [];
   for (const p of state.purchases) for (const l of (p.items || [])) {
     if (l.itemId !== itemId) continue;
+    if (!p.receivedDate) continue; // still-Pending purchase — not a real stock-in event yet
     events.push({ date: p.date, seq: p.createdAt || '', type: 'purch', netQty: l.qty || 0, rate: l.rate || 0 });
   }
   for (const s of state.sales) for (const x of (s.items || [])) {

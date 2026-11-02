@@ -3778,11 +3778,14 @@ function PartyProfile({party,onClose}){
 // into the same balance — this sidesteps the `ob`-scalar double-count
 // bug entirely (customer-side and supplier-side history come from two
 // separate, independently-sourced arrays, not one shared number), so the
-// result is a real combined balance built from every known transaction,
-// which may now differ from getPartyNetBal elsewhere in the app for a party
-// whose pre-ERP history sits on only one side (that discrepancy is the
-// correct outcome, not a new bug — see getPartyNetBal's own ob-cancellation
-// note in store.js for why the dashboard-wide figure still excludes it).
+// result is a real combined balance built from every known transaction.
+//
+// request #146: getPartyNetBal (store.js) has since been fixed to run this
+// exact same historical+in-app walk for 'both'-type parties, so `currentNet`
+// below and getPartyNetBal(party.id) now always agree — the Party Masters
+// list "Net ₹" column and Dashboard Receivables/Payables tiles used to show
+// a different (in-app-only) number than this ledger modal for the same
+// party; they no longer do.
 function MergedPartyLedger({party,onClose}){
   const mobile=useIsMobile();
   const PAGE=20;
@@ -3855,7 +3858,7 @@ function MergedPartyLedger({party,onClose}){
     return withBal.slice().reverse();
   },[custSales,custPmts,suppPurch,suppPmts,histCustSales,histCustPmts,histSuppPurch,histSuppPmts]);
 
-  const currentNet=rows.length?rows[0].balance:0; // may now differ from getPartyNetBal — see comment above
+  const currentNet=rows.length?rows[0].balance:0; // now always agrees with getPartyNetBal(party.id) — see comment above
   const totalSold=[...custSales,...histCustSales].filter(e=>e.type==='sale').reduce((s,e)=>s+e.amount,0);
   const totalReturned=Math.abs([...custSales,...histCustSales].filter(e=>e.type==='return').reduce((s,e)=>s+e.amount,0))
     +Math.abs([...suppPurch,...histSuppPurch].filter(e=>e.type==='return').reduce((s,e)=>s+e.amount,0));
@@ -7145,7 +7148,7 @@ function ItemDetail({item,onClose}){
     <div style={{background:C.surf,borderRadius:7,border:`1px solid ${C.bdr}`,padding:'7px 11px',marginBottom:12}}>
       <input value={search} onChange={e=>{setSearch(e.target.value);setPage(0);}} placeholder="Search by party…" style={{width:'100%',border:'none',outline:'none',fontSize:13,color:C.txt,fontFamily:'inherit',background:'transparent'}}/>
     </div>
-    <div style={{border:mobile?'none':`1px solid ${C.bdr}`,borderRadius:8,overflow:'hidden'}}>
+    <div style={{border:mobile?'none':`1px solid ${C.bdr}`,borderRadius:8,overflowX:'auto',overflowY:'hidden'}}>
       <CardTable mobile={mobile} keyFn={(r,i)=>i} rows={pageRows} emptyLabel="No purchase/sale entries for this item"
         onRowClick={r=>{
           if(r.saleId){const found=state.sales.find(x=>x.id===r.saleId);if(found)setViewSale(found);}
