@@ -6333,7 +6333,7 @@ function CategoryAnalytics(){
   return <div>
     {catDetail&&<CategoryDetail cat={catDetail} onClose={()=>setCatDetail(null)}/>}
     <SectionHead title="Category Analytics" sub={`${totals.count} items (incl. discontinued) · ${fmt(totals.stockValue)} total stock value · click a category for item-level detail`}/>
-    <div style={{background:mobile?'transparent':C.surf,borderRadius:8,border:mobile?'none':`1px solid ${C.bdr}`,overflow:'hidden'}}>
+    <div style={{background:mobile?'transparent':C.surf,borderRadius:8,border:mobile?'none':`1px solid ${C.bdr}`,overflowX:mobile?'visible':'auto',overflowY:'hidden'}}>
       <CardTable mobile={mobile} columns={columns} rows={tableRows} keyFn={(r,i)=>r.cat+i}
         rowStyle={r=>r.cat==='__TOTAL__'?{background:'#F6F8FA',borderTop:`2px solid ${C.bdr}`}:null}
         onRowClick={r=>{if(r.cat!=='__TOTAL__')setCatDetail(r.cat);}} emptyLabel="No categories to show"/>
@@ -6399,7 +6399,7 @@ function ItemLog(){
       <Chip v="Sold" active={dirF==='out'} onClick={()=>{setDirF('out');setPage(0);}}/>
       {(search||dateFrom||dateTo||dirF)&&<Btn onClick={()=>{setSearch('');setDateFrom('');setDateTo('');setDirF('');setPage(0);}} variant="secondary" size="sm">Clear</Btn>}
     </div>
-    <div style={{background:mobile?'transparent':C.surf,borderRadius:8,border:mobile?'none':`1px solid ${C.bdr}`,overflow:'hidden'}}>
+    <div style={{background:mobile?'transparent':C.surf,borderRadius:8,border:mobile?'none':`1px solid ${C.bdr}`,overflowX:mobile?'visible':'auto',overflowY:'hidden'}}>
       <CardTable mobile={mobile} columns={columns} rows={pageData} keyFn={(r,i)=>i} emptyLabel="No entries match"
         rowStyle={r=>r.isNew?{background:C.blueSoft}:null}/>
     </div>
@@ -6635,7 +6635,7 @@ function DamagedInventory(){
     <TC/>
     {sellItem&&<QuickSellModal item={sellItem} source="damaged" onClose={()=>setSellItem(null)} onSold={refresh}/>}
     <SectionHead title="Damaged Inventory" sub={`${items.length} items${discontinuedCount?` (${discontinuedCount} discontinued)`:''} · ${totalDamaged} pcs · ${fmt(totalValue)} value`}/>
-    <div style={{background:mobile?'transparent':C.surf,borderRadius:8,border:mobile?'none':`1px solid ${C.bdr}`,overflow:'hidden'}}>
+    <div style={{background:mobile?'transparent':C.surf,borderRadius:8,border:mobile?'none':`1px solid ${C.bdr}`,overflowX:mobile?'visible':'auto',overflowY:'hidden'}}>
       <CardTable mobile={mobile} columns={columns} rows={items} keyFn={it=>it.id} emptyLabel="No damaged stock ✓"
         renderSubRow={renderSubRow}
         groupHeader={(it,prev)=>{
@@ -6735,7 +6735,7 @@ function RepairedInventory(){
     {sellItem&&<QuickSellModal item={sellItem} source="repaired" onClose={()=>setSellItem(null)} onSold={refresh}/>}
     <SectionHead title="Repaired Inventory" sub={`${items.length} items · ${totalRepaired} pcs · ${fmt(totalValue)} value`}/>
     <div style={{fontSize:12,color:C.sub,marginBottom:12}}>Kept separate from fresh stock by default — repaired units are usually sold on their own (often at a discount). Use "Shift to fresh" to merge a batch back into regular sellable stock, or "Sell" to sell it directly from the repaired bucket.</div>
-    <div style={{background:mobile?'transparent':C.surf,borderRadius:8,border:mobile?'none':`1px solid ${C.bdr}`,overflow:'hidden'}}>
+    <div style={{background:mobile?'transparent':C.surf,borderRadius:8,border:mobile?'none':`1px solid ${C.bdr}`,overflowX:mobile?'visible':'auto',overflowY:'hidden'}}>
       <CardTable mobile={mobile} columns={columns} rows={items} keyFn={it=>it.id} emptyLabel="No repaired stock"/>
     </div>
   </div>;
@@ -6757,7 +6757,7 @@ function StockAdjustmentLog(){
   return <div>
     <SectionHead title="Stock Adjustments" sub={`${rows.length} adjustment${rows.length===1?'':'s'} logged`}/>
     <div style={{fontSize:12,color:C.sub,marginBottom:12}}>Every stock transfer between two items (via "Move" in Inventory), plus damaged/repaired/fresh bucket movements for a single item, is logged here with the reason given, so a correction is always explainable later.</div>
-    <div style={{background:mobile?'transparent':C.surf,borderRadius:8,border:mobile?'none':`1px solid ${C.bdr}`,overflow:'hidden'}}>
+    <div style={{background:mobile?'transparent':C.surf,borderRadius:8,border:mobile?'none':`1px solid ${C.bdr}`,overflowX:mobile?'visible':'auto',overflowY:'hidden'}}>
       <CardTable mobile={mobile} columns={columns} rows={rows} keyFn={r=>r.id} emptyLabel="No stock adjustments yet"/>
     </div>
   </div>;
@@ -7577,7 +7577,7 @@ function ItemMasters(){
     <div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,padding:'8px 12px',marginBottom:12}}>
       <input value={search} onChange={e=>{setSearch(e.target.value);setPage(0);}} placeholder="Search items…" style={{width:'100%',border:'none',outline:'none',fontSize:13,color:C.txt,fontFamily:'inherit',background:'transparent'}}/>
     </div>
-    <div style={{background:mobile?'transparent':C.surf,borderRadius:8,border:mobile?'none':`1px solid ${C.bdr}`,overflow:'hidden'}}>
+    <div style={{background:mobile?'transparent':C.surf,borderRadius:8,border:mobile?'none':`1px solid ${C.bdr}`,overflowX:mobile?'visible':'auto',overflowY:'hidden'}}>
       {mobile?<MobileInventoryList items={pageData} catF={catF} saleOf={saleOf} purchOf={purchOf} marginOf={marginOf} expectedMap={expectedMap} reservedMap={reservedMap}
         onOpenLedger={setDetailItem} onMove={setMoveSrc} onMerge={setMergeSrc} onEdit={openEdit} onShare={setShareItem} onSell={setSellItem} role={role}/>:
       <CardTable mobile={mobile} rows={pageData} keyFn={(it,i)=>it.id||i} emptyLabel="No items match"
@@ -8103,7 +8103,7 @@ function StockReconciliationLog(){
   return <div>
     <SectionHead title="Stock Reconciliations" sub={`${rows.length} count${rows.length===1?'':'s'} logged · net ${totalValue>=0?'profit':'loss'} ${fmt(Math.abs(totalValue))}`}/>
     <div style={{fontSize:12,color:C.sub,marginBottom:12}}>Every physical stock count reconciled against book qty (via "Reconcile Stock" in Inventory) is logged here — a shortfall posts as a loss, an excess as a profit, both folded into Net Profit.</div>
-    <div style={{background:mobile?'transparent':C.surf,borderRadius:8,border:mobile?'none':`1px solid ${C.bdr}`,overflow:'hidden'}}>
+    <div style={{background:mobile?'transparent':C.surf,borderRadius:8,border:mobile?'none':`1px solid ${C.bdr}`,overflowX:mobile?'visible':'auto',overflowY:'hidden'}}>
       <CardTable mobile={mobile} columns={columns} rows={rows} keyFn={r=>r.id} emptyLabel="No stock reconciliations yet"/>
     </div>
   </div>;
@@ -8167,7 +8167,7 @@ function PartyMasters(){
     <div style={{background:C.surf,borderRadius:8,border:`1px solid ${C.bdr}`,padding:'8px 12px',marginBottom:12}}>
       <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search parties…" style={{width:'100%',border:'none',outline:'none',fontSize:13,color:C.txt,fontFamily:'inherit',background:'transparent'}}/>
     </div>
-    <div style={{background:mobile?'transparent':C.surf,borderRadius:8,border:mobile?'none':`1px solid ${C.bdr}`,overflow:'hidden'}}>
+    <div style={{background:mobile?'transparent':C.surf,borderRadius:8,border:mobile?'none':`1px solid ${C.bdr}`,overflowX:mobile?'visible':'auto',overflowY:'hidden'}}>
       <CardTable mobile={mobile} rows={filtered.slice(0,100)} keyFn={(p,i)=>p.id||i}
         columns={[
           {key:'name',label:'Name',render:p=><span onClick={()=>setLedgerParty(p)} style={{fontWeight:600,color:C.blue,cursor:'pointer',textDecoration:'underline',textDecorationStyle:'dotted'}}>{p.name}{p.type==='both'&&<span style={{marginLeft:6,fontSize:10,fontWeight:700,color:C.purple,background:C.purple+'15',padding:'2px 6px',borderRadius:4,textDecoration:'none',display:'inline-block'}}>BOTH</span>}</span>},
