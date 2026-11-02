@@ -1983,6 +1983,18 @@ export const state = {
 // `mk` is just a small factory to keep that pairing from having to be
 // retyped correctly on all ~25 lines below.
 const mk = (key, getVal) => () => { const r = DB.set(key, getVal()); notifyLive(); return r; };
+// Same persistence as `mk`, but skips the local notifyLive() call — for saves
+// that are a same-tab-only UX nicety read directly off the mutated state
+// object (no component needs the liveTick-driven remount to see it) and whose
+// only callers fire mid-form-entry, where that remount is actively harmful:
+// see save.partyTransport below ("pressing Enter after transporter cancels
+// the page" — Enter moves focus to the next field, which blurs Transport,
+// which called save.partyTransport() via `mk`, bumping liveTick, which
+// remounts SaleEntry via `key={mod+'#'+liveTick}` and wipes the whole
+// in-progress Sales Order). Cross-device sync is unaffected: a remote write
+// to this same key still reaches this tab via DB.onRemoteUpdate, which calls
+// notifyLive() itself independently of this local path.
+const mkSilent = (key, getVal) => () => DB.set(key, getVal());
 export const save = {
   sales:            mk('data:sales',            () => state.sales),
   payments:         mk('data:payments',         () => state.payments),
@@ -1993,7 +2005,7 @@ export const save = {
   followups:        mk('data:followups',        () => state.followups),
   templates:        mk('data:templates',        () => state.templates),
   phoneEdits:       mk('data:phoneEdits',       () => state.phoneEdits),
-  partyTransport:   mk('data:partyTransport',   () => state.partyTransport),
+  partyTransport:   mkSilent('data:partyTransport', () => state.partyTransport),
   cityTransport:    mk('data:cityTransport',    () => state.cityTransport),
   parties:          mk('data:parties',          () => state.parties),
   items:            mk('data:items',            () => state.items),
