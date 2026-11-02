@@ -578,7 +578,7 @@ function setItemSubHead(itemId, newSubHead) {
   const trimmed = (newSubHead||'').trim();
   if (!trimmed) {
     state.items = state.items.map(x => x.id === itemId ? { ...x, subHead: '' } : x);
-    save.items();
+    save.itemsSilent();
     return;
   }
   // Match siblings by normalized text (trimmed, case-insensitive, collapsed
@@ -601,7 +601,7 @@ function setItemSubHead(itemId, newSubHead) {
     newSortOrder = catItems.length ? Math.max(...catItems.map(x => x.sortOrder ?? 0)) + 1 : 0;
   }
   state.items = state.items.map(x => x.id === itemId ? { ...x, subHead: canonical, sortOrder: newSortOrder } : x);
-  save.items();
+  save.itemsSilent();
 }
 
 
@@ -6773,7 +6773,7 @@ function ItemNamingEditor(){
   const commit=(id,field)=>{
     const it=items.find(x=>x.id===id);
     state.items=state.items.map(x=>x.id===id?{...x,[field]:it[field]}:x);
-    save.items();
+    save.itemsSilent();
   };
   return <div>
     <TC/>

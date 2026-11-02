@@ -2009,6 +2009,16 @@ export const save = {
   cityTransport:    mk('data:cityTransport',    () => state.cityTransport),
   parties:          mk('data:parties',          () => state.parties),
   items:            mk('data:items',            () => state.items),
+  // Same underlying key/data as `items` above, but silent (see mkSilent) —
+  // for inline per-field editors (ItemNamingEditor, setItemSubHead in
+  // App.jsx) that commit on every blur while the user is still working
+  // through a table of fields on the SAME screen. A notifying save there
+  // force-remounts that screen on every single blur, kicking the user out
+  // of whatever field they just finished ("making entries in name fields
+  // causes it to escape"). Cross-device sync is unaffected — a remote
+  // write still reaches this tab via DB.onRemoteUpdate, which notifies
+  // independently of this local path.
+  itemsSilent:      mkSilent('data:items',        () => state.items),
   categoryTags:     mk('data:categoryTags',     () => state.categoryTags),
   customCategories: mk('data:customCategories', () => state.customCategories),
   orders:           mk('data:orders',           () => state.orders),
