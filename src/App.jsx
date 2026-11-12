@@ -4267,52 +4267,99 @@ function PartyLedger({party,onClose}){
     // string like '=A1+B1' as a formula, it writes it as literal text, so
     // the only way to get a real formula cell is to set {f:...} on the
     // cell object after the sheet exists.
+    //
+    // Reconciliation columns mirror the "Our" block one-for-one (Seller
+    // Qty/Rate/Amount/Balance), so rate and qty can be compared per item
+    // line — not just per invoice total — plus a Rate/Amount difference
+    // and a Match flag, and a free Note column to jot "fix in my books" vs
+    // "ask seller to correct" once a mismatch is found.
     const aoa=[
       ['Upkaran ERP — Party Ledger'],
       [party.name],
       ['Period: '+(exFrom?fmtD(exFrom):'Beginning')+' to '+(exTo?fmtD(exTo):'Today')],
       [],
-      ['🔍 RECONCILIATION — type the seller\'s figure into "Seller\'s Figure" below; Seller\'s Balance/Difference/Match recalculate automatically. Leave a row blank to assume it matches ours.','','','','','','','','','','',''],
-      ['Date','Type','Particulars','Qty','Rate','Amount','Balance','',"Seller's Figure","Seller's Balance",'Difference','Match?'],
+      ['🔍 RECONCILIATION — fill in Seller Qty/Rate (or Seller Amount for payments) below for any line that differs; Amount/Balance/Match recalculate automatically. Leave a line blank to assume it matches ours.','','','','','','','','','','','','','','',''],
+      ['Date','Type','Particulars','Qty','Rate','Amount','Balance','',"Seller Qty","Seller Rate","Seller Amount","Seller Balance",'Rate Diff','Amount Diff','Match?','Note / Action'],
     ];
     const ledgerRows=[];
-    aoa.push(['','','Opening Balance','','','',openingBalance,'','','','','']);
+    aoa.push(['','','Opening Balance','','','',openingBalance,'','','','','','','','','']);
     ledgerRows.push({row:aoa.length-1,kind:'opening'});
 
     for(const e of filtered){
       if(e.type==='payment'){
-        aoa.push([fmtD(e.date),'Payment',e.desc||'Payment','','',e.delta,e.balance,'','','','','']);
-        ledgerRows.push({row:aoa.length-1,kind:'txn'});
+        aoa.push([fmtD(e.date),'Payment',e.desc||'Payment','','',e.delta,e.balance,'','','','','','','','','']);
+        ledgerRows.push({row:aoa.length-1,kind:'txn',hasQtyRate:false});
         continue;
       }
       const label=typeLabel[e.type]||'Sale';
       const items=e.items||[];
       if(items.length<=1){
         const it=items[0];
-        aoa.push([fmtD(e.date),label,it?it.name:label,it?.qty??'',it?.rate??'',e.amount,e.balance,'','','','','']);
-        ledgerRows.push({row:aoa.length-1,kind:'txn'});
+        aoa.push([fmtD(e.date),label,it?it.name:label,it?.qty??'',it?.rate??'',e.amount,e.balance,'','','','','','','','','']);
+        ledgerRows.push({row:aoa.length-1,kind:'txn',hasQtyRate:it&&it.qty!=null&&it.rate!=null});
       }else{
         const subRows=[];
         items.forEach((it,i)=>{
-          aoa.push([i===0?fmtD(e.date):'',i===0?label:'',it.name,it.qty??'',it.rate??'',it.amount??'','','','','','','']);
+          aoa.push([i===0?fmtD(e.date):'',i===0?label:'',it.name,it.qty??'',it.rate??'',it.amount??'','','','','','','','','','','']);
           subRows.push(aoa.length-1);
         });
-        aoa.push(['','','Invoice Total','','',e.amount,e.balance,'','','','','']);
+        aoa.push(['','','Invoice Total','','',e.amount,e.balance,'','','','','','','','','']);
         ledgerRows.push({row:aoa.length-1,kind:'txn',subRows});
       }
     }
     aoa.push([]);
-    aoa.push(['','','Closing Balance','','','',closingBalance,'','','','','']);
+    aoa.push(['','','Closing Balance','','','',closingBalance,'','','','','','','','','']);
     ledgerRows.push({row:aoa.length-1,kind:'closing'});
 
+    // ── Appendix: charges/items on the seller's bill that never made it
+    // into our books at all — the user's own second ask ("if there is a
+    // charge or item I have missed"). Blank rows: fill in Particulars +
+    // Seller Qty/Rate (or just Seller Amount), Our side stays 0/blank by
+    // design since it genuinely isn't in our books yet. Insert more rows
+    // above "Total Missed" if 6 isn't enough.
+    aoa.push([]);
+    const missedBannerRow=aoa.length;
+    aoa.push(['➕ ITEMS/CHARGES ON SELLER\'S BILL NOT YET IN MY BOOKS — add a row per item; leave "Our" columns blank, fill in the Seller columns','','','','','','','','','','','','','','','']);
+    aoa.push(['Date','Type','Particulars','Qty','Rate','Amount','','',"Seller Qty","Seller Rate","Seller Amount",'','','Amount Diff','Match?','Note / Action']);
+    const MISSED_ROWS=6;
+    const missedRows=[];
+    for(let i=0;i<MISSED_ROWS;i++){
+      aoa.push(['','','','','',0,'','','','','','','','','','']);
+      missedRows.push(aoa.length-1);
+    }
+    aoa.push(['','','Total Missed (per Seller)','','',0,'','','','',0,'','','','','']);
+    const missedTotalRow=aoa.length-1;
+
+    aoa.push([]);
+    const summaryBannerRow=aoa.length;
+    aoa.push(['📊 RECONCILIATION SUMMARY','','','','','','','','','','','','','','','']);
+    aoa.push(['Our Closing Balance','','','','','','','','','','','','','','','']);
+    const sumOurRow=aoa.length-1;
+    aoa.push(["Seller's Closing Balance (their ledger, incl. missed items above)",'','','','','','','','','','','','','','','']);
+    const sumSellerRow=aoa.length-1;
+    aoa.push(['Net Difference (books to adjust / amount to query with seller)','','','','','','','','','','','','','','','']);
+    const sumDiffRow=aoa.length-1;
+    aoa.push(['Overall Status','','','','','','','','','','','','','','','']);
+    const sumStatusRow=aoa.length-1;
+
     const ws=XLSX.utils.aoa_to_sheet(aoa);
-    ws['!cols']=[{wch:12},{wch:10},{wch:34},{wch:8},{wch:10},{wch:12},{wch:12},{wch:3},{wch:14},{wch:14},{wch:12},{wch:14}];
+    ws['!cols']=[{wch:12},{wch:10},{wch:32},{wch:8},{wch:9},{wch:11},{wch:11},{wch:3},{wch:9},{wch:9},{wch:12},{wch:12},{wch:9},{wch:11},{wch:11},{wch:26}];
     ws['!merges']=[
-      {s:{r:0,c:0},e:{r:0,c:11}},{s:{r:1,c:0},e:{r:1,c:11}},{s:{r:2,c:0},e:{r:2,c:11}},
-      {s:{r:4,c:0},e:{r:4,c:11}},
+      {s:{r:0,c:0},e:{r:0,c:15}},{s:{r:1,c:0},e:{r:1,c:15}},{s:{r:2,c:0},e:{r:2,c:15}},
+      {s:{r:4,c:0},e:{r:4,c:15}},
+      {s:{r:missedBannerRow,c:0},e:{r:missedBannerRow,c:15}},
+      {s:{r:summaryBannerRow,c:0},e:{r:summaryBannerRow,c:15}},
+      // Label merged A:I, value merged J:P (kept separate so the formula's
+      // result — written at column J — is the merge's own anchor cell and
+      // actually displays, instead of being swallowed by a label merge that
+      // extended over it).
+      {s:{r:sumOurRow,c:0},e:{r:sumOurRow,c:8}},{s:{r:sumOurRow,c:9},e:{r:sumOurRow,c:15}},
+      {s:{r:sumSellerRow,c:0},e:{r:sumSellerRow,c:8}},{s:{r:sumSellerRow,c:9},e:{r:sumSellerRow,c:15}},
+      {s:{r:sumDiffRow,c:0},e:{r:sumDiffRow,c:8}},{s:{r:sumDiffRow,c:9},e:{r:sumDiffRow,c:15}},
+      {s:{r:sumStatusRow,c:0},e:{r:sumStatusRow,c:8}},{s:{r:sumStatusRow,c:9},e:{r:sumStatusRow,c:15}},
     ];
 
-    const colLetter=['A','B','C','D','E','F','G','H','I','J','K','L'];
+    const colLetter=['A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P'];
     const R=n=>n+1;
     const cellRef=(c,r)=>colLetter[c]+R(r);
     const setF=(c,r,formula,value)=>{ ws[cellRef(c,r)]={t:typeof value==='number'?'n':'s',f:formula,v:value}; };
@@ -4346,28 +4393,75 @@ function PartyLedger({party,onClose}){
       else setF(6,cur.row,`${cellRef(6,prev.row)}+${cellRef(5,cur.row)}`,ws[cellRef(6,cur.row)].v);
     }
 
-    // ── Reconciliation (parallel section, columns I:L) ────────────────────
-    // Column I ("Seller's Figure") is the only cell meant to be typed into.
-    // Leaving it blank on a row is read as "assume it matches ours", so a
-    // half-filled sheet never shows false mismatches — only the rows where
-    // the seller's own bill/ledger actually differs need to be touched.
+    // ── Reconciliation (parallel section, columns I:P) ────────────────────
+    // Seller Qty (I) / Seller Rate (J) are the cells meant to be typed into
+    // for an item line — leaving both blank defaults Seller Amount (K) to
+    // our own Qty×Rate, so a half-filled sheet never shows false
+    // mismatches. For rows with no qty/rate (payments, invoice totals,
+    // opening/closing), Seller Amount (K) itself is the editable figure.
+    const setItemRowRecon=r=>{
+      setF(10,r,`IF(${cellRef(8,r)}="",${cellRef(3,r)},${cellRef(8,r)})*IF(${cellRef(9,r)}="",${cellRef(4,r)},${cellRef(9,r)})`, ws[cellRef(5,r)].v);
+      setF(12,r,`IF(${cellRef(9,r)}="","",${cellRef(4,r)}-${cellRef(9,r)})`,'');
+      setF(13,r,`${cellRef(5,r)}-${cellRef(10,r)}`,0);
+      setF(14,r,`IF(AND(${cellRef(8,r)}="",${cellRef(9,r)}=""),"⬜ Not checked",IF(ROUND(${cellRef(13,r)},2)=0,"✓ Match","✗ Mismatch"))`,'⬜ Not checked');
+    };
+    ledgerRows.forEach(lr=>{
+      if(lr.subRows) lr.subRows.forEach(setItemRowRecon);
+      else if(lr.kind==='txn'&&lr.hasQtyRate) setItemRowRecon(lr.row);
+    });
+    // Invoice Total Seller Amount (K) = SUM of its breakdown lines' Seller
+    // Amount cells — aggregates any per-item overrides up to invoice level.
+    // Cached value is computed from the subrows' own cached K values (NOT
+    // read back from the Invoice Total row's own K cell, which is still its
+    // untouched blank placeholder at this point — reading it here was a bug:
+    // it fed a '' into every downstream running-Seller-Balance addition,
+    // turning the whole rest of that balance column into string
+    // concatenation, e.g. "10001200-2000" instead of 4700).
+    ledgerRows.forEach(lr=>{
+      if(lr.subRows&&lr.subRows.length){
+        const first=cellRef(10,lr.subRows[0]),last=cellRef(10,lr.subRows[lr.subRows.length-1]);
+        const kSum=lr.subRows.reduce((s,rr)=>s+(typeof ws[cellRef(10,rr)].v==='number'?ws[cellRef(10,rr)].v:0),0);
+        setF(10,lr.row,`SUM(${first}:${last})`,kSum);
+        const nDiff=ws[cellRef(5,lr.row)].v-kSum;
+        setF(13,lr.row,`${cellRef(5,lr.row)}-${cellRef(10,lr.row)}`,nDiff);
+        setF(14,lr.row,`IF(ROUND(${cellRef(13,lr.row)},2)=0,"✓ Match","✗ Mismatch")`,Math.round(nDiff*100)/100===0?'✓ Match':'✗ Mismatch');
+      }
+    });
+    // Rows with no qty/rate (payments, opening, closing): Seller Amount (K)
+    // / Seller Balance (L) are typed/computed directly, not derived from I*J.
     let sellerBal=openingBalance;
     ledgerRows.forEach((lr,i)=>{
       const r=lr.row;
-      if(lr.kind==='opening'){ setF(9,r,`IF(${cellRef(8,r)}="",${cellRef(6,r)},${cellRef(8,r)})`,sellerBal); return; }
+      if(lr.kind==='opening'){ setF(11,r,`IF(${cellRef(10,r)}="",${cellRef(6,r)},${cellRef(10,r)})`,sellerBal); return; }
       const prev=ledgerRows[i-1];
       if(lr.kind==='closing'){
-        setF(9,r,cellRef(9,prev.row),sellerBal);
+        setF(11,r,cellRef(11,prev.row),sellerBal);
         const diff=Math.round((ws[cellRef(6,r)].v-sellerBal)*100)/100;
-        setF(10,r,`${cellRef(6,r)}-${cellRef(9,r)}`,diff);
-        setF(11,r,`IF(ROUND(${cellRef(10,r)},2)=0,"✓ Reconciled","✗ Discrepancy")`,diff===0?'✓ Reconciled':'✗ Discrepancy');
+        setF(13,r,`${cellRef(6,r)}-${cellRef(11,r)}`,diff);
+        setF(14,r,`IF(ROUND(${cellRef(13,r)},2)=0,"✓ Reconciled","✗ Discrepancy")`,diff===0?'✓ Reconciled':'✗ Discrepancy');
         return;
       }
-      sellerBal+=ws[cellRef(5,r)].v;
-      setF(9,r,`${cellRef(9,prev.row)}+IF(${cellRef(8,r)}="",${cellRef(5,r)},${cellRef(8,r)})`,sellerBal);
-      setF(10,r,`IF(${cellRef(8,r)}="","",${cellRef(5,r)}-${cellRef(8,r)})`,'');
-      setF(11,r,`IF(${cellRef(8,r)}="","",IF(ROUND(${cellRef(10,r)},2)=0,"✓ Match","✗ Mismatch"))`,'');
+      if(lr.kind==='txn'&&!lr.hasQtyRate&&!lr.subRows){
+        // Payment row — Seller Amount (K) is a direct editable input.
+        setF(10,r,`IF(${cellRef(10,r)}="",${cellRef(5,r)},${cellRef(10,r)})`,ws[cellRef(5,r)].v);
+      }
+      sellerBal+=ws[cellRef(10,r)].v;
+      setF(11,r,`${cellRef(11,prev.row)}+${cellRef(10,r)}`,sellerBal);
     });
+
+    // ── Missed items/charges appendix formulas ────────────────────────────
+    missedRows.forEach(r=>{
+      setF(13,r,`${cellRef(5,r)}-${cellRef(10,r)}`,0);
+      setF(14,r,`IF(${cellRef(10,r)}="","",IF(${cellRef(10,r)}=0,"⬜ Not checked","✗ Missing from my books"))`,'⬜ Not checked');
+    });
+    setF(10,missedTotalRow,`SUM(${cellRef(10,missedRows[0])}:${cellRef(10,missedRows[missedRows.length-1])})`,0);
+
+    // ── Reconciliation summary ─────────────────────────────────────────────
+    const closingLedgerRow=ledgerRows[ledgerRows.length-1].row;
+    setF(9,sumOurRow,cellRef(6,closingLedgerRow),closingBalance);
+    setF(9,sumSellerRow,`${cellRef(11,closingLedgerRow)}+${cellRef(10,missedTotalRow)}`,closingBalance);
+    setF(9,sumDiffRow,`${cellRef(9,sumOurRow)}-${cellRef(9,sumSellerRow)}`,0);
+    setF(9,sumStatusRow,`IF(ROUND(${cellRef(9,sumDiffRow)},2)=0,"✓ Fully Reconciled","✗ Adjust my books or query seller for the difference above")`,'✓ Fully Reconciled');
 
     const wb=XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb,ws,'Ledger');
