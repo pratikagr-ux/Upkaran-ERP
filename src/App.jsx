@@ -2973,7 +2973,19 @@ function OrdersModule({navigate,dispatchOrder,setDispatchOrder,reviewOrder,setRe
           <tbody>
             {pending.map(o=><tr key={o.id} style={{borderBottom:`1px solid ${C.bdr}`}}>
               <td style={{padding:'9px 14px',whiteSpace:'nowrap',color:C.sub,verticalAlign:'top'}}>{fmtD(o.date)}</td>
-              <td style={{padding:'9px 14px',fontWeight:600,color:C.txt,verticalAlign:'top'}}>{o.partyName}</td>
+              <td style={{padding:'9px 14px',fontWeight:600,color:C.txt,verticalAlign:'top'}}>
+                {o.partyName}
+                {/* "✅ Dispatched" only flips order.status to 'dispatched' and
+                    opens ReviewOrderModal — the Sale itself (and thus this
+                    order dropping off Sales Log/Party Ledger visibility) only
+                    happens once "Create Invoice" is actually clicked inside
+                    that modal. If the modal gets closed/escaped first, the
+                    order silently sits here forever looking untouched. This
+                    badge is the fix: make that half-finished state visible so
+                    it never gets lost again (root cause of "dispatched from
+                    phone, missing from Sales Log/ledger"). */}
+                {o.status==='dispatched'&&<div style={{marginTop:3}}><Badge v="⏳ Invoice Pending" color="amber"/></div>}
+              </td>
               <td style={{padding:'9px 14px',fontSize:12,color:C.sub}}>
                 {(o.items||[]).map((x,j)=><div key={j} style={{marginBottom:4}}>
                   {/* Sales Orders list — dispatch-facing, use dispatch name (new request #1) */}
@@ -2990,7 +3002,7 @@ function OrdersModule({navigate,dispatchOrder,setDispatchOrder,reviewOrder,setRe
                 <div style={{display:'flex',gap:4,alignItems:'center',justifyContent:'center',flexWrap:'wrap'}}>
                   <IconBtn onClick={()=>setEditOrder(o)} title="Edit this order">✏️</IconBtn>
                   <IconBtn onClick={()=>setDispatchOrder(o)} title="Send to Dispatch (WhatsApp)">📲</IconBtn>
-                  <Btn onClick={()=>openReview(o)} size="sm" variant="success">✅ Dispatched</Btn>
+                  <Btn onClick={()=>openReview(o)} size="sm" variant="success">{o.status==='dispatched'?'🧾 Finish Invoice':'✅ Dispatched'}</Btn>
                 </div>
               </td>
             </tr>)}
@@ -3883,18 +3895,74 @@ function MergedPartyLedger({party,onClose}){
   const exportLedgerExcel=()=>{
     if(!rows.length)return toast('No transactions recorded yet','error');
     const chrono=rows.slice().reverse();
+    // Every number below is pushed as a plain computed value first (so the
+    // sheet is never blank/broken), then selectively upgraded to a real
+    // Excel formula in the pass below — aoa_to_sheet does NOT treat a
+    // string like '=A1+B1' as a formula, it writes it as literal text, so
+    // the only way to get a real formula cell is to set {f:...} on the
+    // cell object after the sheet exists.
     const aoa=[
       ['Upkaran ERP — Combined Party Ledger'],
       [party.name],
       [],
-      ['Date','Type','Particulars','Amount','Net Balance'],
+      ['🔍 RECONCILIATION — type the seller\'s figure into "Seller\'s Figure" below; Seller\'s Balance/Difference/Match recalculate automatically. Leave a row blank to assume it matches ours.','','','','','','','','',''],
+      ['Date','Type','Particulars','Amount','Net Balance','',"Seller's Figure","Seller's Balance",'Difference','Match?'],
+      ['','','Opening Balance','',0,'','','','',''],
     ];
-    for(const e of chrono) aoa.push([fmtD(e.date),typeMeta[e.type].label,e.desc,e.delta,e.balance]);
+    const ledgerRows=[{row:aoa.length-1,kind:'opening'}];
+    for(const e of chrono){
+      aoa.push([fmtD(e.date),typeMeta[e.type].label,e.desc,e.delta,e.balance,'','','','','']);
+      ledgerRows.push({row:aoa.length-1,kind:'txn'});
+    }
     aoa.push([]);
-    aoa.push(['','','Closing Net Balance','',currentNet]);
+    aoa.push(['','','Closing Net Balance','',currentNet,'','','','','']);
+    ledgerRows.push({row:aoa.length-1,kind:'closing'});
+
     const ws=XLSX.utils.aoa_to_sheet(aoa);
-    ws['!cols']=[{wch:12},{wch:10},{wch:38},{wch:12},{wch:12}];
-    ws['!merges']=[{s:{r:0,c:0},e:{r:0,c:4}},{s:{r:1,c:0},e:{r:1,c:4}}];
+    ws['!cols']=[{wch:12},{wch:10},{wch:38},{wch:12},{wch:12},{wch:3},{wch:14},{wch:14},{wch:12},{wch:14}];
+    ws['!merges']=[
+      {s:{r:0,c:0},e:{r:0,c:9}},{s:{r:1,c:0},e:{r:1,c:9}},
+      {s:{r:3,c:0},e:{r:3,c:9}},
+    ];
+
+    const colLetter=['A','B','C','D','E','F','G','H','I','J'];
+    const R=n=>n+1;
+    const cellRef=(c,r)=>colLetter[c]+R(r);
+    const setF=(c,r,formula,value)=>{ ws[cellRef(c,r)]={t:typeof value==='number'?'n':'s',f:formula,v:value}; };
+
+    // Running Net Balance (E): Opening Balance is the known starting fact
+    // (an input, not derived from this sheet); every later row = previous
+    // row's balance + this row's signed Amount; Closing Net Balance mirrors
+    // the last one.
+    for(let i=1;i<ledgerRows.length;i++){
+      const prev=ledgerRows[i-1],cur=ledgerRows[i];
+      if(cur.kind==='closing') setF(4,cur.row,cellRef(4,prev.row),ws[cellRef(4,cur.row)].v);
+      else setF(4,cur.row,`${cellRef(4,prev.row)}+${cellRef(3,cur.row)}`,ws[cellRef(4,cur.row)].v);
+    }
+
+    // ── Reconciliation (parallel section, columns G:J) ────────────────────
+    // Column G ("Seller's Figure") is the only cell meant to be typed into.
+    // Leaving it blank on a row is read as "assume it matches ours", so a
+    // half-filled sheet never shows false mismatches — only the rows where
+    // the seller's own ledger actually differs need to be touched.
+    let sellerBal=0;
+    ledgerRows.forEach((lr,i)=>{
+      const r=lr.row;
+      if(lr.kind==='opening'){ setF(7,r,`IF(${cellRef(6,r)}="",${cellRef(4,r)},${cellRef(6,r)})`,sellerBal); return; }
+      const prev=ledgerRows[i-1];
+      if(lr.kind==='closing'){
+        setF(7,r,cellRef(7,prev.row),sellerBal);
+        const diff=Math.round((ws[cellRef(4,r)].v-sellerBal)*100)/100;
+        setF(8,r,`${cellRef(4,r)}-${cellRef(7,r)}`,diff);
+        setF(9,r,`IF(ROUND(${cellRef(8,r)},2)=0,"✓ Reconciled","✗ Discrepancy")`,diff===0?'✓ Reconciled':'✗ Discrepancy');
+        return;
+      }
+      sellerBal+=ws[cellRef(3,r)].v;
+      setF(7,r,`${cellRef(7,prev.row)}+IF(${cellRef(6,r)}="",${cellRef(3,r)},${cellRef(6,r)})`,sellerBal);
+      setF(8,r,`IF(${cellRef(6,r)}="","",${cellRef(3,r)}-${cellRef(6,r)})`,'');
+      setF(9,r,`IF(${cellRef(6,r)}="","",IF(ROUND(${cellRef(8,r)},2)=0,"✓ Match","✗ Mismatch"))`,'');
+    });
+
     const wb=XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb,ws,'Ledger');
     XLSX.writeFile(wb,party.name.replace(/[^a-z0-9]+/gi,'-')+'-combined-ledger-'+today()+'.xlsx');
@@ -4193,35 +4261,114 @@ function PartyLedger({party,onClose}){
   const exportLedgerExcel=()=>{
     const {filtered,openingBalance,closingBalance}=buildExportWindow();
     if(!filtered.length)return toast('No transactions in this date range','error');
+    // Every number below is pushed as a plain computed value first (so the
+    // sheet is never blank/broken), then selectively upgraded to a real
+    // Excel formula in the pass below — aoa_to_sheet does NOT treat a
+    // string like '=A1+B1' as a formula, it writes it as literal text, so
+    // the only way to get a real formula cell is to set {f:...} on the
+    // cell object after the sheet exists.
     const aoa=[
       ['Upkaran ERP — Party Ledger'],
       [party.name],
       ['Period: '+(exFrom?fmtD(exFrom):'Beginning')+' to '+(exTo?fmtD(exTo):'Today')],
       [],
-      ['Date','Type','Particulars','Qty','Rate','Amount','Balance'],
-      ['','','Opening Balance','','','',openingBalance],
+      ['🔍 RECONCILIATION — type the seller\'s figure into "Seller\'s Figure" below; Seller\'s Balance/Difference/Match recalculate automatically. Leave a row blank to assume it matches ours.','','','','','','','','','','',''],
+      ['Date','Type','Particulars','Qty','Rate','Amount','Balance','',"Seller's Figure","Seller's Balance",'Difference','Match?'],
     ];
+    const ledgerRows=[];
+    aoa.push(['','','Opening Balance','','','',openingBalance,'','','','','']);
+    ledgerRows.push({row:aoa.length-1,kind:'opening'});
+
     for(const e of filtered){
       if(e.type==='payment'){
-        aoa.push([fmtD(e.date),'Payment',e.desc||'Payment','','',e.delta,e.balance]);
+        aoa.push([fmtD(e.date),'Payment',e.desc||'Payment','','',e.delta,e.balance,'','','','','']);
+        ledgerRows.push({row:aoa.length-1,kind:'txn'});
         continue;
       }
       const label=typeLabel[e.type]||'Sale';
       const items=e.items||[];
       if(items.length<=1){
         const it=items[0];
-        aoa.push([fmtD(e.date),label,it?it.name:label,it?.qty??'',it?.rate??'',e.amount,e.balance]);
+        aoa.push([fmtD(e.date),label,it?it.name:label,it?.qty??'',it?.rate??'',e.amount,e.balance,'','','','','']);
+        ledgerRows.push({row:aoa.length-1,kind:'txn'});
       }else{
-        items.forEach((it,i)=>aoa.push([i===0?fmtD(e.date):'',i===0?label:'',it.name,it.qty??'',it.rate??'',it.amount??'','']));
-        aoa.push(['','','Invoice Total','','',e.amount,e.balance]);
+        const subRows=[];
+        items.forEach((it,i)=>{
+          aoa.push([i===0?fmtD(e.date):'',i===0?label:'',it.name,it.qty??'',it.rate??'',it.amount??'','','','','','','']);
+          subRows.push(aoa.length-1);
+        });
+        aoa.push(['','','Invoice Total','','',e.amount,e.balance,'','','','','']);
+        ledgerRows.push({row:aoa.length-1,kind:'txn',subRows});
       }
     }
     aoa.push([]);
-    aoa.push(['','','Closing Balance','','','',closingBalance]);
+    aoa.push(['','','Closing Balance','','','',closingBalance,'','','','','']);
+    ledgerRows.push({row:aoa.length-1,kind:'closing'});
 
     const ws=XLSX.utils.aoa_to_sheet(aoa);
-    ws['!cols']=[{wch:12},{wch:10},{wch:34},{wch:8},{wch:10},{wch:12},{wch:12}];
-    ws['!merges']=[{s:{r:0,c:0},e:{r:0,c:6}},{s:{r:1,c:0},e:{r:1,c:6}},{s:{r:2,c:0},e:{r:2,c:6}}];
+    ws['!cols']=[{wch:12},{wch:10},{wch:34},{wch:8},{wch:10},{wch:12},{wch:12},{wch:3},{wch:14},{wch:14},{wch:12},{wch:14}];
+    ws['!merges']=[
+      {s:{r:0,c:0},e:{r:0,c:11}},{s:{r:1,c:0},e:{r:1,c:11}},{s:{r:2,c:0},e:{r:2,c:11}},
+      {s:{r:4,c:0},e:{r:4,c:11}},
+    ];
+
+    const colLetter=['A','B','C','D','E','F','G','H','I','J','K','L'];
+    const R=n=>n+1;
+    const cellRef=(c,r)=>colLetter[c]+R(r);
+    const setF=(c,r,formula,value)=>{ ws[cellRef(c,r)]={t:typeof value==='number'?'n':'s',f:formula,v:value}; };
+
+    // Amount (F) = Qty × Rate wherever both are present, so every figure is
+    // traceable to its inputs rather than a bare number — applies to
+    // single-item rows and each line of a multi-item invoice breakdown.
+    const qtyRateRow=r=>{
+      const q=ws[cellRef(3,r)]?.v, rt=ws[cellRef(4,r)]?.v;
+      if(typeof q==='number'&&typeof rt==='number') setF(5,r,`${cellRef(3,r)}*${cellRef(4,r)}`,q*rt);
+    };
+    ledgerRows.forEach(lr=>{
+      if(lr.subRows) lr.subRows.forEach(qtyRateRow);
+      else if(lr.kind==='txn') qtyRateRow(lr.row);
+    });
+    // Invoice Total Amount (F) = SUM of its breakdown lines' Amount cells.
+    ledgerRows.forEach(lr=>{
+      if(lr.subRows&&lr.subRows.length){
+        const first=cellRef(5,lr.subRows[0]),last=cellRef(5,lr.subRows[lr.subRows.length-1]);
+        setF(5,lr.row,`SUM(${first}:${last})`,ws[cellRef(5,lr.row)].v);
+      }
+    });
+    // Running Balance (G): Opening Balance is the known starting fact (an
+    // input, not derived from this sheet); every later ledger row =
+    // previous ledger row's Balance + this row's Amount; Closing Balance
+    // mirrors the last one. Item-breakdown sub-rows never get their own
+    // Balance.
+    for(let i=1;i<ledgerRows.length;i++){
+      const prev=ledgerRows[i-1],cur=ledgerRows[i];
+      if(cur.kind==='closing') setF(6,cur.row,cellRef(6,prev.row),ws[cellRef(6,cur.row)].v);
+      else setF(6,cur.row,`${cellRef(6,prev.row)}+${cellRef(5,cur.row)}`,ws[cellRef(6,cur.row)].v);
+    }
+
+    // ── Reconciliation (parallel section, columns I:L) ────────────────────
+    // Column I ("Seller's Figure") is the only cell meant to be typed into.
+    // Leaving it blank on a row is read as "assume it matches ours", so a
+    // half-filled sheet never shows false mismatches — only the rows where
+    // the seller's own bill/ledger actually differs need to be touched.
+    let sellerBal=openingBalance;
+    ledgerRows.forEach((lr,i)=>{
+      const r=lr.row;
+      if(lr.kind==='opening'){ setF(9,r,`IF(${cellRef(8,r)}="",${cellRef(6,r)},${cellRef(8,r)})`,sellerBal); return; }
+      const prev=ledgerRows[i-1];
+      if(lr.kind==='closing'){
+        setF(9,r,cellRef(9,prev.row),sellerBal);
+        const diff=Math.round((ws[cellRef(6,r)].v-sellerBal)*100)/100;
+        setF(10,r,`${cellRef(6,r)}-${cellRef(9,r)}`,diff);
+        setF(11,r,`IF(ROUND(${cellRef(10,r)},2)=0,"✓ Reconciled","✗ Discrepancy")`,diff===0?'✓ Reconciled':'✗ Discrepancy');
+        return;
+      }
+      sellerBal+=ws[cellRef(5,r)].v;
+      setF(9,r,`${cellRef(9,prev.row)}+IF(${cellRef(8,r)}="",${cellRef(5,r)},${cellRef(8,r)})`,sellerBal);
+      setF(10,r,`IF(${cellRef(8,r)}="","",${cellRef(5,r)}-${cellRef(8,r)})`,'');
+      setF(11,r,`IF(${cellRef(8,r)}="","",IF(ROUND(${cellRef(10,r)},2)=0,"✓ Match","✗ Mismatch"))`,'');
+    });
+
     const wb=XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb,ws,'Ledger');
     XLSX.writeFile(wb,party.name.replace(/[^a-z0-9]+/gi,'-')+'-ledger-'+today()+'.xlsx');
@@ -5882,7 +6029,13 @@ function Dashboard({navigate,reviewOrder,setReviewOrder,doneSale,setDoneSale}){
           style={{padding:'8px 16px',borderBottom:`1px solid ${C.bdr}`,cursor:'pointer'}}>
           <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:10,marginBottom:3}}>
             <div style={{fontWeight:600,color:C.txt,fontSize:12}}>{order.partyName}</div>
-            <Badge v={st.label} color={st.color}/>
+            {/* Marking "Dispatched" only opens the review modal — the Sale
+                (and this order's disappearance from Sales Log/Party Ledger)
+                only happens once "Create Invoice" is clicked inside it. If
+                that modal gets closed first, the order used to sit here with
+                no visible difference from a never-touched one — this badge
+                makes that half-finished state obvious so it's never lost. */}
+            {order.status==='dispatched'?<Badge v="⏳ Invoice Pending" color="amber"/>:<Badge v={st.label} color={st.color}/>}
           </div>
           {/* Request #4: every line of the order under the party name — rate +
               qty per item, colored by live availability (green = available,
