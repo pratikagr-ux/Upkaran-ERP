@@ -4442,8 +4442,24 @@ function PartyLedger({party,onClose}){
         return;
       }
       if(lr.kind==='txn'&&!lr.hasQtyRate&&!lr.subRows){
-        // Payment row — Seller Amount (K) is a direct editable input.
-        setF(10,r,`IF(${cellRef(10,r)}="",${cellRef(5,r)},${cellRef(10,r)})`,ws[cellRef(5,r)].v);
+        // Payment row — Seller Amount (K) stays a genuine blank/editable
+        // input cell, no formula. A formula here would have to test "is K
+        // blank" from inside K itself (IF(K="",F,K) written INTO K) — that's
+        // a circular reference (a cell can't read its own prior content to
+        // decide its own new content), which is exactly the bug that broke
+        // this column: Excel disables auto-calc on any cell chain downstream
+        // of a circular reference, so every Seller Balance (L) row after a
+        // payment silently stopped recalculating. Fixed the same way the
+        // combined-ledger export already does it correctly: leave K blank,
+        // and let the cells that NEED "blank defaults to our Amount" wrap
+        // the raw K reference in their OWN formula instead.
+        const kv=ws[cellRef(10,r)].v;
+        const hasOverride=typeof kv==='number';
+        sellerBal+=hasOverride?kv:ws[cellRef(5,r)].v;
+        setF(11,r,`${cellRef(11,prev.row)}+IF(${cellRef(10,r)}="",${cellRef(5,r)},${cellRef(10,r)})`,sellerBal);
+        setF(13,r,`IF(${cellRef(10,r)}="","",${cellRef(5,r)}-${cellRef(10,r)})`,hasOverride?ws[cellRef(5,r)].v-kv:'');
+        setF(14,r,`IF(${cellRef(10,r)}="","⬜ Not checked",IF(ROUND(${cellRef(13,r)},2)=0,"✓ Match","✗ Mismatch"))`,hasOverride?(Math.round((ws[cellRef(5,r)].v-kv)*100)/100===0?'✓ Match':'✗ Mismatch'):'⬜ Not checked');
+        return;
       }
       sellerBal+=ws[cellRef(10,r)].v;
       setF(11,r,`${cellRef(11,prev.row)}+${cellRef(10,r)}`,sellerBal);
