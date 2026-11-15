@@ -4050,18 +4050,23 @@ function MergedPartyLedger({party,onClose}){
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Supplier Reconciliation (account reconciliation against the seller's
-// statement). Opened from a supplier's Party Ledger. Four jobs, one screen:
-//   ① match billed rate & qty line-by-line against the seller's bill
-//   ② add genuinely missed items (on the seller's bill, never booked by us)
-//   ③ add extras / entries the seller made that we haven't recorded yet
-//   ④ show the difference and the final settlement
-// Everything typed is autosaved as a per-supplier draft (silent save — a
+// Supplier Reconciliation — a side-by-side ledger against the seller's
+// statement. Opened from a supplier's Party Ledger.
+//
+// One chronological ledger (bills, their lines, payments — in date order) with
+// BOTH sides' running balances on every row: ours on the left, the seller's on
+// the right (built from the figures typed in), and the gap between them.
+//   • per bill line: compare rate & qty (pre-ERP bills included — read-only
+//     history, so differences there are posted as adjustment entries)
+//   • per bill: add a missed item or an extra charge right on that bill
+//   • per payment: enter what the seller shows; correct/adjust/dispute
+//   • a note on any bill or payment, changes or not
+//   • entries that belong to no bill of ours can be added on their own date
+// Everything typed autosaves as a per-supplier draft (silent save — a
 // notifying save would remount this screen mid-typing). Nothing touches the
 // books until the user reviews the change list and presses "Post to books".
-// Sign convention: balances are what WE OWE the seller (positive = payable),
-// Δ on a line = seller's figure − ours (so accepting a Δ adds it to our
-// payable).
+// Sign convention: balances are what WE OWE the seller (positive = payable);
+// Δ on a line = seller's figure − ours (accepting a Δ adds it to our payable).
 // ═════════════════════════════════════════════════════════════════════════════
 function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onClose}){
   const mobile=useIsMobile();
@@ -4083,22 +4088,40 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
   const[missed,setMissed]=useState(d0.missed||[]);
   const[extras,setExtras]=useState(d0.extras||[]);
   const[payChk,setPayChk]=useState(d0.payChk||{});
+  const[payRes,setPayRes]=useState(d0.payRes||{});
+  const[noteMap,setNoteMap]=useState(d0.noteMap||{});
   const[notes,setNotes]=useState(d0.notes||'');
   const[settleBasis,setSettleBasis]=useState(d0.settleBasis||'ours');
   const[filter,setFilter]=useState('all');
-  const[showPays,setShowPays]=useState(false);
+  const[noteOpen,setNoteOpen]=useState({});
   const[step,setStep]=useState('work');
   const[posting,setPosting]=useState(false);
 
   // ── Our side of the picture ────────────────────────────────────────────────
   const bills=useMemo(()=>{
     const out=[];
+    // Pre-ERP history: visible with its real qty/rate lines. Read-only (it also
+    // feeds stock/FIFO costing), so a difference on these is resolved with an
+    // adjustment entry, which moves the ledger balance identically.
     (SUPPLIER_HISTORY[party.name]?.s||[]).forEach((s,bi)=>{
       if(!inWin(s[0]))return;
-      const names=(s[2]||[]).map(x=>Array.isArray(x)?x[0]+(x[1]!=null?' ×'+x[1]:''):String(x)).join(', ');
-      const key='H'+bi;
-      out.push({key,hist:true,date:s[0],ref:'Pre-ERP bill',total:r2(s[1]),
-        lines:[{key:key+'#T',billKey:key,type:'amount',name:names||'Bill total',our:r2(s[1]),fixable:false}]});
+      const key='H'+bi,total=r2(s[1]);
+      const lines=[];let sum=0;
+      (s[2]||[]).forEach((x,i)=>{
+        if(Array.isArray(x)&&x[1]!=null&&x[2]!=null){
+          const q=Number(x[1])||0,rt=Number(x[2])||0;
+          lines.push({key:key+'#'+i,billKey:key,type:'item',idx:i,name:x[0],qty:q,rate:rt,our:r2(q*rt),fixable:false});
+          sum+=q*rt;
+        }
+      });
+      const rem=r2(total-sum);
+      if(!lines.length){
+        const names=(s[2]||[]).map(x=>Array.isArray(x)?x[0]:String(x)).join(', ');
+        lines.push({key:key+'#T',billKey:key,type:'amount',name:names||'Bill total',our:total,fixable:false});
+      }else if(Math.abs(rem)>=0.5){
+        lines.push({key:key+'#R',billKey:key,type:'amount',name:'Other / discount / rounding on this bill',our:rem,fixable:false});
+      }
+      out.push({key,hist:true,date:s[0],ref:'Pre-ERP bill',total,lines});
     });
     state.purchases.filter(p=>p.partyId===party.id&&inWin(p.date)).forEach(p=>{
       const lines=[];
@@ -4114,11 +4137,12 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
     return out.sort((a,b)=>a.date.localeCompare(b.date));
   },[party.id]);
   const allLines=useMemo(()=>bills.flatMap(b=>b.lines),[bills]);
+  const billKeys=useMemo(()=>new Set(bills.map(b=>b.key)),[bills]);
 
   const pays=useMemo(()=>{
     const out=[];
-    (SUPPLIER_HISTORY[party.name]?.p||[]).forEach((p,i)=>{if(inWin(p[0]))out.push({key:'HP'+i,date:p[0],amount:r2(p[1]),desc:'Paid — '+(p[2]||'Cash/Bank')});});
-    state.supplierPayments.filter(p=>p.partyId===party.id&&inWin(p.date)).forEach(p=>out.push({key:p.id,date:p.date,amount:r2(p.amount),desc:p.notes||('Paid — '+(ACC_MAP[p.account]?.short||p.account||'—'))}));
+    (SUPPLIER_HISTORY[party.name]?.p||[]).forEach((p,i)=>{if(inWin(p[0]))out.push({key:'HP'+i,hist:true,date:p[0],amount:r2(p[1]),desc:'Paid — '+(p[2]||'Cash/Bank')});});
+    state.supplierPayments.filter(p=>p.partyId===party.id&&inWin(p.date)).forEach(p=>out.push({key:p.id,hist:false,txnId:p.txnId,date:p.date,amount:r2(p.amount),desc:p.notes||('Paid — '+(ACC_MAP[p.account]?.short||p.account||'—'))}));
     return out.sort((a,b)=>a.date.localeCompare(b.date));
   },[party.id]);
 
@@ -4152,15 +4176,21 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
   const dFix=sumRes('fix'),dAdj=sumRes('adjust'),dDis=sumRes('dispute');
   const nChecked=allLines.filter(l=>calcs[l.key].checked).length;
 
+  // delta = ours − seller's (a lower amount on the seller's side leaves THEIR
+  // balance higher, so it adds +delta to the seller's running balance).
   const payCalcs=useMemo(()=>{
     const m={};
     pays.forEach(p=>{
       const a=num(payChk[p.key]);
-      m[p.key]={checked:a!=null,sAmt:a!=null?r2(a):p.amount,delta:a!=null?r2(p.amount-a):0};
+      const delta=a!=null?r2(p.amount-a):0;
+      m[p.key]={checked:a!=null,sAmt:a!=null?r2(a):p.amount,delta,res:payRes[p.key]||'dispute',mismatch:a!=null&&delta!==0};
     });
     return m;
-  },[pays,payChk]);
-  const payDiff=r2(pays.reduce((s,p)=>s+payCalcs[p.key].delta,0));
+  },[pays,payChk,payRes]);
+  const payMism=pays.filter(p=>payCalcs[p.key].mismatch);
+  const sumPay=res=>r2(payMism.filter(p=>payCalcs[p.key].res===res).reduce((s,p)=>s+payCalcs[p.key].delta,0));
+  const payFix=sumPay('fix'),payAdj=sumPay('adjust'),payDis=sumPay('dispute');
+  const payDiff=r2(payFix+payAdj+payDis);
 
   const missedRows=missed.filter(m=>m.name||m.qty||m.rate);
   const missedAmt=m=>r2((num(m.qty)||0)*(num(m.rate)||0));
@@ -4170,19 +4200,24 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
   const extrasTotal=r2(extraRows.reduce((s,e)=>s+extraSigned(e),0));
 
   // ── The reconciliation waterfall ───────────────────────────────────────────
-  const ourAdjusted=r2(closingBalance+dFix+dAdj+missedTotal+extrasTotal);
   const sc=num(sellerClosing);
   const so=num(sellerOpening);
-  const diff=sc==null?null:r2(sc-ourAdjusted);
   const openDiff=so==null?0:r2(so-openingBalance);
-  // What's left after the differences we can already explain: lines we're
-  // disputing (seller says X, we kept Y), payments the seller recorded
-  // differently, and a different opening balance.
-  const unexplained=diff==null?null:r2(diff-dDis-payDiff-openDiff);
+  const dLines=r2(dFix+dAdj+dDis);
+  // What the seller's books add up to, given every figure typed in here:
+  const sellerCalc=r2(closingBalance+dLines+payDiff+missedTotal+extrasTotal+openDiff);
+  // What our books become once the accepted changes are posted:
+  const ourAdjusted=r2(closingBalance+dFix+dAdj+payFix+payAdj+missedTotal+extrasTotal);
+  // Still open with the seller after posting = the parts we kept as disputes.
+  const remaining=r2(sellerCalc-ourAdjusted);
+  const diff=sc==null?null:r2(sc-ourAdjusted);
+  // Seller's own statement balance vs what their figures here add up to — if
+  // this is non-zero there's still a bill/payment/charge not captured above.
+  const unexplained=sc==null?null:r2(sc-sellerCalc);
   const settleAmt=settleBasis==='seller'&&sc!=null?sc:ourAdjusted;
 
   // ── Autosave (debounced, silent) ───────────────────────────────────────────
-  const payload=useMemo(()=>({id:draftId,partyId:party.id,partyName:party.name,status:'draft',from:from||'',to:to||'',sellerClosing,sellerOpening,lines:ls,billOk,missed,extras,payChk,notes,settleBasis}),[draftId,party.id,party.name,from,to,sellerClosing,sellerOpening,ls,billOk,missed,extras,payChk,notes,settleBasis]);
+  const payload=useMemo(()=>({id:draftId,partyId:party.id,partyName:party.name,status:'draft',from:from||'',to:to||'',sellerClosing,sellerOpening,lines:ls,billOk,missed,extras,payChk,payRes,noteMap,notes,settleBasis}),[draftId,party.id,party.name,from,to,sellerClosing,sellerOpening,ls,billOk,missed,extras,payChk,payRes,noteMap,notes,settleBasis]);
   const lastSaved=useRef(JSON.stringify(payload));
   const latestPayload=useRef(payload);latestPayload.current=payload;
   // finished = this reconciliation was posted/saved as final; from then on the
@@ -4204,10 +4239,16 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
 
   // ── Updaters ───────────────────────────────────────────────────────────────
   const setL=(key,patch)=>setLs(p=>({...p,[key]:{...(p[key]||{}),...patch}}));
+  const setNote=(key,v)=>setNoteMap(p=>({...p,[key]:v}));
   const acceptAll=()=>{
     setLs(p=>{
       const n={...p};
       mism.forEach(l=>{n[l.key]={...(n[l.key]||{}),res:l.fixable?'fix':'adjust'};});
+      return n;
+    });
+    setPayRes(p=>{
+      const n={...p};
+      payMism.forEach(x=>{n[x.key]=(!x.hist&&payCalcs[x.key].sAmt>0)?'fix':'adjust';});
       return n;
     });
   };
@@ -4215,11 +4256,11 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
   const markAllBills=()=>{const n={};bills.forEach(b=>{n[b.key]=true;});setBillOk(n);};
   const clearAll=()=>{
     if(!window.confirm('Clear everything typed on this reconciliation and start over? (Nothing in your books changes.)'))return;
-    setLs({});setBillOk({});setMissed([]);setExtras([]);setPayChk({});setSellerClosing('');setSellerOpening('');setNotes('');
+    setLs({});setBillOk({});setMissed([]);setExtras([]);setPayChk({});setPayRes({});setNoteMap({});setSellerClosing('');setSellerOpening('');setNotes('');
   };
 
-  // Catalogue lookup for the "missed items" rows (name → item, so a missed
-  // item can be linked to stock when it's a real catalogue item).
+  // Catalogue lookup for missed-item rows (name → item, so a missed item can be
+  // linked to stock when it's a real catalogue item).
   const itemIndex=useMemo(()=>{
     const m=new Map();
     state.items.filter(it=>it.active!==false).forEach(it=>{
@@ -4234,7 +4275,8 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
     return[...seen.values()];
   },[]);
 
-  const addMissed=()=>setMissed(p=>[...p,{id:uid('MS'),date:to||today(),name:'',itemId:'',qty:'',rate:'',receive:true}]);
+  // billKey '' = not attached to any bill of ours (sits in the ledger on its own date).
+  const addMissed=(billKey='',date)=>setMissed(p=>[...p,{id:uid('MS'),billKey,date:date||to||today(),name:'',itemId:'',qty:'',rate:'',receive:true}]);
   const editMissed=(id,patch)=>setMissed(p=>p.map(m=>m.id!==id?m:{...m,...patch}));
   const setMissedName=(id,name)=>{
     const it=itemIndex.get(name.trim().toLowerCase());
@@ -4245,12 +4287,16 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
       return next;
     }));
   };
-  const addExtra=(label='',sign='plus')=>setExtras(p=>[...p,{id:uid('EX'),date:to||today(),label,sign,amount:''}]);
+  const addExtra=(billKey='',date,label='',sign='plus',kind='charge')=>setExtras(p=>[...p,{id:uid('EX'),billKey,date:date||to||today(),label,sign,kind,amount:''}]);
   const editExtra=(id,patch)=>setExtras(p=>p.map(e=>e.id!==id?e:{...e,...patch}));
+
+  // Date a missed/extra entry posts on: its bill's date when attached to a bill.
+  const billOf=k=>bills.find(b=>b.key===k);
+  const entryDate=e=>(e.billKey&&billOf(e.billKey))?billOf(e.billKey).date:e.date;
 
   // ── What "Post to books" will do ───────────────────────────────────────────
   const plan=useMemo(()=>{
-    const fix=[],adj=[];
+    const fix=[],adj=[],payFixes=[],payAdjs=[];
     mism.forEach(l=>{
       const c=calcs[l.key];
       const bill=bills.find(b=>b.key===l.billKey);
@@ -4262,22 +4308,27 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
         adj.push({date:bill.date,name:'Reconciliation adj — '+l.name+' ('+fmtD(bill.date)+')',amount:c.delta});
       }
     });
-    const miss=missedRows.map(m=>({...m,amount:missedAmt(m)}));
-    const ext=extraRows.map(e=>({...e,signed:extraSigned(e)}));
-    return{fix,adj,miss,ext,count:fix.length+adj.length+miss.length+ext.length};
-  },[mism,calcs,bills,missed,extras]);
+    payMism.forEach(p=>{
+      const c=payCalcs[p.key];
+      if(c.res==='fix'&&!p.hist&&c.sAmt>0)payFixes.push({id:p.key,txnId:p.txnId,date:p.date,desc:p.desc,oldAmt:p.amount,newAmt:c.sAmt,delta:c.delta});
+      else if(c.res==='adjust'||c.res==='fix')payAdjs.push({date:p.date,name:'Reconciliation adj — payment '+fmtD(p.date)+' ('+p.desc+')',amount:c.delta});
+    });
+    const miss=missedRows.map(m=>({...m,date:entryDate(m),amount:missedAmt(m)}));
+    const ext=extraRows.map(e=>({...e,date:entryDate(e),signed:extraSigned(e)}));
+    return{fix,adj,payFixes,payAdjs,miss,ext,count:fix.length+adj.length+payFixes.length+payAdjs.length+miss.length+ext.length};
+  },[mism,calcs,bills,payMism,payCalcs,missed,extras]);
 
   const validate=()=>{
     for(const m of missedRows){
       if(!m.name.trim())return'A missed-item row has no item name';
       if(!(num(m.qty)>0))return'Missed item "'+m.name+'" needs a quantity greater than 0';
       if(num(m.rate)==null||num(m.rate)<0)return'Missed item "'+m.name+'" needs a rate';
-      if(!m.date)return'Missed item "'+m.name+'" needs a date';
+      if(!entryDate(m))return'Missed item "'+m.name+'" needs a date';
     }
     for(const e of extraRows){
       if(!e.label.trim())return'An extra/entry row has no description';
-      if(!(num(e.amount)>0))return'Extra "'+e.label+'" needs an amount greater than 0 (use the +/− choice for credits)';
-      if(!e.date)return'Extra "'+e.label+'" needs a date';
+      if(!(num(e.amount)>0))return'"'+e.label+'" needs an amount greater than 0 (use the +/− choice for credits)';
+      if(!entryDate(e))return'"'+e.label+'" needs a date';
     }
     return'';
   };
@@ -4285,6 +4336,13 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
     const err=validate();
     if(err)return toast(err,'error');
     setStep('review');
+  };
+
+  const summaryObj=()=>({ourClosing:closingBalance,ourAdjusted,sellerClosing:sc,sellerCalc,difference:diff,disputed:dDis,paymentDisputed:payDis,openingDiff:openDiff,unexplained,settleBasis,settleAmt});
+  const finalize=(nowIso,posted)=>{
+    const rec={...payload,status:'posted',postedAt:nowIso,summary:summaryObj(),posted};
+    const had=state.supplierReconciliations.some(r=>r.id===draftId);
+    state.supplierReconciliations=had?state.supplierReconciliations.map(r=>r.id===draftId?{...r,...rec}:r):[rec,...state.supplierReconciliations];
   };
 
   const doPost=()=>{
@@ -4338,18 +4396,31 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
       }
     });
 
-    // Helper — a ledger-only entry (no catalogue item, no stock) carrying one
-    // signed amount, so it shows in the supplier ledger with its reason.
+    // Payments corrected to what the seller recorded — same fields the existing
+    // Edit Transaction screen updates (the supplier payment AND its bank/cash
+    // transaction, so account balances stay in step).
+    let txnsChanged=false;
+    plan.payFixes.forEach(f=>{
+      state.supplierPayments=state.supplierPayments.map(sp=>sp.id===f.id?{...sp,amount:f.newAmt,reconEdited:{reconId:draftId,at:nowIso,was:f.oldAmt}}:sp);
+      if(f.txnId){
+        state.txns=state.txns.map(t=>t.id===f.txnId?{...t,amount:(t.amount<0?-1:1)*f.newAmt}:t);
+        txnsChanged=true;
+      }
+    });
+
+    // A ledger-only entry (no catalogue item, no stock) carrying one signed
+    // amount, so it shows in the supplier ledger with its reason.
     const mkLedgerEntry=(date,name,amount,source)=>({id:newPurId(),date,bookedDate:date,receivedDate:date,status:'received',expectedDate:null,
       partyId:party.id,partyName:party.name,
       items:[{itemId:'',itemName:name,customerName:name,supplierName:name,qty:1,rate:amount,amount,peti:1,freightPerPeti:0,freightAmount:0}],
       total:amount,bilty:'',extraCharges:[],extraChargesTotal:0,totalPetis:0,freightAmount:0,source,reconId:draftId,createdAt:nowIso});
 
-    // Rate/qty differences accepted as a separate adjustment instead of editing the bill.
+    // Differences kept as separate adjustment entries instead of editing the original.
     plan.adj.forEach(a=>{if(a.amount)created.push(mkLedgerEntry(a.date,a.name,a.amount,'reconciliation-adjustment'));});
-    // ③ Extras / seller entries not yet in the books.
+    plan.payAdjs.forEach(a=>{if(a.amount)created.push(mkLedgerEntry(a.date,a.name,a.amount,'reconciliation-adjustment'));});
+    // Seller's extras / entries not yet in the books.
     plan.ext.forEach(e=>{if(e.signed)created.push(mkLedgerEntry(e.date,'Reconciliation — '+e.label.trim(),e.signed,'reconciliation-extra'));});
-    // ② Missed items → real purchase lines (stock moves only when "received").
+    // Missed items → real purchase lines (stock moves only when "received").
     const groups={};
     plan.miss.forEach(m=>{const k=m.date+'|'+(m.receive?'R':'P');(groups[k]||=[]).push(m);});
     Object.entries(groups).forEach(([k,rows])=>{
@@ -4367,13 +4438,11 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
     });
 
     state.purchases=[...created,...purchases];
-    const rec={...payload,status:'posted',postedAt:nowIso,
-      summary:{ourClosing:closingBalance,ourAdjusted,sellerClosing:sc,difference:diff,disputed:dDis,paymentDiff:payDiff,openingDiff:openDiff,unexplained,settleBasis,settleAmt},
-      posted:{fixed:plan.fix.length,adjusted:plan.adj.length,missed:plan.miss.length,extras:plan.ext.length}};
-    const had=state.supplierReconciliations.some(r=>r.id===draftId);
-    state.supplierReconciliations=had?state.supplierReconciliations.map(r=>r.id===draftId?{...r,...rec}:r):[rec,...state.supplierReconciliations];
+    finalize(nowIso,{fixed:plan.fix.length,adjusted:plan.adj.length,paymentsFixed:plan.payFixes.length,paymentsAdjusted:plan.payAdjs.length,missed:plan.miss.length,extras:plan.ext.length});
     save.purchases();
     if(freightChanged)save.freightCharges();
+    if(plan.payFixes.length)save.supplierPayments();
+    if(txnsChanged)save.txns();
     Object.entries(stock).forEach(([id,delta])=>adjustStock(id,delta));
     save.supplierReconciliations();
     toast('Reconciliation posted ✓ '+plan.count+' change'+(plan.count===1?'':'s')+' applied to your books');
@@ -4383,11 +4452,7 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
 
   const finishWithoutPosting=()=>{
     finished.current=true;
-    const rec={...payload,status:'posted',postedAt:new Date().toISOString(),
-      summary:{ourClosing:closingBalance,ourAdjusted,sellerClosing:sc,difference:diff,disputed:dDis,paymentDiff:payDiff,openingDiff:openDiff,unexplained,settleBasis,settleAmt},
-      posted:{fixed:0,adjusted:0,missed:0,extras:0}};
-    const had=state.supplierReconciliations.some(r=>r.id===draftId);
-    state.supplierReconciliations=had?state.supplierReconciliations.map(r=>r.id===draftId?{...r,...rec}:r):[rec,...state.supplierReconciliations];
+    finalize(new Date().toISOString(),{fixed:0,adjusted:0,paymentsFixed:0,paymentsAdjusted:0,missed:0,extras:0});
     save.supplierReconciliations();
     toast('Reconciliation saved ✓');
     onClose();
@@ -4397,15 +4462,19 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
   const sendNote=()=>{
     const lines=[];
     mism.filter(l=>calcs[l.key].res==='dispute').forEach(l=>{
-      const c=calcs[l.key],b=bills.find(x=>x.key===l.billKey);
+      const c=calcs[l.key],b=billOf(l.billKey);
       if(l.type==='item')lines.push('• '+fmtD(b.date)+' '+l.name+': your bill qty '+c.sQty+' × ₹'+c.sRate+' = '+fmt(c.sAmt)+' | our record qty '+l.qty+' × ₹'+l.rate+' = '+fmt(l.our)+' (diff '+sgn(c.delta)+')'+(c.note?' — '+c.note:''));
       else lines.push('• '+fmtD(b.date)+' '+l.name+': your figure '+fmt(c.sAmt)+' | ours '+fmt(l.our)+' (diff '+sgn(c.delta)+')'+(c.note?' — '+c.note:''));
     });
-    pays.filter(p=>payCalcs[p.key].checked&&payCalcs[p.key].delta!==0).forEach(p=>{
+    payMism.filter(p=>payCalcs[p.key].res==='dispute').forEach(p=>{
       lines.push('• Payment '+fmtD(p.date)+': we paid '+fmt(p.amount)+' | you show '+fmt(payCalcs[p.key].sAmt));
     });
+    const noteLines=[];
+    bills.forEach(b=>{if((noteMap[b.key]||'').trim())noteLines.push('• '+fmtD(b.date)+' bill: '+noteMap[b.key].trim());});
+    pays.forEach(p=>{if((noteMap['p'+p.key]||'').trim())noteLines.push('• '+fmtD(p.date)+' payment: '+noteMap['p'+p.key].trim());});
     let msg='Hi '+party.name+', we are reconciling our accounts'+(from||to?' ('+(from?fmtD(from):'start')+' to '+(to?fmtD(to):'today')+')':'')+'.\n\n';
     if(lines.length)msg+='Please check these on your side:\n'+lines.join('\n')+'\n\n';
+    if(noteLines.length)msg+='Notes:\n'+noteLines.join('\n')+'\n\n';
     msg+='Our balance after adjustments: '+balTxt(ourAdjusted)+'\n';
     if(sc!=null)msg+='Your balance: '+balTxt(sc)+'\nDifference: '+sgn(diff)+'\n';
     if(notes.trim())msg+='\n'+notes.trim()+'\n';
@@ -4416,26 +4485,109 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
 
   // ── Rendering helpers (plain functions — NOT components — so inputs keep
   //    focus across re-renders) ───────────────────────────────────────────────
-  const inp={width:66,padding:'4px 6px',borderRadius:5,border:`1.5px solid ${C.bdr}`,fontSize:12,textAlign:'right',fontFamily:'inherit',outline:'none',boxSizing:'border-box',background:'#fff',color:C.txt};
-  const th=(al='right')=>({padding:'6px 8px',fontSize:10,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.4,textAlign:al,borderBottom:`1px solid ${C.bdr}`,whiteSpace:'nowrap',background:'#F6F8FA'});
-  const td=(al='right')=>({padding:'5px 8px',fontSize:12,textAlign:al,color:C.txt,fontVariantNumeric:'tabular-nums',whiteSpace:al==='left'?'normal':'nowrap'});
-  const sec=(n,title,sub,right,children)=><div style={{border:`1px solid ${C.bdr}`,borderRadius:10,marginBottom:14,background:C.surf,overflow:'hidden'}}>
-    <div style={{display:'flex',alignItems:'center',gap:10,padding:'10px 14px',background:'#F9FAFB',borderBottom:`1px solid ${C.bdr}`,flexWrap:'wrap'}}>
-      <span style={{width:22,height:22,borderRadius:'50%',background:C.blue,color:'#fff',fontSize:12,fontWeight:800,display:'inline-flex',alignItems:'center',justifyContent:'center'}}>{n}</span>
-      <div style={{flex:1,minWidth:180}}><div style={{fontSize:13,fontWeight:700,color:C.txt}}>{title}</div>{sub&&<div style={{fontSize:11,color:C.sub}}>{sub}</div>}</div>
-      {right}
-    </div>
-    <div style={{padding:'10px 14px'}}>{children}</div>
-  </div>;
-  const statusBadge=s=>s==='match'?<Badge v="✓ Match" color="green"/>:s==='mismatch'?<Badge v="✗ Mismatch" color="red"/>:<Badge v="Not checked" color="gray"/>;
+  const inp={width:62,padding:'3px 5px',borderRadius:5,border:`1.5px solid ${C.bdr}`,fontSize:12,textAlign:'right',fontFamily:'inherit',outline:'none',boxSizing:'border-box',background:'#fff',color:C.txt};
+  const th=(al='right',extra)=>({padding:'6px 7px',fontSize:10,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.4,textAlign:al,borderBottom:`1px solid ${C.bdr}`,whiteSpace:'nowrap',background:'#F6F8FA',...extra});
+  const td=(al='right',extra)=>({padding:'4px 7px',fontSize:12,textAlign:al,color:C.txt,fontVariantNumeric:'tabular-nums',whiteSpace:al==='left'?'normal':'nowrap',...extra});
+  const SEL={borderLeft:`2px solid ${C.blue}`};      // first column of the seller block
+  const xbtn=onClick=><button onClick={onClick} title="Remove" style={{border:'none',background:'transparent',color:C.red,cursor:'pointer',fontSize:14,padding:'0 4px'}}>✕</button>;
+  const miniBtn=(label,onClick,color=C.blue)=><button onClick={onClick} style={{padding:'2px 9px',borderRadius:12,border:`1px solid ${color}`,background:'#fff',color,fontSize:11,fontWeight:600,cursor:'pointer',fontFamily:'inherit',whiteSpace:'nowrap'}}>{label}</button>;
+  const balCells=(b,gapBold)=>{
+    const gap=r2(b.sel-b.our);
+    return <>
+      <td style={{...td(),fontWeight:700}}>{fmt(b.our)}</td>
+      <td style={{...td(),...SEL,fontWeight:700}}>{fmt(b.sel)}</td>
+      <td style={{...td(),fontWeight:gapBold?800:600,color:gap===0?C.muted:gap>0?C.red:C.green}}>{gap===0?'—':sgn(gap)}</td>
+    </>;
+  };
+  const COLS=12;
 
+  // Running balances for both sides, row by row — ours from the books, the
+  // seller's from our figures + whatever was typed against each row.
+  const walk=(()=>{
+    const B={};
+    let our=openingBalance,sel=so!=null?so:openingBalance;
+    const snap=k=>{B[k]={our:r2(our),sel:r2(sel)};};
+    const items=[];
+    bills.forEach(b=>items.push({t:'bill',date:b.date,ord:0,b}));
+    pays.forEach(p=>items.push({t:'pay',date:p.date,ord:1,p}));
+    missed.filter(m=>!m.billKey||!billKeys.has(m.billKey)).forEach(m=>items.push({t:'freeM',date:m.date||'',ord:2,m}));
+    extras.filter(e=>!e.billKey||!billKeys.has(e.billKey)).forEach(e=>items.push({t:'freeX',date:e.date||'',ord:2,e}));
+    items.forEach((it,i)=>{it.i=i;});
+    items.sort((a,b)=>a.date.localeCompare(b.date)||a.ord-b.ord||a.i-b.i);
+    items.forEach(it=>{
+      if(it.t==='bill'){
+        const b=it.b;
+        b.lines.forEach(l=>{our+=l.our;sel+=calcs[l.key].sAmt;snap(l.key);});
+        missed.filter(m=>m.billKey===b.key).forEach(m=>{sel+=missedAmt(m);snap('m'+m.id);});
+        extras.filter(e=>e.billKey===b.key).forEach(e=>{sel+=extraSigned(e);snap('x'+e.id);});
+        snap('T'+b.key);
+      }else if(it.t==='pay'){
+        our-=it.p.amount;sel-=payCalcs[it.p.key].sAmt;snap('p'+it.p.key);
+      }else if(it.t==='freeM'){sel+=missedAmt(it.m);snap('m'+it.m.id);}
+      else{sel+=extraSigned(it.e);snap('x'+it.e.id);}
+    });
+    return{B,items,ourEnd:r2(our),selEnd:r2(sel)};
+  })();
+  const walkGap=r2(closingBalance-walk.ourEnd);
+
+  const statusBadge=s=>s==='match'?<Badge v="✓ Match" color="green"/>:s==='mismatch'?<Badge v="✗ Mismatch" color="red"/>:<Badge v="Not checked" color="gray"/>;
   const billMismCount=b=>b.lines.filter(l=>calcs[l.key].status==='mismatch').length;
   const billChecked=b=>b.lines.every(l=>calcs[l.key].checked);
-  const shownBills=bills.filter(b=>filter==='all'?true:filter==='attention'?billMismCount(b)>0:!billChecked(b));
+  const showItem=it=>{
+    if(filter==='all')return true;
+    if(it.t==='bill')return filter==='attention'?(billMismCount(it.b)>0):!billChecked(it.b);
+    if(it.t==='pay')return filter==='attention'?payCalcs[it.p.key].mismatch:!payCalcs[it.p.key].checked;
+    return true;                                  // seller-only entries are always relevant
+  };
+  const noteBox=(key,placeholder)=>(noteOpen[key]||(noteMap[key]||'').trim())?
+    <tr><td colSpan={COLS} style={{padding:'2px 8px 6px',background:'#FFFDF5'}}>
+      <input value={noteMap[key]||''} onChange={e=>setNote(key,e.target.value)} placeholder={placeholder||'📝 Note…'}
+        style={{...inp,width:'100%',textAlign:'left',fontSize:11,borderColor:C.amber}}/></td></tr>:null;
+  const noteToggle=key=><button onClick={()=>setNoteOpen(p=>({...p,[key]:!p[key]}))} title="Add / edit note"
+    style={{border:'none',background:'transparent',cursor:'pointer',fontSize:13,padding:'0 3px',opacity:(noteMap[key]||'').trim()?1:.45}}>📝</button>;
+
+  // A seller-only row: a missed item or an extra, inline on a bill or standalone.
+  const missedRow=(m,standalone)=>{
+    const b=walk.B['m'+m.id]||{our:0,sel:0};
+    return <tr key={'m'+m.id} style={{background:'#F3F9FF',borderTop:`1px solid ${C.bdr}`}}>
+      <td style={td('left')}>{standalone?<input type="date" value={m.date} onChange={e=>editMissed(m.id,{date:e.target.value})} style={{...inp,width:118,textAlign:'left'}}/>:''}</td>
+      <td style={td('left')}>
+        <div style={{display:'flex',alignItems:'center',gap:6}}><Badge v="➕ missed item" color="blue"/>
+          <input list="recon-item-names" value={m.name} onChange={e=>setMissedName(m.id,e.target.value)} placeholder="Item name…" style={{...inp,width:mobile?150:210,textAlign:'left'}}/></div>
+        <div style={{fontSize:10,marginLeft:2,color:m.itemId?C.green:(m.name?C.amber:C.muted)}}>{m.itemId?'✓ linked to catalogue':(m.name?'not in catalogue — no stock change':' ')}</div></td>
+      <td style={td()}>—</td><td style={td()}>—</td><td style={td()}>—</td>
+      <td style={{...td(),...SEL}}><input value={m.qty} onChange={e=>editMissed(m.id,{qty:e.target.value})} inputMode="decimal" placeholder="qty" style={inp}/></td>
+      <td style={td()}><input value={m.rate} onChange={e=>editMissed(m.id,{rate:e.target.value})} inputMode="decimal" placeholder="rate" style={inp}/></td>
+      <td style={{...td(),fontWeight:700}}>{fmt(missedAmt(m))}</td>
+      <td style={td()}>{fmt(b.our)}</td><td style={td()}>{fmt(b.sel)}</td>
+      <td style={td()}></td>
+      <td style={td('left')}><label style={{display:'inline-flex',alignItems:'center',gap:3,fontSize:11,color:C.sub,cursor:'pointer'}}><input type="checkbox" checked={m.receive!==false} onChange={e=>editMissed(m.id,{receive:e.target.checked})}/>received</label>{xbtn(()=>setMissed(p=>p.filter(x=>x.id!==m.id)))}</td>
+    </tr>;
+  };
+  const extraRow=(e,standalone)=>{
+    const b=walk.B['x'+e.id]||{our:0,sel:0};
+    const isPay=e.kind==='payment';
+    return <tr key={'x'+e.id} style={{background:isPay?'#F6FFF6':'#FFF9F0',borderTop:`1px solid ${C.bdr}`}}>
+      <td style={td('left')}>{standalone?<input type="date" value={e.date} onChange={ev=>editExtra(e.id,{date:ev.target.value})} style={{...inp,width:118,textAlign:'left'}}/>:''}</td>
+      <td style={td('left')}>
+        <div style={{display:'flex',alignItems:'center',gap:6}}><Badge v={isPay?'➕ payment seller has':'➕ extra / entry'} color={isPay?'green':'amber'}/>
+          <input list="recon-extra-names" value={e.label} onChange={ev=>editExtra(e.id,{label:ev.target.value})} placeholder="e.g. Freight, Interest, Discount" style={{...inp,width:mobile?150:210,textAlign:'left'}}/></div></td>
+      <td style={td()}>—</td><td style={td()}>—</td><td style={td()}>—</td>
+      <td style={{...td(),...SEL}}>—</td><td style={td()}>—</td>
+      <td style={td()}><input value={e.amount} onChange={ev=>editExtra(e.id,{amount:ev.target.value})} inputMode="decimal" placeholder="amount" style={{...inp,width:76,fontWeight:700,color:e.sign==='minus'?C.green:C.red}}/></td>
+      <td style={td()}>{fmt(b.our)}</td><td style={td()}>{fmt(b.sel)}</td>
+      <td style={td()}></td>
+      <td style={td('left')}>
+        <select value={e.sign} onChange={ev=>editExtra(e.id,{sign:ev.target.value})} style={{padding:'2px 4px',borderRadius:5,border:`1.5px solid ${C.bdr}`,fontSize:11,fontFamily:'inherit',background:'#fff'}}>
+          <option value="plus">+ I owe more</option><option value="minus">− I owe less</option></select>{xbtn(()=>setExtras(p=>p.filter(x=>x.id!==e.id)))}</td>
+    </tr>;
+  };
 
   // ═════════════════════════════ REVIEW STEP ═════════════════════════════════
   if(step==='review'){
-    const effect=r2(dFix+dAdj+missedTotal+extrasTotal);
+    const effect=r2(dFix+dAdj+payFix+payAdj+missedTotal+extrasTotal);
+    const secT=t=><div style={{fontSize:12,fontWeight:700,color:C.txt,marginBottom:6}}>{t}</div>;
+    const rowL=(l,r,c)=><div style={{display:'flex',justifyContent:'space-between',gap:10,padding:'5px 0',borderBottom:`1px solid ${C.bdr}`,fontSize:12,flexWrap:'wrap'}}><span style={{color:C.txt}}>{l}</span><span style={{fontWeight:700,color:c}}>{r}</span></div>;
     return <Modal title={'Review & post — '+party.name} onClose={onClose} width={820}>
       <TC/>
       <div style={{padding:'8px 12px',borderRadius:8,background:C.amberSoft,color:C.amber,fontSize:12,fontWeight:600,marginBottom:12}}>
@@ -4443,7 +4595,7 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
       </div>
       {plan.count===0&&<div style={{padding:16,textAlign:'center',color:C.sub,fontSize:13}}>Nothing to post — no accepted corrections, missed items or extras.</div>}
       {plan.fix.length>0&&<div style={{marginBottom:14}}>
-        <div style={{fontSize:12,fontWeight:700,color:C.txt,marginBottom:6}}>① Correct my existing entries ({plan.fix.length})</div>
+        {secT('Correct my existing bill lines ('+plan.fix.length+')')}
         <div style={{overflowX:'auto'}}><table style={{width:'100%',borderCollapse:'collapse'}}>
           <thead><tr><th style={th('left')}>Bill</th><th style={th('left')}>Item</th><th style={th()}>Was</th><th style={th()}>Becomes</th><th style={th()}>Balance Δ</th><th style={th()}>Stock</th></tr></thead>
           <tbody>{plan.fix.map((f,i)=>{
@@ -4457,26 +4609,25 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
             </tr>;})}</tbody>
         </table></div>
       </div>}
-      {plan.adj.length>0&&<div style={{marginBottom:14}}>
-        <div style={{fontSize:12,fontWeight:700,color:C.txt,marginBottom:6}}>① Post as separate adjustment entries ({plan.adj.length}) — original bills stay untouched</div>
-        {plan.adj.map((a,i)=><div key={i} style={{display:'flex',justifyContent:'space-between',gap:10,padding:'5px 0',borderBottom:`1px solid ${C.bdr}`,fontSize:12}}>
-          <span style={{color:C.txt}}>{a.name}</span><span style={{fontWeight:700,color:a.amount>0?C.red:C.green}}>{sgn(a.amount)}</span></div>)}
+      {plan.payFixes.length>0&&<div style={{marginBottom:14}}>
+        {secT('Correct my payment records ('+plan.payFixes.length+') — also updates the bank/cash entry')}
+        {plan.payFixes.map((f,i)=><div key={i}>{rowL(fmtD(f.date)+' · '+f.desc+' · '+fmt(f.oldAmt)+' → '+fmt(f.newAmt),sgn(f.delta),f.delta>0?C.red:C.green)}</div>)}
+      </div>}
+      {(plan.adj.length+plan.payAdjs.length)>0&&<div style={{marginBottom:14}}>
+        {secT('Post as separate adjustment entries ('+(plan.adj.length+plan.payAdjs.length)+') — originals stay untouched')}
+        {[...plan.adj,...plan.payAdjs].map((a,i)=><div key={i}>{rowL(a.name,sgn(a.amount),a.amount>0?C.red:C.green)}</div>)}
       </div>}
       {plan.miss.length>0&&<div style={{marginBottom:14}}>
-        <div style={{fontSize:12,fontWeight:700,color:C.txt,marginBottom:6}}>② Missed items added as new purchases ({plan.miss.length})</div>
-        {plan.miss.map((m,i)=><div key={i} style={{display:'flex',justifyContent:'space-between',gap:10,padding:'5px 0',borderBottom:`1px solid ${C.bdr}`,fontSize:12,flexWrap:'wrap'}}>
-          <span style={{color:C.txt}}>{fmtD(m.date)} · {m.name} · {m.qty} × ₹{m.rate}
-            <span style={{color:m.receive&&m.itemId?C.blue:C.muted,marginLeft:8}}>{m.receive?(m.itemId?'stock +'+m.qty:'received · not a catalogue item, no stock change'):'not received yet (shows as a pending purchase)'}</span></span>
-          <span style={{fontWeight:700,color:C.red}}>{sgn(m.amount)}</span></div>)}
+        {secT('Missed items added as new purchases ('+plan.miss.length+')')}
+        {plan.miss.map((m,i)=><div key={i}>{rowL(<>{fmtD(m.date)} · {m.name} · {m.qty} × ₹{m.rate}<span style={{color:m.receive&&m.itemId?C.blue:C.muted,marginLeft:8}}>{m.receive?(m.itemId?'stock +'+m.qty:'received · not a catalogue item, no stock change'):'not received yet (shows as a pending purchase)'}</span></>,sgn(m.amount),C.red)}</div>)}
       </div>}
       {plan.ext.length>0&&<div style={{marginBottom:14}}>
-        <div style={{fontSize:12,fontWeight:700,color:C.txt,marginBottom:6}}>③ Seller's extras / entries added ({plan.ext.length})</div>
-        {plan.ext.map((e,i)=><div key={i} style={{display:'flex',justifyContent:'space-between',gap:10,padding:'5px 0',borderBottom:`1px solid ${C.bdr}`,fontSize:12}}>
-          <span style={{color:C.txt}}>{fmtD(e.date)} · {e.label}</span><span style={{fontWeight:700,color:e.signed>0?C.red:C.green}}>{sgn(e.signed)}</span></div>)}
+        {secT("Seller's extras / entries added ("+plan.ext.length+')')}
+        {plan.ext.map((e,i)=><div key={i}>{rowL(fmtD(e.date)+' · '+e.label,sgn(e.signed),e.signed>0?C.red:C.green)}</div>)}
       </div>}
       <div style={{display:'flex',justifyContent:'space-between',padding:'10px 12px',borderRadius:8,background:'#F6F8FA',fontSize:13,fontWeight:700,marginBottom:8}}>
         <span>Net change to what you owe {party.name}</span><span style={{color:effect>0?C.red:effect<0?C.green:C.txt}}>{effect===0?'₹0':sgn(effect)}</span></div>
-      <div style={{display:'flex',justifyContent:'space-between',fontSize:12,color:C.sub,marginBottom:14}}>
+      <div style={{display:'flex',justifyContent:'space-between',fontSize:12,color:C.sub,marginBottom:14,flexWrap:'wrap',gap:6}}>
         <span>Balance {fmt(closingBalance)} → <b style={{color:C.txt}}>{balTxt(ourAdjusted)}</b></span>
         {sc!=null&&<span>Seller says {balTxt(sc)} · remaining difference <b style={{color:diff===0?C.green:C.red}}>{diff===0?'none ✓':sgn(diff)}</b></span>}</div>
       <div style={{display:'flex',gap:8,justifyContent:'flex-end'}}>
@@ -4490,17 +4641,18 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
 
   // ═════════════════════════════ WORKING STEP ════════════════════════════════
   const diffColor=diff==null?C.muted:diff===0?C.green:C.red;
-  return <Modal title={'Reconcile with '+party.name} onClose={onClose} width={1000}>
+  const shown=walk.items.filter(showItem);
+  const openGap=r2((so!=null?so:openingBalance)-openingBalance);
+  return <Modal title={'Reconcile with '+party.name} onClose={onClose} width={1240}>
     <TC/>
     <div style={{fontSize:12,color:C.sub,marginBottom:10}}>
       Period: <b style={{color:C.txt}}>{from?fmtD(from):'Beginning'} → {to?fmtD(to):'Today'}</b>
-      {' · '}Type the seller's figures from their bill/statement. Anything left blank is treated as "matches". Your books change only when you press <b>Post to books</b>.
+      {' · '}Read down the ledger: <b>your books on the left, the seller's on the right</b>, with both running balances. Type the seller's figure only where it differs — blank means "matches". Your books change only when you press <b>Post to books</b>.
       {existing&&<span style={{marginLeft:8,color:C.blue,fontWeight:600}}>↺ Resumed your saved draft</span>}
       {lastPosted&&<span style={{marginLeft:8,color:C.muted}}>Last reconciled {fmtD((lastPosted.postedAt||'').slice(0,10))}{lastPosted.summary?.difference!=null?' · difference then '+fmt(Math.abs(lastPosted.summary.difference)):''}</span>}
     </div>
 
-    {/* Seller's balances */}
-    <div style={{display:'grid',gridTemplateColumns:mobile?'1fr':'repeat(4,1fr)',gap:10,marginBottom:14}}>
+    <div style={{display:'grid',gridTemplateColumns:mobile?'1fr 1fr':'repeat(4,1fr)',gap:10,marginBottom:12}}>
       <div style={{padding:'8px 12px',borderRadius:8,border:`1px solid ${C.bdr}`,background:C.surf}}>
         <div style={{fontSize:10,fontWeight:700,color:C.sub,textTransform:'uppercase'}}>Our closing balance</div>
         <div style={{fontSize:18,fontWeight:800,color:C.txt}}>{balTxt(closingBalance)}</div>
@@ -4510,187 +4662,215 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
         <input value={sellerClosing} onChange={e=>setSellerClosing(e.target.value)} inputMode="decimal" placeholder="From their statement"
           style={{...inp,width:'100%',textAlign:'left',fontSize:15,fontWeight:700,marginTop:2}}/></div>
       <div style={{padding:'8px 12px',borderRadius:8,border:`1px solid ${C.bdr}`,background:C.surf}}>
-        <div style={{fontSize:10,fontWeight:700,color:C.sub,textTransform:'uppercase'}}>Seller's opening balance</div>
-        <input value={sellerOpening} onChange={e=>setSellerOpening(e.target.value)} inputMode="decimal" placeholder="Optional"
-          style={{...inp,width:'100%',textAlign:'left',fontSize:14,marginTop:2}}/>
-        {so!=null&&openDiff!==0&&<div style={{fontSize:10,color:C.amber,fontWeight:600}}>differs from ours by {sgn(openDiff)}</div>}</div>
+        <div style={{fontSize:10,fontWeight:700,color:C.sub,textTransform:'uppercase'}}>Seller's figures add up to</div>
+        <div style={{fontSize:18,fontWeight:800,color:C.txt}}>{balTxt(sellerCalc)}</div>
+        <div style={{fontSize:10,color:unexplained?C.red:C.muted}}>{unexplained==null?'enter their closing balance to compare':unexplained===0?'✓ matches their statement':'statement differs by '+sgn(unexplained)+' — something is still missing'}</div></div>
       <div style={{padding:'8px 12px',borderRadius:8,border:`1.5px solid ${diffColor}`,background:'#fff'}}>
         <div style={{fontSize:10,fontWeight:700,color:C.sub,textTransform:'uppercase'}}>Difference (seller − ours adjusted)</div>
-        <div style={{fontSize:18,fontWeight:800,color:diffColor}}>{diff==null?'Enter seller balance':diff===0?'✓ Reconciled':sgn(diff)}</div>
+        <div style={{fontSize:18,fontWeight:800,color:diffColor}}>{diff==null?'—':diff===0?'✓ Reconciled':sgn(diff)}</div>
         <div style={{fontSize:10,color:C.muted}}>Ours after changes {balTxt(ourAdjusted)}</div></div>
     </div>
 
-    {/* ① Match rates & qty */}
-    {sec(1,'Match billed rates & quantities','Compare each bill line with the seller\'s bill. Type only what differs (a rate, a qty, or both) — or tick a whole bill as matching.',
-      <div style={{display:'flex',gap:6,flexWrap:'wrap',alignItems:'center'}}>
-        {[['all','All'],['attention','Mismatches'],['todo','Not fully checked']].map(([k,l])=>
-          <button key={k} onClick={()=>setFilter(k)} style={{padding:'3px 10px',borderRadius:14,border:`1px solid ${filter===k?C.blue:C.bdr}`,background:filter===k?C.blueSoft:'#fff',color:filter===k?C.blue:C.sub,fontSize:11,fontWeight:600,cursor:'pointer',fontFamily:'inherit'}}>{l}</button>)}
-        <Btn onClick={markAllBills} size="sm" variant="secondary">✓ All bills match</Btn>
-        {mism.length>0&&<Btn onClick={acceptAll} size="sm" variant="secondary">Accept all seller figures</Btn>}
-      </div>,
-      <>
-        {bills.length===0&&<div style={{padding:12,color:C.sub,fontSize:12}}>No purchase bills from this supplier in the selected period.</div>}
-        {shownBills.length===0&&bills.length>0&&<div style={{padding:12,color:C.sub,fontSize:12}}>Nothing in this view.</div>}
-        {shownBills.map(b=>{
-          const mc=billMismCount(b),ok=!!billOk[b.key];
-          return <div key={b.key} style={{border:`1px solid ${mc?C.red:C.bdr}`,borderRadius:8,marginBottom:10,overflow:'hidden'}}>
-            <div style={{display:'flex',alignItems:'center',gap:8,padding:'6px 10px',background:mc?C.redSoft:'#F9FAFB',flexWrap:'wrap'}}>
-              <span style={{fontSize:12,fontWeight:700,color:C.txt}}>{fmtD(b.date)}</span>
-              <span style={{fontSize:11,color:C.sub}}>{b.ref}</span>
-              {b.hist&&<Badge v="pre-ERP" color="gray"/>}
-              {!b.hist&&!b.received&&<Badge v="not received" color="amber"/>}
-              <span style={{flex:1}}/>
-              <span style={{fontSize:12,fontWeight:700,color:C.txt}}>{fmt(b.total)}</span>
-              {mc>0&&<Badge v={mc+' mismatch'+(mc>1?'es':'')} color="red"/>}
-              <label style={{display:'flex',alignItems:'center',gap:4,fontSize:11,color:C.sub,cursor:'pointer'}}>
-                <input type="checkbox" checked={ok} onChange={e=>markBill(b,e.target.checked)}/> Bill matches
-              </label>
-            </div>
-            <div style={{overflowX:'auto'}}><table style={{width:'100%',borderCollapse:'collapse',minWidth:mobile?760:0}}>
-              <thead><tr><th style={th('left')}>Item / charge</th><th style={th()}>Our qty</th><th style={th()}>Our rate</th><th style={th()}>Our amt</th>
-                <th style={th()}>Seller qty</th><th style={th()}>Seller rate</th><th style={th()}>Seller amt</th><th style={th()}>Δ</th><th style={th('left')}>Status / action</th></tr></thead>
-              <tbody>{b.lines.map(l=>{
-                const c=calcs[l.key],s=ls[l.key]||{};
-                return <Fragment key={l.key}>
-                  <tr style={{borderTop:`1px solid ${C.bdr}`,background:c.status==='mismatch'?'#FFF8F8':'transparent'}}>
-                    <td style={td('left')}>{l.name}{l.isCharge&&<span style={{fontSize:10,color:C.muted}}> (extra charge)</span>}</td>
-                    <td style={td()}>{l.type==='item'?l.qty:'—'}</td>
-                    <td style={td()}>{l.type==='item'?'₹'+l.rate:'—'}</td>
-                    <td style={td()}>{fmt(l.our)}</td>
-                    {l.type==='item'?<>
-                      <td style={td()}><input value={s.sQty??''} onChange={e=>setL(l.key,{sQty:e.target.value})} inputMode="decimal" placeholder={String(l.qty)} style={inp}/></td>
-                      <td style={td()}><input value={s.sRate??''} onChange={e=>setL(l.key,{sRate:e.target.value})} inputMode="decimal" placeholder={String(l.rate)} style={inp}/></td>
-                      <td style={{...td(),color:c.checked?C.txt:C.muted}}>{fmt(c.sAmt)}</td>
-                    </>:<>
-                      <td style={td()}>—</td><td style={td()}>—</td>
-                      <td style={td()}><input value={s.sAmt??''} onChange={e=>setL(l.key,{sAmt:e.target.value})} inputMode="decimal" placeholder={String(l.our)} style={{...inp,width:84}}/></td>
-                    </>}
-                    <td style={{...td(),fontWeight:700,color:c.delta>0?C.red:c.delta<0?C.green:C.muted}}>{c.status==='mismatch'?sgn(c.delta):c.status==='match'?'0':'—'}</td>
-                    <td style={td('left')}>
-                      {c.status!=='mismatch'?statusBadge(c.status):
-                        <select value={c.res} onChange={e=>setL(l.key,{res:e.target.value})} style={{padding:'3px 6px',borderRadius:5,border:`1.5px solid ${C.bdr}`,fontSize:11,fontFamily:'inherit',background:'#fff'}}>
-                          {l.fixable&&<option value="fix">Correct my entry</option>}
+    <div style={{display:'flex',gap:6,flexWrap:'wrap',alignItems:'center',marginBottom:8}}>
+      {[['all','All'],['attention','Mismatches'],['todo','Not fully checked']].map(([k,l])=>
+        <button key={k} onClick={()=>setFilter(k)} style={{padding:'3px 10px',borderRadius:14,border:`1px solid ${filter===k?C.blue:C.bdr}`,background:filter===k?C.blueSoft:'#fff',color:filter===k?C.blue:C.sub,fontSize:11,fontWeight:600,cursor:'pointer',fontFamily:'inherit'}}>{l}</button>)}
+      <Btn onClick={markAllBills} size="sm" variant="secondary">✓ All bills match</Btn>
+      {(mism.length>0||payMism.length>0)&&<Btn onClick={acceptAll} size="sm" variant="secondary">Accept all seller figures</Btn>}
+      <span style={{flex:1}}/>
+      <span style={{fontSize:11,color:C.sub}}>On the seller's bill but on none of my bills:</span>
+      {miniBtn('+ Missed item',()=>addMissed(''))}
+      {miniBtn('+ Charge / credit',()=>addExtra('',undefined,'', 'plus','charge'),C.amber)}
+      {miniBtn('+ Payment seller has',()=>addExtra('',undefined,'Payment received','minus','payment'),C.green)}
+    </div>
+
+    <div style={{border:`1px solid ${C.bdr}`,borderRadius:10,overflow:'hidden',marginBottom:14,background:C.surf}}>
+      <div style={{overflowX:'auto',maxHeight:mobile?undefined:'58vh',overflowY:'auto'}}>
+      <table style={{width:'100%',borderCollapse:'collapse',minWidth:1120}}>
+        <thead style={{position:'sticky',top:0,zIndex:2}}>
+          <tr>
+            <th colSpan={5} style={{...th('left'),background:'#EEF2F6',textAlign:'center'}}>MY BOOKS</th>
+            <th colSpan={4} style={{...th('left',SEL),background:C.blueSoft,color:C.blue,textAlign:'center'}}>SELLER'S BILL / STATEMENT (type here)</th>
+            <th colSpan={3} style={{...th('left'),background:'#EEF2F6',textAlign:'center'}}>RUNNING BALANCE</th>
+          </tr>
+          <tr>
+            <th style={th('left')}>Date</th><th style={th('left')}>Particulars</th><th style={th()}>Qty</th><th style={th()}>Rate</th><th style={th()}>Amount</th>
+            <th style={th('right',SEL)}>Qty</th><th style={th()}>Rate</th><th style={th()}>Amount</th><th style={th('left')}>Δ / action</th>
+            <th style={th()}>Mine</th><th style={th('right',SEL)}>Seller's</th><th style={th()}>Gap</th>
+          </tr>
+        </thead>
+        <tbody>
+          {/* Opening balance — the seller's opening is typed right here */}
+          <tr style={{background:'#F9FAFB',borderBottom:`1px solid ${C.bdr}`}}>
+            <td style={td('left')}></td><td style={{...td('left'),fontWeight:700}}>Opening balance</td>
+            <td colSpan={3}></td><td style={SEL} colSpan={3}></td>
+            <td style={td('left')}>{so!=null&&openGap!==0&&<span style={{fontSize:10,color:C.amber,fontWeight:600}}>differs {sgn(openGap)}</span>}</td>
+            <td style={{...td(),fontWeight:700}}>{fmt(openingBalance)}</td>
+            <td style={{...td(),...SEL}}><input value={sellerOpening} onChange={e=>setSellerOpening(e.target.value)} inputMode="decimal" placeholder={String(openingBalance)} style={{...inp,width:84,fontWeight:700}}/></td>
+            <td style={td()}>{openGap===0?'—':sgn(openGap)}</td>
+          </tr>
+          {shown.length===0&&<tr><td colSpan={COLS} style={{padding:14,textAlign:'center',color:C.sub,fontSize:12}}>{walk.items.length===0?'No bills or payments for this supplier in the selected period.':'Nothing in this view.'}</td></tr>}
+          {shown.map(it=>{
+            // ── a bill: header, lines, inline adds, note, total ──────────────
+            if(it.t==='bill'){
+              const b=it.b,mc=billMismCount(b),ok=!!billOk[b.key];
+              const inM=missed.filter(m=>m.billKey===b.key),inX=extras.filter(e=>e.billKey===b.key);
+              const sellerBillAmt=r2(b.lines.reduce((s,l)=>s+calcs[l.key].sAmt,0)+inM.reduce((s,m)=>s+missedAmt(m),0)+inX.reduce((s,e)=>s+extraSigned(e),0));
+              return <Fragment key={'b'+b.key}>
+                <tr style={{background:mc?C.redSoft:'#EEF6FF',borderTop:`2px solid ${C.bdr}`}}>
+                  <td colSpan={COLS} style={{padding:'5px 8px'}}>
+                    <div style={{display:'flex',alignItems:'center',gap:8,flexWrap:'wrap'}}>
+                      <span style={{fontSize:12,fontWeight:800,color:C.txt}}>🧾 {fmtD(b.date)}</span>
+                      <span style={{fontSize:11,color:C.sub}}>{b.ref}</span>
+                      {b.hist&&<Badge v="pre-ERP · adjust only" color="gray"/>}
+                      {!b.hist&&!b.received&&<Badge v="not received" color="amber"/>}
+                      {mc>0&&<Badge v={mc+' mismatch'+(mc>1?'es':'')} color="red"/>}
+                      <span style={{flex:1}}/>
+                      <label style={{display:'flex',alignItems:'center',gap:4,fontSize:11,color:C.sub,cursor:'pointer'}}><input type="checkbox" checked={ok} onChange={e=>markBill(b,e.target.checked)}/> Bill matches</label>
+                      {miniBtn('+ Missed item',()=>addMissed(b.key,b.date))}
+                      {miniBtn('+ Charge',()=>addExtra(b.key,b.date,'','plus','charge'),C.amber)}
+                      {miniBtn((noteMap[b.key]||'').trim()?'📝 Note ✓':'📝 Note',()=>setNoteOpen(p=>({...p,[b.key]:!p[b.key]})),C.sub)}
+                    </div>
+                  </td>
+                </tr>
+                {b.lines.map(l=>{
+                  const c=calcs[l.key],s=ls[l.key]||{},bal=walk.B[l.key];
+                  return <Fragment key={l.key}>
+                    <tr style={{borderTop:`1px solid ${C.bdr}`,background:c.status==='mismatch'?'#FFF8F8':'transparent'}}>
+                      <td style={td('left')}></td>
+                      <td style={td('left')}>{l.name}{l.isCharge&&<span style={{fontSize:10,color:C.muted}}> (extra charge)</span>}</td>
+                      <td style={td()}>{l.type==='item'?l.qty:'—'}</td>
+                      <td style={td()}>{l.type==='item'?'₹'+l.rate:'—'}</td>
+                      <td style={td()}>{fmt(l.our)}</td>
+                      {l.type==='item'?<>
+                        <td style={{...td(),...SEL}}><input value={s.sQty??''} onChange={e=>setL(l.key,{sQty:e.target.value})} inputMode="decimal" placeholder={String(l.qty)} style={inp}/></td>
+                        <td style={td()}><input value={s.sRate??''} onChange={e=>setL(l.key,{sRate:e.target.value})} inputMode="decimal" placeholder={String(l.rate)} style={inp}/></td>
+                        <td style={{...td(),color:c.checked?C.txt:C.muted}}>{fmt(c.sAmt)}</td>
+                      </>:<>
+                        <td style={{...td(),...SEL}}>—</td><td style={td()}>—</td>
+                        <td style={td()}><input value={s.sAmt??''} onChange={e=>setL(l.key,{sAmt:e.target.value})} inputMode="decimal" placeholder={String(l.our)} style={{...inp,width:80}}/></td>
+                      </>}
+                      <td style={td('left')}>
+                        {c.status!=='mismatch'?statusBadge(c.status):
+                          <div style={{display:'flex',alignItems:'center',gap:5}}>
+                            <b style={{color:c.delta>0?C.red:C.green}}>{sgn(c.delta)}</b>
+                            <select value={c.res} onChange={e=>setL(l.key,{res:e.target.value})} style={{padding:'2px 4px',borderRadius:5,border:`1.5px solid ${C.bdr}`,fontSize:11,fontFamily:'inherit',background:'#fff'}}>
+                              {l.fixable&&<option value="fix">Correct my entry</option>}
+                              <option value="adjust">Post as adjustment</option>
+                              <option value="dispute">Seller to correct</option>
+                            </select></div>}
+                      </td>
+                      {balCells(bal)}
+                    </tr>
+                    {c.status==='mismatch'&&<tr style={{background:'#FFF8F8'}}><td colSpan={COLS} style={{padding:'0 8px 5px 34px'}}>
+                      <input value={s.note??''} onChange={e=>setL(l.key,{note:e.target.value})} placeholder="Note on this line (optional) — included in the message to the seller"
+                        style={{...inp,width:'100%',textAlign:'left',fontSize:11}}/></td></tr>}
+                  </Fragment>;})}
+                {inM.map(m=>missedRow(m,false))}
+                {inX.map(e=>extraRow(e,false))}
+                <tr style={{background:'#F6F8FA',borderTop:`1px solid ${C.bdr}`}}>
+                  <td style={td('left')}></td><td style={{...td('left'),fontWeight:700,color:C.sub}}>Bill total</td>
+                  <td colSpan={2}></td><td style={{...td(),fontWeight:800}}>{fmt(b.total)}</td>
+                  <td style={SEL} colSpan={2}></td><td style={{...td(),fontWeight:800}}>{fmt(sellerBillAmt)}</td>
+                  <td style={td('left')}>{sellerBillAmt!==b.total&&<b style={{fontSize:11,color:sellerBillAmt>b.total?C.red:C.green}}>{sgn(r2(sellerBillAmt-b.total))}</b>}</td>
+                  {balCells(walk.B['T'+b.key],true)}
+                </tr>
+                {noteBox(b.key,'📝 Note on this bill (kept even if nothing changes)…')}
+              </Fragment>;
+            }
+            // ── a payment ────────────────────────────────────────────────────
+            if(it.t==='pay'){
+              const p=it.p,pc=payCalcs[p.key],bal=walk.B['p'+p.key];
+              return <Fragment key={'p'+p.key}>
+                <tr style={{borderTop:`2px solid ${C.bdr}`,background:pc.mismatch?'#FFF8F8':'#F6FFF6'}}>
+                  <td style={{...td('left'),fontWeight:700}}>💸 {fmtD(p.date)}</td>
+                  <td style={td('left')}>{p.desc}{p.hist&&<span style={{marginLeft:6}}><Badge v="pre-ERP" color="gray"/></span>} {noteToggle('p'+p.key)}</td>
+                  <td style={td()}>—</td><td style={td()}>—</td>
+                  <td style={{...td(),color:C.green,fontWeight:700}}>− {fmt(p.amount)}</td>
+                  <td style={{...td(),...SEL}}>—</td><td style={td()}>—</td>
+                  <td style={td()}><input value={payChk[p.key]??''} onChange={e=>setPayChk(x=>({...x,[p.key]:e.target.value}))} inputMode="decimal" placeholder={String(p.amount)} style={{...inp,width:80}}/></td>
+                  <td style={td('left')}>
+                    {!pc.mismatch?(pc.checked?<Badge v="✓ Match" color="green"/>:<Badge v="Not checked" color="gray"/>):
+                      <div style={{display:'flex',alignItems:'center',gap:5}}>
+                        <b style={{color:C.red}}>{sgn(pc.delta)}</b>
+                        <select value={pc.res} onChange={e=>setPayRes(x=>({...x,[p.key]:e.target.value}))} style={{padding:'2px 4px',borderRadius:5,border:`1.5px solid ${C.bdr}`,fontSize:11,fontFamily:'inherit',background:'#fff'}}>
+                          {!p.hist&&pc.sAmt>0&&<option value="fix">Correct my payment</option>}
                           <option value="adjust">Post as adjustment</option>
                           <option value="dispute">Seller to correct</option>
-                        </select>}
-                    </td>
-                  </tr>
-                  {c.status==='mismatch'&&<tr style={{background:'#FFF8F8'}}><td colSpan={9} style={{padding:'0 8px 6px'}}>
-                    <input value={s.note??''} onChange={e=>setL(l.key,{note:e.target.value})} placeholder="Note (optional) — included in the message to the seller"
-                      style={{...inp,width:'100%',textAlign:'left',fontSize:11}}/></td></tr>}
-                </Fragment>;})}
-              </tbody>
-            </table></div>
-          </div>;})}
-        <div style={{fontSize:11,color:C.muted}}>{nChecked} of {allLines.length} lines checked · {mism.length} mismatch{mism.length===1?'':'es'}</div>
-      </>)}
+                        </select></div>}
+                  </td>
+                  {balCells(bal)}
+                </tr>
+                {noteBox('p'+p.key,'📝 Note on this payment…')}
+              </Fragment>;
+            }
+            // ── a seller-only entry on its own date ──────────────────────────
+            return it.t==='freeM'?missedRow(it.m,true):extraRow(it.e,true);
+          })}
+          {/* Closing */}
+          <tr style={{background:'#EEF2F6',borderTop:`2px solid ${C.txt}`}}>
+            <td style={td('left')}></td><td style={{...td('left'),fontWeight:800}}>Closing balance</td>
+            <td colSpan={3}></td><td colSpan={3} style={SEL}></td><td style={td('left')}></td>
+            {balCells({our:walk.ourEnd,sel:walk.selEnd},true)}
+          </tr>
+        </tbody>
+      </table></div>
+      <div style={{padding:'6px 12px',fontSize:11,color:C.muted,borderTop:`1px solid ${C.bdr}`}}>
+        {nChecked} of {allLines.length} lines checked · {mism.length+payMism.length} mismatch{mism.length+payMism.length===1?'':'es'}
+        {walkGap!==0&&<span style={{color:C.amber,marginLeft:8}}>⚠ The bills and payments above add up to {fmt(walk.ourEnd)}, but your ledger closing balance is {fmt(closingBalance)} (difference {sgn(walkGap)} — usually an opening-balance carry-over or an entry outside this period).</span>}
+      </div>
+    </div>
+    <datalist id="recon-item-names">{itemNames.map(n=><option key={n} value={n}/>)}</datalist>
+    <datalist id="recon-extra-names">{extraNames.map(n=><option key={n} value={n}/>)}</datalist>
 
-    {/* ② Missed items */}
-    {sec(2,'Missed items — on the seller\'s bill, not in my books','Items the seller billed that you never entered. Posting adds them as a purchase (and to stock if marked received).',
-      <Btn onClick={addMissed} size="sm" variant="secondary">+ Add missed item</Btn>,
-      <>
-        {missed.length===0&&<div style={{padding:'6px 0',color:C.sub,fontSize:12}}>None added.</div>}
-        {missed.length>0&&<div style={{overflowX:'auto'}}><table style={{width:'100%',borderCollapse:'collapse',minWidth:mobile?720:0}}>
-          <thead><tr><th style={th('left')}>Bill date</th><th style={th('left')}>Item</th><th style={th()}>Qty</th><th style={th()}>Rate ₹</th><th style={th()}>Amount</th><th style={th('left')}>Received?</th><th style={th()}></th></tr></thead>
-          <tbody>{missed.map(m=><tr key={m.id} style={{borderTop:`1px solid ${C.bdr}`}}>
-            <td style={td('left')}><input type="date" value={m.date} onChange={e=>editMissed(m.id,{date:e.target.value})} style={{...inp,width:126,textAlign:'left'}}/></td>
-            <td style={td('left')}>
-              <input list="recon-item-names" value={m.name} onChange={e=>setMissedName(m.id,e.target.value)} placeholder="Item name…" style={{...inp,width:mobile?170:230,textAlign:'left'}}/>
-              <div style={{fontSize:10,color:m.itemId?C.green:(m.name?C.amber:C.muted)}}>{m.itemId?'✓ linked to catalogue':(m.name?'not in catalogue — no stock change':' ')}</div></td>
-            <td style={td()}><input value={m.qty} onChange={e=>editMissed(m.id,{qty:e.target.value})} inputMode="decimal" style={inp}/></td>
-            <td style={td()}><input value={m.rate} onChange={e=>editMissed(m.id,{rate:e.target.value})} inputMode="decimal" style={inp}/></td>
-            <td style={{...td(),fontWeight:700}}>{fmt(missedAmt(m))}</td>
-            <td style={td('left')}><label style={{display:'flex',alignItems:'center',gap:4,fontSize:11,color:C.sub,cursor:'pointer'}}><input type="checkbox" checked={m.receive!==false} onChange={e=>editMissed(m.id,{receive:e.target.checked})}/> goods received</label></td>
-            <td style={td()}><button onClick={()=>setMissed(p=>p.filter(x=>x.id!==m.id))} style={{border:'none',background:'transparent',color:C.red,cursor:'pointer',fontSize:14}}>✕</button></td>
-          </tr>)}</tbody>
-          <tfoot><tr><td colSpan={4} style={{...td('left'),fontWeight:700}}>Total missed</td><td style={{...td(),fontWeight:800}}>{fmt(missedTotal)}</td><td colSpan={2}/></tr></tfoot>
-        </table></div>}
-        <datalist id="recon-item-names">{itemNames.map(n=><option key={n} value={n}/>)}</datalist>
-      </>)}
-
-    {/* ③ Extras */}
-    {sec(3,'Extras & seller entries not yet in my books','Charges the seller billed (freight, packing, interest…) or credits/discounts/returns they gave — anything on their statement that you haven\'t recorded.',
-      <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
-        <Btn onClick={()=>addExtra('','plus')} size="sm" variant="secondary">+ Charge billed</Btn>
-        <Btn onClick={()=>addExtra('Discount','minus')} size="sm" variant="secondary">+ Credit / discount</Btn>
-      </div>,
-      <>
-        {extras.length===0&&<div style={{padding:'6px 0',color:C.sub,fontSize:12}}>None added.</div>}
-        {extras.length>0&&<div style={{overflowX:'auto'}}><table style={{width:'100%',borderCollapse:'collapse',minWidth:mobile?640:0}}>
-          <thead><tr><th style={th('left')}>Date</th><th style={th('left')}>Description</th><th style={th('left')}>Type</th><th style={th()}>Amount ₹</th><th style={th()}>Effect</th><th style={th()}></th></tr></thead>
-          <tbody>{extras.map(e=><tr key={e.id} style={{borderTop:`1px solid ${C.bdr}`}}>
-            <td style={td('left')}><input type="date" value={e.date} onChange={ev=>editExtra(e.id,{date:ev.target.value})} style={{...inp,width:126,textAlign:'left'}}/></td>
-            <td style={td('left')}><input list="recon-extra-names" value={e.label} onChange={ev=>editExtra(e.id,{label:ev.target.value})} placeholder="e.g. Freight, Interest, Discount" style={{...inp,width:mobile?160:220,textAlign:'left'}}/></td>
-            <td style={td('left')}><select value={e.sign} onChange={ev=>editExtra(e.id,{sign:ev.target.value})} style={{padding:'4px 6px',borderRadius:5,border:`1.5px solid ${C.bdr}`,fontSize:11,fontFamily:'inherit',background:'#fff'}}>
-              <option value="plus">Charge billed (+ I owe more)</option><option value="minus">Credit / discount (− I owe less)</option></select></td>
-            <td style={td()}><input value={e.amount} onChange={ev=>editExtra(e.id,{amount:ev.target.value})} inputMode="decimal" style={inp}/></td>
-            <td style={{...td(),fontWeight:700,color:e.sign==='minus'?C.green:C.red}}>{num(e.amount)?sgn(extraSigned(e)):'—'}</td>
-            <td style={td()}><button onClick={()=>setExtras(p=>p.filter(x=>x.id!==e.id))} style={{border:'none',background:'transparent',color:C.red,cursor:'pointer',fontSize:14}}>✕</button></td>
-          </tr>)}</tbody>
-          <tfoot><tr><td colSpan={4} style={{...td('left'),fontWeight:700}}>Net extras</td><td style={{...td(),fontWeight:800}}>{extrasTotal===0?'₹0':sgn(extrasTotal)}</td><td/></tr></tfoot>
-        </table></div>}
-        <datalist id="recon-extra-names">{extraNames.map(n=><option key={n} value={n}/>)}</datalist>
-      </>)}
-
-    {/* Payments check */}
-    {sec('✓','Payments check (optional)','If the seller shows a different amount for a payment you made, enter it — enter 0 if they never got it. This explains part of the difference; it never edits your payments.',
-      <Btn onClick={()=>setShowPays(v=>!v)} size="sm" variant="secondary">{showPays?'Hide':'Show'} {pays.length} payment{pays.length===1?'':'s'}</Btn>,
-      <>
-        {!showPays&&<div style={{fontSize:12,color:C.sub}}>{payDiff!==0?'Payment differences so far: '+sgn(payDiff):'No payment differences entered.'}</div>}
-        {showPays&&(pays.length===0?<div style={{fontSize:12,color:C.sub}}>No payments to this supplier in the period.</div>
-          :<div style={{overflowX:'auto'}}><table style={{width:'100%',borderCollapse:'collapse'}}>
-            <thead><tr><th style={th('left')}>Date</th><th style={th('left')}>Payment</th><th style={th()}>We paid</th><th style={th()}>Seller shows</th><th style={th()}>Δ</th></tr></thead>
-            <tbody>{pays.map(p=>{const pc=payCalcs[p.key];return <tr key={p.key} style={{borderTop:`1px solid ${C.bdr}`}}>
-              <td style={td('left')}>{fmtD(p.date)}</td><td style={td('left')}>{p.desc}</td><td style={td()}>{fmt(p.amount)}</td>
-              <td style={td()}><input value={payChk[p.key]??''} onChange={e=>setPayChk(x=>({...x,[p.key]:e.target.value}))} inputMode="decimal" placeholder={String(p.amount)} style={{...inp,width:84}}/></td>
-              <td style={{...td(),fontWeight:700,color:pc.delta===0?C.muted:C.red}}>{pc.checked?(pc.delta===0?'✓':sgn(pc.delta)):'—'}</td></tr>;})}</tbody>
-          </table></div>)}
-      </>)}
-
-    {/* ④ Difference & settlement */}
-    {sec(4,'Difference & final settlement',null,null,
-      <>
-        <table style={{width:'100%',borderCollapse:'collapse',maxWidth:620}}>
-          <tbody>
+    {/* Difference & settlement */}
+    <div style={{border:`1px solid ${C.bdr}`,borderRadius:10,background:C.surf,padding:'12px 14px',marginBottom:14}}>
+      <div style={{fontSize:13,fontWeight:700,color:C.txt,marginBottom:8}}>Difference & final settlement</div>
+      <div style={{display:'grid',gridTemplateColumns:mobile?'1fr':'1fr 1fr',gap:16}}>
+        <div>
+          <table style={{width:'100%',borderCollapse:'collapse'}}><tbody>
             {[
               ['Our closing balance',balTxt(closingBalance),C.txt,false],
-              ['+ Rate/qty corrections accepted',dFix+dAdj===0?'₹0':sgn(r2(dFix+dAdj)),C.txt,false],
+              ['+ Line corrections I accept (rate/qty)',(dFix+dAdj)===0?'₹0':sgn(r2(dFix+dAdj)),C.txt,false],
+              ['+ Payment corrections I accept',(payFix+payAdj)===0?'₹0':sgn(r2(payFix+payAdj)),C.txt,false],
               ['+ Missed items added',missedTotal===0?'₹0':sgn(missedTotal),C.txt,false],
               ['+ Seller extras / entries added',extrasTotal===0?'₹0':sgn(extrasTotal),C.txt,false],
               ['= Our balance after adjustments',balTxt(ourAdjusted),C.blue,true],
-              ["Seller's closing balance",sc==null?'— enter above —':balTxt(sc),C.txt,true],
+              ["Seller's closing balance (statement)",sc==null?'— enter above —':balTxt(sc),C.txt,true],
               ['Difference (seller − ours)',diff==null?'—':diff===0?'₹0  ✓ reconciled':sgn(diff),diffColor,true],
             ].map(([l,v,c,b],i)=><tr key={i} style={{borderTop:b?`1px solid ${C.bdr}`:'none'}}>
-              <td style={{padding:'4px 0',fontSize:12,color:C.sub,fontWeight:b?700:400}}>{l}</td>
-              <td style={{padding:'4px 0',fontSize:13,textAlign:'right',color:c,fontWeight:b?800:600,fontVariantNumeric:'tabular-nums'}}>{v}</td></tr>)}
-          </tbody>
-        </table>
-        {diff!=null&&diff!==0&&<div style={{margin:'10px 0',padding:'10px 12px',borderRadius:8,background:'#F9FAFB',border:`1px solid ${C.bdr}`,maxWidth:620}}>
-          <div style={{fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',marginBottom:4}}>What the difference is made of</div>
-          {[
-            ['Lines I\'m asking the seller to correct',dDis],
-            ['Payments the seller recorded differently',payDiff],
-            ['Opening balance difference',openDiff],
-            ['Still unexplained — check dates, missing bills/payments',unexplained],
-          ].map(([l,v],i)=><div key={i} style={{display:'flex',justifyContent:'space-between',fontSize:12,padding:'2px 0',color:i===3&&v!==0?C.red:C.txt,fontWeight:i===3?700:400}}>
-            <span>{l}</span><span style={{fontVariantNumeric:'tabular-nums'}}>{v===0?'₹0':sgn(v)}</span></div>)}
-        </div>}
-        <div style={{margin:'12px 0 6px',padding:'12px 14px',borderRadius:10,background:C.blueSoft,border:`1px solid ${C.blue}`,maxWidth:620}}>
-          <div style={{fontSize:11,fontWeight:700,color:C.blue,textTransform:'uppercase',marginBottom:6}}>Final settlement</div>
-          <div style={{display:'flex',gap:14,flexWrap:'wrap',fontSize:12,marginBottom:6}}>
-            <label style={{display:'flex',alignItems:'center',gap:5,cursor:'pointer'}}><input type="radio" checked={settleBasis==='ours'} onChange={()=>setSettleBasis('ours')}/> Settle on my adjusted balance</label>
-            <label style={{display:'flex',alignItems:'center',gap:5,cursor:sc==null?'not-allowed':'pointer',opacity:sc==null?.5:1}}><input type="radio" disabled={sc==null} checked={settleBasis==='seller'} onChange={()=>setSettleBasis('seller')}/> Settle on the seller's balance (I accept it)</label>
-          </div>
-          <div style={{fontSize:22,fontWeight:800,color:settleAmt>0?C.red:C.green}}>
-            {settleAmt>0?'Pay '+party.name+' '+fmt(settleAmt):settleAmt<0?party.name+' owes you '+fmt(Math.abs(settleAmt)):'Nothing to pay — fully settled'}
-          </div>
-          {settleBasis==='ours'&&diff!=null&&diff!==0&&<div style={{fontSize:11,color:C.sub,marginTop:4}}>The {fmt(Math.abs(diff))} difference stays open with the seller until they confirm.</div>}
+              <td style={{padding:'3px 0',fontSize:12,color:C.sub,fontWeight:b?700:400}}>{l}</td>
+              <td style={{padding:'3px 0',fontSize:13,textAlign:'right',color:c,fontWeight:b?800:600,fontVariantNumeric:'tabular-nums'}}>{v}</td></tr>)}
+          </tbody></table>
+          {diff!=null&&diff!==0&&<div style={{margin:'10px 0 0',padding:'8px 12px',borderRadius:8,background:'#F9FAFB',border:`1px solid ${C.bdr}`}}>
+            <div style={{fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',marginBottom:4}}>What the difference is made of</div>
+            {[
+              ["Lines I'm asking the seller to correct",dDis],
+              ['Payments I\'m asking the seller to correct',payDis],
+              ['Opening balance difference',openDiff],
+              ["Not captured above — their statement still differs",unexplained],
+            ].map(([l,v],i)=><div key={i} style={{display:'flex',justifyContent:'space-between',fontSize:12,padding:'2px 0',color:i===3&&v!==0?C.red:C.txt,fontWeight:i===3?700:400}}>
+              <span>{l}</span><span style={{fontVariantNumeric:'tabular-nums'}}>{v===0?'₹0':sgn(v)}</span></div>)}
+          </div>}
         </div>
-        <div style={{marginTop:10}}>
-          <label style={{fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase'}}>Notes (kept with this reconciliation, added to the message to the seller)</label>
-          <textarea value={notes} onChange={e=>setNotes(e.target.value)} rows={2} style={{width:'100%',marginTop:3,padding:'6px 8px',borderRadius:6,border:`1.5px solid ${C.bdr}`,fontSize:12,fontFamily:'inherit',boxSizing:'border-box',resize:'vertical'}}/>
+        <div>
+          <div style={{padding:'12px 14px',borderRadius:10,background:C.blueSoft,border:`1px solid ${C.blue}`}}>
+            <div style={{fontSize:11,fontWeight:700,color:C.blue,textTransform:'uppercase',marginBottom:6}}>Final settlement</div>
+            <div style={{display:'flex',gap:14,flexWrap:'wrap',fontSize:12,marginBottom:6}}>
+              <label style={{display:'flex',alignItems:'center',gap:5,cursor:'pointer'}}><input type="radio" checked={settleBasis==='ours'} onChange={()=>setSettleBasis('ours')}/> On my adjusted balance</label>
+              <label style={{display:'flex',alignItems:'center',gap:5,cursor:sc==null?'not-allowed':'pointer',opacity:sc==null?.5:1}}><input type="radio" disabled={sc==null} checked={settleBasis==='seller'} onChange={()=>setSettleBasis('seller')}/> On the seller's balance (I accept it)</label>
+            </div>
+            <div style={{fontSize:22,fontWeight:800,color:settleAmt>0?C.red:C.green}}>
+              {settleAmt>0?'Pay '+party.name+' '+fmt(settleAmt):settleAmt<0?party.name+' owes you '+fmt(Math.abs(settleAmt)):'Nothing to pay — fully settled'}
+            </div>
+            {settleBasis==='ours'&&diff!=null&&diff!==0&&<div style={{fontSize:11,color:C.sub,marginTop:4}}>The {fmt(Math.abs(diff))} difference stays open with the seller until they confirm.</div>}
+          </div>
+          <div style={{marginTop:10}}>
+            <label style={{fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase'}}>General notes (kept with this reconciliation, added to the message to the seller)</label>
+            <textarea value={notes} onChange={e=>setNotes(e.target.value)} rows={2} style={{width:'100%',marginTop:3,padding:'6px 8px',borderRadius:6,border:`1.5px solid ${C.bdr}`,fontSize:12,fontFamily:'inherit',boxSizing:'border-box',resize:'vertical'}}/>
+          </div>
         </div>
-      </>)}
+      </div>
+    </div>
 
     <div style={{display:'flex',gap:8,justifyContent:'space-between',flexWrap:'wrap',position:'sticky',bottom:0,background:'#fff',padding:'10px 0 2px',borderTop:`1px solid ${C.bdr}`}}>
       <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
