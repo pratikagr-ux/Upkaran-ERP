@@ -4049,6 +4049,663 @@ function MergedPartyLedger({party,onClose}){
   </Modal>;
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// Supplier Reconciliation (account reconciliation against the seller's
+// statement). Opened from a supplier's Party Ledger. Four jobs, one screen:
+//   ① match billed rate & qty line-by-line against the seller's bill
+//   ② add genuinely missed items (on the seller's bill, never booked by us)
+//   ③ add extras / entries the seller made that we haven't recorded yet
+//   ④ show the difference and the final settlement
+// Everything typed is autosaved as a per-supplier draft (silent save — a
+// notifying save would remount this screen mid-typing). Nothing touches the
+// books until the user reviews the change list and presses "Post to books".
+// Sign convention: balances are what WE OWE the seller (positive = payable),
+// Δ on a line = seller's figure − ours (so accepting a Δ adds it to our
+// payable).
+// ═════════════════════════════════════════════════════════════════════════════
+function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onClose}){
+  const mobile=useIsMobile();
+  const{toast,TC}=useToast();
+  const r2=n=>Math.round((Number(n)||0)*100)/100;
+  const num=v=>(v===''||v==null||isNaN(Number(v)))?null:Number(v);
+  const sgn=n=>(n>0?'+ ':n<0?'− ':'')+fmt(Math.abs(n));
+  const balTxt=n=>fmt(Math.abs(n))+(n<0?' (advance)':'');
+  const inWin=d=>(!from||d>=from)&&(!to||d<=to);
+
+  const existing=useMemo(()=>state.supplierReconciliations.find(r=>r.partyId===party.id&&r.status==='draft'),[]);
+  const lastPosted=useMemo(()=>state.supplierReconciliations.filter(r=>r.partyId===party.id&&r.status==='posted').sort((a,b)=>(b.postedAt||'').localeCompare(a.postedAt||''))[0],[]);
+  const[draftId]=useState(existing?.id||uid('REC'));
+  const d0=existing||{};
+  const[sellerClosing,setSellerClosing]=useState(d0.sellerClosing??'');
+  const[sellerOpening,setSellerOpening]=useState(d0.sellerOpening??'');
+  const[ls,setLs]=useState(d0.lines||{});
+  const[billOk,setBillOk]=useState(d0.billOk||{});
+  const[missed,setMissed]=useState(d0.missed||[]);
+  const[extras,setExtras]=useState(d0.extras||[]);
+  const[payChk,setPayChk]=useState(d0.payChk||{});
+  const[notes,setNotes]=useState(d0.notes||'');
+  const[settleBasis,setSettleBasis]=useState(d0.settleBasis||'ours');
+  const[filter,setFilter]=useState('all');
+  const[showPays,setShowPays]=useState(false);
+  const[step,setStep]=useState('work');
+  const[posting,setPosting]=useState(false);
+
+  // ── Our side of the picture ────────────────────────────────────────────────
+  const bills=useMemo(()=>{
+    const out=[];
+    (SUPPLIER_HISTORY[party.name]?.s||[]).forEach((s,bi)=>{
+      if(!inWin(s[0]))return;
+      const names=(s[2]||[]).map(x=>Array.isArray(x)?x[0]+(x[1]!=null?' ×'+x[1]:''):String(x)).join(', ');
+      const key='H'+bi;
+      out.push({key,hist:true,date:s[0],ref:'Pre-ERP bill',total:r2(s[1]),
+        lines:[{key:key+'#T',billKey:key,type:'amount',name:names||'Bill total',our:r2(s[1]),fixable:false}]});
+    });
+    state.purchases.filter(p=>p.partyId===party.id&&inWin(p.date)).forEach(p=>{
+      const lines=[];
+      (p.items||[]).forEach((it,i)=>{
+        const q=Number(it.qty)||0,rt=Number(it.rate)||0;
+        lines.push({key:p.id+'#'+i,billKey:p.id,type:'item',idx:i,name:it.supplierName||it.customerName||it.itemName||'Item',itemId:it.itemId,qty:q,rate:rt,our:r2(q*rt),fixable:true});
+      });
+      (p.extraCharges||[]).forEach((c,i)=>{
+        lines.push({key:p.id+'!'+(c.id||i),billKey:p.id,type:'amount',chargeIdx:i,name:c.name||'Extra charge',our:r2(c.amount),fixable:true,isCharge:true});
+      });
+      out.push({key:p.id,hist:false,date:p.date,ref:p.bilty?('LR '+p.bilty):(p.source?'Reconciliation entry':p.id),purchase:p,total:r2((p.total||0)+(p.extraChargesTotal||0)),lines,received:!!p.receivedDate});
+    });
+    return out.sort((a,b)=>a.date.localeCompare(b.date));
+  },[party.id]);
+  const allLines=useMemo(()=>bills.flatMap(b=>b.lines),[bills]);
+
+  const pays=useMemo(()=>{
+    const out=[];
+    (SUPPLIER_HISTORY[party.name]?.p||[]).forEach((p,i)=>{if(inWin(p[0]))out.push({key:'HP'+i,date:p[0],amount:r2(p[1]),desc:'Paid — '+(p[2]||'Cash/Bank')});});
+    state.supplierPayments.filter(p=>p.partyId===party.id&&inWin(p.date)).forEach(p=>out.push({key:p.id,date:p.date,amount:r2(p.amount),desc:p.notes||('Paid — '+(ACC_MAP[p.account]?.short||p.account||'—'))}));
+    return out.sort((a,b)=>a.date.localeCompare(b.date));
+  },[party.id]);
+
+  // ── Per-line comparison ────────────────────────────────────────────────────
+  // Blank seller input = "not checked" (never a false mismatch). Typing only a
+  // rate keeps our qty (and vice versa), so one field is enough to flag a
+  // rate-only or qty-only disagreement.
+  const calcs=useMemo(()=>{
+    const m={};
+    allLines.forEach(l=>{
+      const s=ls[l.key]||{};
+      let sQty=l.qty,sRate=l.rate,sAmt=l.our,touched=false;
+      if(l.type==='item'){
+        const q=num(s.sQty),r=num(s.sRate);
+        if(q!=null){sQty=q;touched=true;}
+        if(r!=null){sRate=r;touched=true;}
+        sAmt=r2(sQty*sRate);
+      }else{
+        const a=num(s.sAmt);
+        if(a!=null){sAmt=r2(a);touched=true;}
+      }
+      const checked=touched||!!billOk[l.billKey];
+      const delta=checked?r2(sAmt-l.our):0;
+      m[l.key]={sQty,sRate,sAmt,checked,delta,status:!checked?'unchecked':delta===0?'match':'mismatch',res:s.res||'dispute',note:s.note||''};
+    });
+    return m;
+  },[allLines,ls,billOk]);
+
+  const mism=allLines.filter(l=>calcs[l.key].status==='mismatch');
+  const sumRes=res=>r2(mism.filter(l=>calcs[l.key].res===res).reduce((s,l)=>s+calcs[l.key].delta,0));
+  const dFix=sumRes('fix'),dAdj=sumRes('adjust'),dDis=sumRes('dispute');
+  const nChecked=allLines.filter(l=>calcs[l.key].checked).length;
+
+  const payCalcs=useMemo(()=>{
+    const m={};
+    pays.forEach(p=>{
+      const a=num(payChk[p.key]);
+      m[p.key]={checked:a!=null,sAmt:a!=null?r2(a):p.amount,delta:a!=null?r2(p.amount-a):0};
+    });
+    return m;
+  },[pays,payChk]);
+  const payDiff=r2(pays.reduce((s,p)=>s+payCalcs[p.key].delta,0));
+
+  const missedRows=missed.filter(m=>m.name||m.qty||m.rate);
+  const missedAmt=m=>r2((num(m.qty)||0)*(num(m.rate)||0));
+  const missedTotal=r2(missedRows.reduce((s,m)=>s+missedAmt(m),0));
+  const extraRows=extras.filter(e=>e.label||e.amount);
+  const extraSigned=e=>r2((e.sign==='minus'?-1:1)*(num(e.amount)||0));
+  const extrasTotal=r2(extraRows.reduce((s,e)=>s+extraSigned(e),0));
+
+  // ── The reconciliation waterfall ───────────────────────────────────────────
+  const ourAdjusted=r2(closingBalance+dFix+dAdj+missedTotal+extrasTotal);
+  const sc=num(sellerClosing);
+  const so=num(sellerOpening);
+  const diff=sc==null?null:r2(sc-ourAdjusted);
+  const openDiff=so==null?0:r2(so-openingBalance);
+  // What's left after the differences we can already explain: lines we're
+  // disputing (seller says X, we kept Y), payments the seller recorded
+  // differently, and a different opening balance.
+  const unexplained=diff==null?null:r2(diff-dDis-payDiff-openDiff);
+  const settleAmt=settleBasis==='seller'&&sc!=null?sc:ourAdjusted;
+
+  // ── Autosave (debounced, silent) ───────────────────────────────────────────
+  const payload=useMemo(()=>({id:draftId,partyId:party.id,partyName:party.name,status:'draft',from:from||'',to:to||'',sellerClosing,sellerOpening,lines:ls,billOk,missed,extras,payChk,notes,settleBasis}),[draftId,party.id,party.name,from,to,sellerClosing,sellerOpening,ls,billOk,missed,extras,payChk,notes,settleBasis]);
+  const lastSaved=useRef(JSON.stringify(payload));
+  const latestPayload=useRef(payload);latestPayload.current=payload;
+  // finished = this reconciliation was posted/saved as final; from then on the
+  // autosave (incl. the flush-on-close below) must never write the draft
+  // version back over the finished record.
+  const finished=useRef(false);
+  const persist=pl=>{
+    const json=JSON.stringify(pl);
+    if(finished.current||json===lastSaved.current)return;
+    lastSaved.current=json;
+    const prev=state.supplierReconciliations.find(r=>r.id===draftId);
+    const rec={...(prev||{createdAt:new Date().toISOString()}),...pl,updatedAt:new Date().toISOString()};
+    state.supplierReconciliations=prev?state.supplierReconciliations.map(r=>r.id===draftId?rec:r):[rec,...state.supplierReconciliations];
+    save.supplierReconciliationsSilent();
+  };
+  useEffect(()=>{const t=setTimeout(()=>persist(payload),700);return()=>clearTimeout(t);},[payload]);
+  // Flush a pending edit if the screen is closed within the debounce window.
+  useEffect(()=>()=>persist(latestPayload.current),[]);
+
+  // ── Updaters ───────────────────────────────────────────────────────────────
+  const setL=(key,patch)=>setLs(p=>({...p,[key]:{...(p[key]||{}),...patch}}));
+  const acceptAll=()=>{
+    setLs(p=>{
+      const n={...p};
+      mism.forEach(l=>{n[l.key]={...(n[l.key]||{}),res:l.fixable?'fix':'adjust'};});
+      return n;
+    });
+  };
+  const markBill=(b,ok)=>setBillOk(p=>({...p,[b.key]:ok}));
+  const markAllBills=()=>{const n={};bills.forEach(b=>{n[b.key]=true;});setBillOk(n);};
+  const clearAll=()=>{
+    if(!window.confirm('Clear everything typed on this reconciliation and start over? (Nothing in your books changes.)'))return;
+    setLs({});setBillOk({});setMissed([]);setExtras([]);setPayChk({});setSellerClosing('');setSellerOpening('');setNotes('');
+  };
+
+  // Catalogue lookup for the "missed items" rows (name → item, so a missed
+  // item can be linked to stock when it's a real catalogue item).
+  const itemIndex=useMemo(()=>{
+    const m=new Map();
+    state.items.filter(it=>it.active!==false).forEach(it=>{
+      [it.supplier,it.internal,it.name].filter(Boolean).forEach(n=>{const k=String(n).trim().toLowerCase();if(!m.has(k))m.set(k,it);});
+    });
+    return m;
+  },[]);
+  const itemNames=useMemo(()=>[...new Set(state.items.filter(it=>it.active!==false).map(it=>it.supplier||it.internal||it.name).filter(Boolean))].slice(0,1500),[]);
+  const extraNames=useMemo(()=>{
+    const seen=new Map(['Freight','Packing','Loading / Unloading','Octroi','Interest','Discount','Rate difference','Cash discount','Debit note','Credit note'].map(n=>[n.toLowerCase(),n]));
+    for(const p of state.purchases)for(const c of(p.extraCharges||[]))if(c.name)seen.set(c.name.toLowerCase(),c.name);
+    return[...seen.values()];
+  },[]);
+
+  const addMissed=()=>setMissed(p=>[...p,{id:uid('MS'),date:to||today(),name:'',itemId:'',qty:'',rate:'',receive:true}]);
+  const editMissed=(id,patch)=>setMissed(p=>p.map(m=>m.id!==id?m:{...m,...patch}));
+  const setMissedName=(id,name)=>{
+    const it=itemIndex.get(name.trim().toLowerCase());
+    setMissed(p=>p.map(m=>{
+      if(m.id!==id)return m;
+      const next={...m,name,itemId:it?it.id:''};
+      if(it&&(m.rate===''||m.rate==null))next.rate=String(getBestPurchRate(party.name,it.id,it.purch)||it.purch||'');
+      return next;
+    }));
+  };
+  const addExtra=(label='',sign='plus')=>setExtras(p=>[...p,{id:uid('EX'),date:to||today(),label,sign,amount:''}]);
+  const editExtra=(id,patch)=>setExtras(p=>p.map(e=>e.id!==id?e:{...e,...patch}));
+
+  // ── What "Post to books" will do ───────────────────────────────────────────
+  const plan=useMemo(()=>{
+    const fix=[],adj=[];
+    mism.forEach(l=>{
+      const c=calcs[l.key];
+      const bill=bills.find(b=>b.key===l.billKey);
+      if(c.res==='fix'&&l.fixable){
+        fix.push({purchaseId:l.billKey,type:l.type,idx:l.idx,chargeIdx:l.chargeIdx,name:l.name,date:bill.date,
+          oldQty:l.qty,oldRate:l.rate,oldAmt:l.our,sQty:c.sQty,sRate:c.sRate,sAmt:c.sAmt,delta:c.delta,
+          itemId:l.itemId,received:bill.received});
+      }else if(c.res==='adjust'||(c.res==='fix'&&!l.fixable)){
+        adj.push({date:bill.date,name:'Reconciliation adj — '+l.name+' ('+fmtD(bill.date)+')',amount:c.delta});
+      }
+    });
+    const miss=missedRows.map(m=>({...m,amount:missedAmt(m)}));
+    const ext=extraRows.map(e=>({...e,signed:extraSigned(e)}));
+    return{fix,adj,miss,ext,count:fix.length+adj.length+miss.length+ext.length};
+  },[mism,calcs,bills,missed,extras]);
+
+  const validate=()=>{
+    for(const m of missedRows){
+      if(!m.name.trim())return'A missed-item row has no item name';
+      if(!(num(m.qty)>0))return'Missed item "'+m.name+'" needs a quantity greater than 0';
+      if(num(m.rate)==null||num(m.rate)<0)return'Missed item "'+m.name+'" needs a rate';
+      if(!m.date)return'Missed item "'+m.name+'" needs a date';
+    }
+    for(const e of extraRows){
+      if(!e.label.trim())return'An extra/entry row has no description';
+      if(!(num(e.amount)>0))return'Extra "'+e.label+'" needs an amount greater than 0 (use the +/− choice for credits)';
+      if(!e.date)return'Extra "'+e.label+'" needs a date';
+    }
+    return'';
+  };
+  const goReview=()=>{
+    const err=validate();
+    if(err)return toast(err,'error');
+    setStep('review');
+  };
+
+  const doPost=()=>{
+    if(!requireOwner(toast))return;
+    const err=validate();
+    if(err)return toast(err,'error');
+    setPosting(true);
+    finished.current=true;
+    const nowIso=new Date().toISOString();
+    const stock={};
+    let purchases=[...state.purchases];
+    const created=[];
+    // uid() is prefix + millisecond timestamp, so several records created in this
+    // one synchronous pass would collide — add a running sequence to each.
+    let seq=0;
+    const newPurId=()=>uid('PUR')+'-'+(++seq);
+
+    // ① Fix my entries — edit the existing bill lines to the seller's figures.
+    const byPurchase={};
+    plan.fix.forEach(f=>{(byPurchase[f.purchaseId]||=[]).push(f);});
+    let freightChanged=false;
+    Object.entries(byPurchase).forEach(([pid,fixes])=>{
+      const p=purchases.find(x=>x.id===pid);
+      if(!p)return;
+      const items=(p.items||[]).map(x=>({...x}));
+      const charges=(p.extraCharges||[]).map(c=>({...c}));
+      fixes.forEach(f=>{
+        if(f.type==='item'){
+          const it=items[f.idx];
+          if(!it)return;
+          const oldQty=Number(it.qty)||0;
+          it.qty=f.sQty;it.rate=f.sRate;it.amount=r2(f.sQty*f.sRate);
+          it.freightAmount=(f.sQty/(it.peti||1))*(Number(it.freightPerPeti)||0);
+          // Stock only moves for a bill that has actually been received — same
+          // rule EditPurchaseModal follows.
+          if(p.receivedDate&&it.itemId&&f.sQty!==oldQty)stock[it.itemId]=(stock[it.itemId]||0)+(f.sQty-oldQty);
+        }else{
+          const c=charges[f.chargeIdx];
+          if(c)c.amount=f.sAmt;
+        }
+      });
+      const total=items.reduce((s,x)=>s+(Number(x.qty)||0)*(Number(x.rate)||0),0);
+      const extraChargesTotal=charges.reduce((s,c)=>s+(Number(c.amount)||0),0);
+      const freightAmount=Math.round(items.reduce((s,x)=>s+((Number(x.qty)||0)/(x.peti||1))*(Number(x.freightPerPeti)||0),0));
+      const totalPetis=items.reduce((s,x)=>s+((Number(x.qty)||0)/(x.peti||1)),0);
+      purchases=purchases.map(x=>x.id===pid?{...x,items,extraCharges:charges,total,extraChargesTotal,freightAmount,totalPetis,updatedAt:nowIso,
+        reconFixes:[...(x.reconFixes||[]),{reconId:draftId,at:nowIso,changes:fixes.map(f=>({name:f.name,oldQty:f.oldQty,oldRate:f.oldRate,oldAmt:f.oldAmt,newQty:f.sQty,newRate:f.sRate,newAmt:f.sAmt}))}]}:x);
+      if(freightAmount!==(Number(p.freightAmount)||0)){
+        state.freightCharges=state.freightCharges.map(fr=>fr.purchaseId===pid?{...fr,totalPetis,ratePerPeti:totalPetis>0?freightAmount/totalPetis:0,amount:freightAmount}:fr);
+        freightChanged=true;
+      }
+    });
+
+    // Helper — a ledger-only entry (no catalogue item, no stock) carrying one
+    // signed amount, so it shows in the supplier ledger with its reason.
+    const mkLedgerEntry=(date,name,amount,source)=>({id:newPurId(),date,bookedDate:date,receivedDate:date,status:'received',expectedDate:null,
+      partyId:party.id,partyName:party.name,
+      items:[{itemId:'',itemName:name,customerName:name,supplierName:name,qty:1,rate:amount,amount,peti:1,freightPerPeti:0,freightAmount:0}],
+      total:amount,bilty:'',extraCharges:[],extraChargesTotal:0,totalPetis:0,freightAmount:0,source,reconId:draftId,createdAt:nowIso});
+
+    // Rate/qty differences accepted as a separate adjustment instead of editing the bill.
+    plan.adj.forEach(a=>{if(a.amount)created.push(mkLedgerEntry(a.date,a.name,a.amount,'reconciliation-adjustment'));});
+    // ③ Extras / seller entries not yet in the books.
+    plan.ext.forEach(e=>{if(e.signed)created.push(mkLedgerEntry(e.date,'Reconciliation — '+e.label.trim(),e.signed,'reconciliation-extra'));});
+    // ② Missed items → real purchase lines (stock moves only when "received").
+    const groups={};
+    plan.miss.forEach(m=>{const k=m.date+'|'+(m.receive?'R':'P');(groups[k]||=[]).push(m);});
+    Object.entries(groups).forEach(([k,rows])=>{
+      const[date,flag]=k.split('|');
+      const received=flag==='R';
+      const items=rows.map(m=>{
+        const cat=m.itemId?state.items.find(x=>x.id===m.itemId):null;
+        const q=num(m.qty),rt=num(m.rate);
+        if(received&&m.itemId)stock[m.itemId]=(stock[m.itemId]||0)+q;
+        return{itemId:m.itemId||'',itemName:cat?.internal||m.name,customerName:cat?.internal||m.name,supplierName:m.name,qty:q,rate:rt,amount:r2(q*rt),peti:cat?.peti||1,freightPerPeti:0,freightAmount:0};
+      });
+      created.push({id:newPurId(),date,bookedDate:date,receivedDate:received?date:null,status:received?'received':'ordered',expectedDate:null,
+        partyId:party.id,partyName:party.name,items,total:r2(items.reduce((s,x)=>s+x.amount,0)),bilty:'',
+        extraCharges:[],extraChargesTotal:0,totalPetis:0,freightAmount:0,source:'reconciliation-missed',reconId:draftId,createdAt:nowIso});
+    });
+
+    state.purchases=[...created,...purchases];
+    const rec={...payload,status:'posted',postedAt:nowIso,
+      summary:{ourClosing:closingBalance,ourAdjusted,sellerClosing:sc,difference:diff,disputed:dDis,paymentDiff:payDiff,openingDiff:openDiff,unexplained,settleBasis,settleAmt},
+      posted:{fixed:plan.fix.length,adjusted:plan.adj.length,missed:plan.miss.length,extras:plan.ext.length}};
+    const had=state.supplierReconciliations.some(r=>r.id===draftId);
+    state.supplierReconciliations=had?state.supplierReconciliations.map(r=>r.id===draftId?{...r,...rec}:r):[rec,...state.supplierReconciliations];
+    save.purchases();
+    if(freightChanged)save.freightCharges();
+    Object.entries(stock).forEach(([id,delta])=>adjustStock(id,delta));
+    save.supplierReconciliations();
+    toast('Reconciliation posted ✓ '+plan.count+' change'+(plan.count===1?'':'s')+' applied to your books');
+    setPosting(false);
+    onClose();
+  };
+
+  const finishWithoutPosting=()=>{
+    finished.current=true;
+    const rec={...payload,status:'posted',postedAt:new Date().toISOString(),
+      summary:{ourClosing:closingBalance,ourAdjusted,sellerClosing:sc,difference:diff,disputed:dDis,paymentDiff:payDiff,openingDiff:openDiff,unexplained,settleBasis,settleAmt},
+      posted:{fixed:0,adjusted:0,missed:0,extras:0}};
+    const had=state.supplierReconciliations.some(r=>r.id===draftId);
+    state.supplierReconciliations=had?state.supplierReconciliations.map(r=>r.id===draftId?{...r,...rec}:r):[rec,...state.supplierReconciliations];
+    save.supplierReconciliations();
+    toast('Reconciliation saved ✓');
+    onClose();
+  };
+
+  // ── Note to seller (WhatsApp) ──────────────────────────────────────────────
+  const sendNote=()=>{
+    const lines=[];
+    mism.filter(l=>calcs[l.key].res==='dispute').forEach(l=>{
+      const c=calcs[l.key],b=bills.find(x=>x.key===l.billKey);
+      if(l.type==='item')lines.push('• '+fmtD(b.date)+' '+l.name+': your bill qty '+c.sQty+' × ₹'+c.sRate+' = '+fmt(c.sAmt)+' | our record qty '+l.qty+' × ₹'+l.rate+' = '+fmt(l.our)+' (diff '+sgn(c.delta)+')'+(c.note?' — '+c.note:''));
+      else lines.push('• '+fmtD(b.date)+' '+l.name+': your figure '+fmt(c.sAmt)+' | ours '+fmt(l.our)+' (diff '+sgn(c.delta)+')'+(c.note?' — '+c.note:''));
+    });
+    pays.filter(p=>payCalcs[p.key].checked&&payCalcs[p.key].delta!==0).forEach(p=>{
+      lines.push('• Payment '+fmtD(p.date)+': we paid '+fmt(p.amount)+' | you show '+fmt(payCalcs[p.key].sAmt));
+    });
+    let msg='Hi '+party.name+', we are reconciling our accounts'+(from||to?' ('+(from?fmtD(from):'start')+' to '+(to?fmtD(to):'today')+')':'')+'.\n\n';
+    if(lines.length)msg+='Please check these on your side:\n'+lines.join('\n')+'\n\n';
+    msg+='Our balance after adjustments: '+balTxt(ourAdjusted)+'\n';
+    if(sc!=null)msg+='Your balance: '+balTxt(sc)+'\nDifference: '+sgn(diff)+'\n';
+    if(notes.trim())msg+='\n'+notes.trim()+'\n';
+    msg+='\nKindly review and confirm. Thanks.';
+    const ph=party.phone;
+    window.open(ph?('https://wa.me/91'+ph+'?text='+encodeURIComponent(msg)):('https://wa.me/?text='+encodeURIComponent(msg)),'_blank');
+  };
+
+  // ── Rendering helpers (plain functions — NOT components — so inputs keep
+  //    focus across re-renders) ───────────────────────────────────────────────
+  const inp={width:66,padding:'4px 6px',borderRadius:5,border:`1.5px solid ${C.bdr}`,fontSize:12,textAlign:'right',fontFamily:'inherit',outline:'none',boxSizing:'border-box',background:'#fff',color:C.txt};
+  const th=(al='right')=>({padding:'6px 8px',fontSize:10,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.4,textAlign:al,borderBottom:`1px solid ${C.bdr}`,whiteSpace:'nowrap',background:'#F6F8FA'});
+  const td=(al='right')=>({padding:'5px 8px',fontSize:12,textAlign:al,color:C.txt,fontVariantNumeric:'tabular-nums',whiteSpace:al==='left'?'normal':'nowrap'});
+  const sec=(n,title,sub,right,children)=><div style={{border:`1px solid ${C.bdr}`,borderRadius:10,marginBottom:14,background:C.surf,overflow:'hidden'}}>
+    <div style={{display:'flex',alignItems:'center',gap:10,padding:'10px 14px',background:'#F9FAFB',borderBottom:`1px solid ${C.bdr}`,flexWrap:'wrap'}}>
+      <span style={{width:22,height:22,borderRadius:'50%',background:C.blue,color:'#fff',fontSize:12,fontWeight:800,display:'inline-flex',alignItems:'center',justifyContent:'center'}}>{n}</span>
+      <div style={{flex:1,minWidth:180}}><div style={{fontSize:13,fontWeight:700,color:C.txt}}>{title}</div>{sub&&<div style={{fontSize:11,color:C.sub}}>{sub}</div>}</div>
+      {right}
+    </div>
+    <div style={{padding:'10px 14px'}}>{children}</div>
+  </div>;
+  const statusBadge=s=>s==='match'?<Badge v="✓ Match" color="green"/>:s==='mismatch'?<Badge v="✗ Mismatch" color="red"/>:<Badge v="Not checked" color="gray"/>;
+
+  const billMismCount=b=>b.lines.filter(l=>calcs[l.key].status==='mismatch').length;
+  const billChecked=b=>b.lines.every(l=>calcs[l.key].checked);
+  const shownBills=bills.filter(b=>filter==='all'?true:filter==='attention'?billMismCount(b)>0:!billChecked(b));
+
+  // ═════════════════════════════ REVIEW STEP ═════════════════════════════════
+  if(step==='review'){
+    const effect=r2(dFix+dAdj+missedTotal+extrasTotal);
+    return <Modal title={'Review & post — '+party.name} onClose={onClose} width={820}>
+      <TC/>
+      <div style={{padding:'8px 12px',borderRadius:8,background:C.amberSoft,color:C.amber,fontSize:12,fontWeight:600,marginBottom:12}}>
+        Nothing has been changed yet. Posting edits your books as listed below — check it once, then post.
+      </div>
+      {plan.count===0&&<div style={{padding:16,textAlign:'center',color:C.sub,fontSize:13}}>Nothing to post — no accepted corrections, missed items or extras.</div>}
+      {plan.fix.length>0&&<div style={{marginBottom:14}}>
+        <div style={{fontSize:12,fontWeight:700,color:C.txt,marginBottom:6}}>① Correct my existing entries ({plan.fix.length})</div>
+        <div style={{overflowX:'auto'}}><table style={{width:'100%',borderCollapse:'collapse'}}>
+          <thead><tr><th style={th('left')}>Bill</th><th style={th('left')}>Item</th><th style={th()}>Was</th><th style={th()}>Becomes</th><th style={th()}>Balance Δ</th><th style={th()}>Stock</th></tr></thead>
+          <tbody>{plan.fix.map((f,i)=>{
+            const stk=f.type==='item'&&f.received&&f.itemId&&f.sQty!==f.oldQty?f.sQty-f.oldQty:0;
+            return <tr key={i} style={{borderBottom:`1px solid ${C.bdr}`}}>
+              <td style={td('left')}>{fmtD(f.date)}</td><td style={td('left')}>{f.name}</td>
+              <td style={td()}>{f.type==='item'?f.oldQty+' × ₹'+f.oldRate+' = '+fmt(f.oldAmt):fmt(f.oldAmt)}</td>
+              <td style={{...td(),fontWeight:700}}>{f.type==='item'?f.sQty+' × ₹'+f.sRate+' = '+fmt(f.sAmt):fmt(f.sAmt)}</td>
+              <td style={{...td(),color:f.delta>0?C.red:C.green,fontWeight:700}}>{sgn(f.delta)}</td>
+              <td style={{...td(),color:stk?C.blue:C.muted}}>{stk?(stk>0?'+':'')+stk:'—'}</td>
+            </tr>;})}</tbody>
+        </table></div>
+      </div>}
+      {plan.adj.length>0&&<div style={{marginBottom:14}}>
+        <div style={{fontSize:12,fontWeight:700,color:C.txt,marginBottom:6}}>① Post as separate adjustment entries ({plan.adj.length}) — original bills stay untouched</div>
+        {plan.adj.map((a,i)=><div key={i} style={{display:'flex',justifyContent:'space-between',gap:10,padding:'5px 0',borderBottom:`1px solid ${C.bdr}`,fontSize:12}}>
+          <span style={{color:C.txt}}>{a.name}</span><span style={{fontWeight:700,color:a.amount>0?C.red:C.green}}>{sgn(a.amount)}</span></div>)}
+      </div>}
+      {plan.miss.length>0&&<div style={{marginBottom:14}}>
+        <div style={{fontSize:12,fontWeight:700,color:C.txt,marginBottom:6}}>② Missed items added as new purchases ({plan.miss.length})</div>
+        {plan.miss.map((m,i)=><div key={i} style={{display:'flex',justifyContent:'space-between',gap:10,padding:'5px 0',borderBottom:`1px solid ${C.bdr}`,fontSize:12,flexWrap:'wrap'}}>
+          <span style={{color:C.txt}}>{fmtD(m.date)} · {m.name} · {m.qty} × ₹{m.rate}
+            <span style={{color:m.receive&&m.itemId?C.blue:C.muted,marginLeft:8}}>{m.receive?(m.itemId?'stock +'+m.qty:'received · not a catalogue item, no stock change'):'not received yet (shows as a pending purchase)'}</span></span>
+          <span style={{fontWeight:700,color:C.red}}>{sgn(m.amount)}</span></div>)}
+      </div>}
+      {plan.ext.length>0&&<div style={{marginBottom:14}}>
+        <div style={{fontSize:12,fontWeight:700,color:C.txt,marginBottom:6}}>③ Seller's extras / entries added ({plan.ext.length})</div>
+        {plan.ext.map((e,i)=><div key={i} style={{display:'flex',justifyContent:'space-between',gap:10,padding:'5px 0',borderBottom:`1px solid ${C.bdr}`,fontSize:12}}>
+          <span style={{color:C.txt}}>{fmtD(e.date)} · {e.label}</span><span style={{fontWeight:700,color:e.signed>0?C.red:C.green}}>{sgn(e.signed)}</span></div>)}
+      </div>}
+      <div style={{display:'flex',justifyContent:'space-between',padding:'10px 12px',borderRadius:8,background:'#F6F8FA',fontSize:13,fontWeight:700,marginBottom:8}}>
+        <span>Net change to what you owe {party.name}</span><span style={{color:effect>0?C.red:effect<0?C.green:C.txt}}>{effect===0?'₹0':sgn(effect)}</span></div>
+      <div style={{display:'flex',justifyContent:'space-between',fontSize:12,color:C.sub,marginBottom:14}}>
+        <span>Balance {fmt(closingBalance)} → <b style={{color:C.txt}}>{balTxt(ourAdjusted)}</b></span>
+        {sc!=null&&<span>Seller says {balTxt(sc)} · remaining difference <b style={{color:diff===0?C.green:C.red}}>{diff===0?'none ✓':sgn(diff)}</b></span>}</div>
+      <div style={{display:'flex',gap:8,justifyContent:'flex-end'}}>
+        <Btn onClick={()=>setStep('work')} variant="secondary">← Back</Btn>
+        {plan.count>0
+          ?<Btn onClick={doPost} variant="success" disabled={posting}>✓ Post to books</Btn>
+          :<Btn onClick={finishWithoutPosting} variant="success">Save & finish</Btn>}
+      </div>
+    </Modal>;
+  }
+
+  // ═════════════════════════════ WORKING STEP ════════════════════════════════
+  const diffColor=diff==null?C.muted:diff===0?C.green:C.red;
+  return <Modal title={'Reconcile with '+party.name} onClose={onClose} width={1000}>
+    <TC/>
+    <div style={{fontSize:12,color:C.sub,marginBottom:10}}>
+      Period: <b style={{color:C.txt}}>{from?fmtD(from):'Beginning'} → {to?fmtD(to):'Today'}</b>
+      {' · '}Type the seller's figures from their bill/statement. Anything left blank is treated as "matches". Your books change only when you press <b>Post to books</b>.
+      {existing&&<span style={{marginLeft:8,color:C.blue,fontWeight:600}}>↺ Resumed your saved draft</span>}
+      {lastPosted&&<span style={{marginLeft:8,color:C.muted}}>Last reconciled {fmtD((lastPosted.postedAt||'').slice(0,10))}{lastPosted.summary?.difference!=null?' · difference then '+fmt(Math.abs(lastPosted.summary.difference)):''}</span>}
+    </div>
+
+    {/* Seller's balances */}
+    <div style={{display:'grid',gridTemplateColumns:mobile?'1fr':'repeat(4,1fr)',gap:10,marginBottom:14}}>
+      <div style={{padding:'8px 12px',borderRadius:8,border:`1px solid ${C.bdr}`,background:C.surf}}>
+        <div style={{fontSize:10,fontWeight:700,color:C.sub,textTransform:'uppercase'}}>Our closing balance</div>
+        <div style={{fontSize:18,fontWeight:800,color:C.txt}}>{balTxt(closingBalance)}</div>
+        <div style={{fontSize:10,color:C.muted}}>Opening {balTxt(openingBalance)}</div></div>
+      <div style={{padding:'8px 12px',borderRadius:8,border:`1.5px solid ${C.blue}`,background:C.blueSoft}}>
+        <div style={{fontSize:10,fontWeight:700,color:C.blue,textTransform:'uppercase'}}>Seller's closing balance ★</div>
+        <input value={sellerClosing} onChange={e=>setSellerClosing(e.target.value)} inputMode="decimal" placeholder="From their statement"
+          style={{...inp,width:'100%',textAlign:'left',fontSize:15,fontWeight:700,marginTop:2}}/></div>
+      <div style={{padding:'8px 12px',borderRadius:8,border:`1px solid ${C.bdr}`,background:C.surf}}>
+        <div style={{fontSize:10,fontWeight:700,color:C.sub,textTransform:'uppercase'}}>Seller's opening balance</div>
+        <input value={sellerOpening} onChange={e=>setSellerOpening(e.target.value)} inputMode="decimal" placeholder="Optional"
+          style={{...inp,width:'100%',textAlign:'left',fontSize:14,marginTop:2}}/>
+        {so!=null&&openDiff!==0&&<div style={{fontSize:10,color:C.amber,fontWeight:600}}>differs from ours by {sgn(openDiff)}</div>}</div>
+      <div style={{padding:'8px 12px',borderRadius:8,border:`1.5px solid ${diffColor}`,background:'#fff'}}>
+        <div style={{fontSize:10,fontWeight:700,color:C.sub,textTransform:'uppercase'}}>Difference (seller − ours adjusted)</div>
+        <div style={{fontSize:18,fontWeight:800,color:diffColor}}>{diff==null?'Enter seller balance':diff===0?'✓ Reconciled':sgn(diff)}</div>
+        <div style={{fontSize:10,color:C.muted}}>Ours after changes {balTxt(ourAdjusted)}</div></div>
+    </div>
+
+    {/* ① Match rates & qty */}
+    {sec(1,'Match billed rates & quantities','Compare each bill line with the seller\'s bill. Type only what differs (a rate, a qty, or both) — or tick a whole bill as matching.',
+      <div style={{display:'flex',gap:6,flexWrap:'wrap',alignItems:'center'}}>
+        {[['all','All'],['attention','Mismatches'],['todo','Not fully checked']].map(([k,l])=>
+          <button key={k} onClick={()=>setFilter(k)} style={{padding:'3px 10px',borderRadius:14,border:`1px solid ${filter===k?C.blue:C.bdr}`,background:filter===k?C.blueSoft:'#fff',color:filter===k?C.blue:C.sub,fontSize:11,fontWeight:600,cursor:'pointer',fontFamily:'inherit'}}>{l}</button>)}
+        <Btn onClick={markAllBills} size="sm" variant="secondary">✓ All bills match</Btn>
+        {mism.length>0&&<Btn onClick={acceptAll} size="sm" variant="secondary">Accept all seller figures</Btn>}
+      </div>,
+      <>
+        {bills.length===0&&<div style={{padding:12,color:C.sub,fontSize:12}}>No purchase bills from this supplier in the selected period.</div>}
+        {shownBills.length===0&&bills.length>0&&<div style={{padding:12,color:C.sub,fontSize:12}}>Nothing in this view.</div>}
+        {shownBills.map(b=>{
+          const mc=billMismCount(b),ok=!!billOk[b.key];
+          return <div key={b.key} style={{border:`1px solid ${mc?C.red:C.bdr}`,borderRadius:8,marginBottom:10,overflow:'hidden'}}>
+            <div style={{display:'flex',alignItems:'center',gap:8,padding:'6px 10px',background:mc?C.redSoft:'#F9FAFB',flexWrap:'wrap'}}>
+              <span style={{fontSize:12,fontWeight:700,color:C.txt}}>{fmtD(b.date)}</span>
+              <span style={{fontSize:11,color:C.sub}}>{b.ref}</span>
+              {b.hist&&<Badge v="pre-ERP" color="gray"/>}
+              {!b.hist&&!b.received&&<Badge v="not received" color="amber"/>}
+              <span style={{flex:1}}/>
+              <span style={{fontSize:12,fontWeight:700,color:C.txt}}>{fmt(b.total)}</span>
+              {mc>0&&<Badge v={mc+' mismatch'+(mc>1?'es':'')} color="red"/>}
+              <label style={{display:'flex',alignItems:'center',gap:4,fontSize:11,color:C.sub,cursor:'pointer'}}>
+                <input type="checkbox" checked={ok} onChange={e=>markBill(b,e.target.checked)}/> Bill matches
+              </label>
+            </div>
+            <div style={{overflowX:'auto'}}><table style={{width:'100%',borderCollapse:'collapse',minWidth:mobile?760:0}}>
+              <thead><tr><th style={th('left')}>Item / charge</th><th style={th()}>Our qty</th><th style={th()}>Our rate</th><th style={th()}>Our amt</th>
+                <th style={th()}>Seller qty</th><th style={th()}>Seller rate</th><th style={th()}>Seller amt</th><th style={th()}>Δ</th><th style={th('left')}>Status / action</th></tr></thead>
+              <tbody>{b.lines.map(l=>{
+                const c=calcs[l.key],s=ls[l.key]||{};
+                return <Fragment key={l.key}>
+                  <tr style={{borderTop:`1px solid ${C.bdr}`,background:c.status==='mismatch'?'#FFF8F8':'transparent'}}>
+                    <td style={td('left')}>{l.name}{l.isCharge&&<span style={{fontSize:10,color:C.muted}}> (extra charge)</span>}</td>
+                    <td style={td()}>{l.type==='item'?l.qty:'—'}</td>
+                    <td style={td()}>{l.type==='item'?'₹'+l.rate:'—'}</td>
+                    <td style={td()}>{fmt(l.our)}</td>
+                    {l.type==='item'?<>
+                      <td style={td()}><input value={s.sQty??''} onChange={e=>setL(l.key,{sQty:e.target.value})} inputMode="decimal" placeholder={String(l.qty)} style={inp}/></td>
+                      <td style={td()}><input value={s.sRate??''} onChange={e=>setL(l.key,{sRate:e.target.value})} inputMode="decimal" placeholder={String(l.rate)} style={inp}/></td>
+                      <td style={{...td(),color:c.checked?C.txt:C.muted}}>{fmt(c.sAmt)}</td>
+                    </>:<>
+                      <td style={td()}>—</td><td style={td()}>—</td>
+                      <td style={td()}><input value={s.sAmt??''} onChange={e=>setL(l.key,{sAmt:e.target.value})} inputMode="decimal" placeholder={String(l.our)} style={{...inp,width:84}}/></td>
+                    </>}
+                    <td style={{...td(),fontWeight:700,color:c.delta>0?C.red:c.delta<0?C.green:C.muted}}>{c.status==='mismatch'?sgn(c.delta):c.status==='match'?'0':'—'}</td>
+                    <td style={td('left')}>
+                      {c.status!=='mismatch'?statusBadge(c.status):
+                        <select value={c.res} onChange={e=>setL(l.key,{res:e.target.value})} style={{padding:'3px 6px',borderRadius:5,border:`1.5px solid ${C.bdr}`,fontSize:11,fontFamily:'inherit',background:'#fff'}}>
+                          {l.fixable&&<option value="fix">Correct my entry</option>}
+                          <option value="adjust">Post as adjustment</option>
+                          <option value="dispute">Seller to correct</option>
+                        </select>}
+                    </td>
+                  </tr>
+                  {c.status==='mismatch'&&<tr style={{background:'#FFF8F8'}}><td colSpan={9} style={{padding:'0 8px 6px'}}>
+                    <input value={s.note??''} onChange={e=>setL(l.key,{note:e.target.value})} placeholder="Note (optional) — included in the message to the seller"
+                      style={{...inp,width:'100%',textAlign:'left',fontSize:11}}/></td></tr>}
+                </Fragment>;})}
+              </tbody>
+            </table></div>
+          </div>;})}
+        <div style={{fontSize:11,color:C.muted}}>{nChecked} of {allLines.length} lines checked · {mism.length} mismatch{mism.length===1?'':'es'}</div>
+      </>)}
+
+    {/* ② Missed items */}
+    {sec(2,'Missed items — on the seller\'s bill, not in my books','Items the seller billed that you never entered. Posting adds them as a purchase (and to stock if marked received).',
+      <Btn onClick={addMissed} size="sm" variant="secondary">+ Add missed item</Btn>,
+      <>
+        {missed.length===0&&<div style={{padding:'6px 0',color:C.sub,fontSize:12}}>None added.</div>}
+        {missed.length>0&&<div style={{overflowX:'auto'}}><table style={{width:'100%',borderCollapse:'collapse',minWidth:mobile?720:0}}>
+          <thead><tr><th style={th('left')}>Bill date</th><th style={th('left')}>Item</th><th style={th()}>Qty</th><th style={th()}>Rate ₹</th><th style={th()}>Amount</th><th style={th('left')}>Received?</th><th style={th()}></th></tr></thead>
+          <tbody>{missed.map(m=><tr key={m.id} style={{borderTop:`1px solid ${C.bdr}`}}>
+            <td style={td('left')}><input type="date" value={m.date} onChange={e=>editMissed(m.id,{date:e.target.value})} style={{...inp,width:126,textAlign:'left'}}/></td>
+            <td style={td('left')}>
+              <input list="recon-item-names" value={m.name} onChange={e=>setMissedName(m.id,e.target.value)} placeholder="Item name…" style={{...inp,width:mobile?170:230,textAlign:'left'}}/>
+              <div style={{fontSize:10,color:m.itemId?C.green:(m.name?C.amber:C.muted)}}>{m.itemId?'✓ linked to catalogue':(m.name?'not in catalogue — no stock change':' ')}</div></td>
+            <td style={td()}><input value={m.qty} onChange={e=>editMissed(m.id,{qty:e.target.value})} inputMode="decimal" style={inp}/></td>
+            <td style={td()}><input value={m.rate} onChange={e=>editMissed(m.id,{rate:e.target.value})} inputMode="decimal" style={inp}/></td>
+            <td style={{...td(),fontWeight:700}}>{fmt(missedAmt(m))}</td>
+            <td style={td('left')}><label style={{display:'flex',alignItems:'center',gap:4,fontSize:11,color:C.sub,cursor:'pointer'}}><input type="checkbox" checked={m.receive!==false} onChange={e=>editMissed(m.id,{receive:e.target.checked})}/> goods received</label></td>
+            <td style={td()}><button onClick={()=>setMissed(p=>p.filter(x=>x.id!==m.id))} style={{border:'none',background:'transparent',color:C.red,cursor:'pointer',fontSize:14}}>✕</button></td>
+          </tr>)}</tbody>
+          <tfoot><tr><td colSpan={4} style={{...td('left'),fontWeight:700}}>Total missed</td><td style={{...td(),fontWeight:800}}>{fmt(missedTotal)}</td><td colSpan={2}/></tr></tfoot>
+        </table></div>}
+        <datalist id="recon-item-names">{itemNames.map(n=><option key={n} value={n}/>)}</datalist>
+      </>)}
+
+    {/* ③ Extras */}
+    {sec(3,'Extras & seller entries not yet in my books','Charges the seller billed (freight, packing, interest…) or credits/discounts/returns they gave — anything on their statement that you haven\'t recorded.',
+      <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
+        <Btn onClick={()=>addExtra('','plus')} size="sm" variant="secondary">+ Charge billed</Btn>
+        <Btn onClick={()=>addExtra('Discount','minus')} size="sm" variant="secondary">+ Credit / discount</Btn>
+      </div>,
+      <>
+        {extras.length===0&&<div style={{padding:'6px 0',color:C.sub,fontSize:12}}>None added.</div>}
+        {extras.length>0&&<div style={{overflowX:'auto'}}><table style={{width:'100%',borderCollapse:'collapse',minWidth:mobile?640:0}}>
+          <thead><tr><th style={th('left')}>Date</th><th style={th('left')}>Description</th><th style={th('left')}>Type</th><th style={th()}>Amount ₹</th><th style={th()}>Effect</th><th style={th()}></th></tr></thead>
+          <tbody>{extras.map(e=><tr key={e.id} style={{borderTop:`1px solid ${C.bdr}`}}>
+            <td style={td('left')}><input type="date" value={e.date} onChange={ev=>editExtra(e.id,{date:ev.target.value})} style={{...inp,width:126,textAlign:'left'}}/></td>
+            <td style={td('left')}><input list="recon-extra-names" value={e.label} onChange={ev=>editExtra(e.id,{label:ev.target.value})} placeholder="e.g. Freight, Interest, Discount" style={{...inp,width:mobile?160:220,textAlign:'left'}}/></td>
+            <td style={td('left')}><select value={e.sign} onChange={ev=>editExtra(e.id,{sign:ev.target.value})} style={{padding:'4px 6px',borderRadius:5,border:`1.5px solid ${C.bdr}`,fontSize:11,fontFamily:'inherit',background:'#fff'}}>
+              <option value="plus">Charge billed (+ I owe more)</option><option value="minus">Credit / discount (− I owe less)</option></select></td>
+            <td style={td()}><input value={e.amount} onChange={ev=>editExtra(e.id,{amount:ev.target.value})} inputMode="decimal" style={inp}/></td>
+            <td style={{...td(),fontWeight:700,color:e.sign==='minus'?C.green:C.red}}>{num(e.amount)?sgn(extraSigned(e)):'—'}</td>
+            <td style={td()}><button onClick={()=>setExtras(p=>p.filter(x=>x.id!==e.id))} style={{border:'none',background:'transparent',color:C.red,cursor:'pointer',fontSize:14}}>✕</button></td>
+          </tr>)}</tbody>
+          <tfoot><tr><td colSpan={4} style={{...td('left'),fontWeight:700}}>Net extras</td><td style={{...td(),fontWeight:800}}>{extrasTotal===0?'₹0':sgn(extrasTotal)}</td><td/></tr></tfoot>
+        </table></div>}
+        <datalist id="recon-extra-names">{extraNames.map(n=><option key={n} value={n}/>)}</datalist>
+      </>)}
+
+    {/* Payments check */}
+    {sec('✓','Payments check (optional)','If the seller shows a different amount for a payment you made, enter it — enter 0 if they never got it. This explains part of the difference; it never edits your payments.',
+      <Btn onClick={()=>setShowPays(v=>!v)} size="sm" variant="secondary">{showPays?'Hide':'Show'} {pays.length} payment{pays.length===1?'':'s'}</Btn>,
+      <>
+        {!showPays&&<div style={{fontSize:12,color:C.sub}}>{payDiff!==0?'Payment differences so far: '+sgn(payDiff):'No payment differences entered.'}</div>}
+        {showPays&&(pays.length===0?<div style={{fontSize:12,color:C.sub}}>No payments to this supplier in the period.</div>
+          :<div style={{overflowX:'auto'}}><table style={{width:'100%',borderCollapse:'collapse'}}>
+            <thead><tr><th style={th('left')}>Date</th><th style={th('left')}>Payment</th><th style={th()}>We paid</th><th style={th()}>Seller shows</th><th style={th()}>Δ</th></tr></thead>
+            <tbody>{pays.map(p=>{const pc=payCalcs[p.key];return <tr key={p.key} style={{borderTop:`1px solid ${C.bdr}`}}>
+              <td style={td('left')}>{fmtD(p.date)}</td><td style={td('left')}>{p.desc}</td><td style={td()}>{fmt(p.amount)}</td>
+              <td style={td()}><input value={payChk[p.key]??''} onChange={e=>setPayChk(x=>({...x,[p.key]:e.target.value}))} inputMode="decimal" placeholder={String(p.amount)} style={{...inp,width:84}}/></td>
+              <td style={{...td(),fontWeight:700,color:pc.delta===0?C.muted:C.red}}>{pc.checked?(pc.delta===0?'✓':sgn(pc.delta)):'—'}</td></tr>;})}</tbody>
+          </table></div>)}
+      </>)}
+
+    {/* ④ Difference & settlement */}
+    {sec(4,'Difference & final settlement',null,null,
+      <>
+        <table style={{width:'100%',borderCollapse:'collapse',maxWidth:620}}>
+          <tbody>
+            {[
+              ['Our closing balance',balTxt(closingBalance),C.txt,false],
+              ['+ Rate/qty corrections accepted',dFix+dAdj===0?'₹0':sgn(r2(dFix+dAdj)),C.txt,false],
+              ['+ Missed items added',missedTotal===0?'₹0':sgn(missedTotal),C.txt,false],
+              ['+ Seller extras / entries added',extrasTotal===0?'₹0':sgn(extrasTotal),C.txt,false],
+              ['= Our balance after adjustments',balTxt(ourAdjusted),C.blue,true],
+              ["Seller's closing balance",sc==null?'— enter above —':balTxt(sc),C.txt,true],
+              ['Difference (seller − ours)',diff==null?'—':diff===0?'₹0  ✓ reconciled':sgn(diff),diffColor,true],
+            ].map(([l,v,c,b],i)=><tr key={i} style={{borderTop:b?`1px solid ${C.bdr}`:'none'}}>
+              <td style={{padding:'4px 0',fontSize:12,color:C.sub,fontWeight:b?700:400}}>{l}</td>
+              <td style={{padding:'4px 0',fontSize:13,textAlign:'right',color:c,fontWeight:b?800:600,fontVariantNumeric:'tabular-nums'}}>{v}</td></tr>)}
+          </tbody>
+        </table>
+        {diff!=null&&diff!==0&&<div style={{margin:'10px 0',padding:'10px 12px',borderRadius:8,background:'#F9FAFB',border:`1px solid ${C.bdr}`,maxWidth:620}}>
+          <div style={{fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',marginBottom:4}}>What the difference is made of</div>
+          {[
+            ['Lines I\'m asking the seller to correct',dDis],
+            ['Payments the seller recorded differently',payDiff],
+            ['Opening balance difference',openDiff],
+            ['Still unexplained — check dates, missing bills/payments',unexplained],
+          ].map(([l,v],i)=><div key={i} style={{display:'flex',justifyContent:'space-between',fontSize:12,padding:'2px 0',color:i===3&&v!==0?C.red:C.txt,fontWeight:i===3?700:400}}>
+            <span>{l}</span><span style={{fontVariantNumeric:'tabular-nums'}}>{v===0?'₹0':sgn(v)}</span></div>)}
+        </div>}
+        <div style={{margin:'12px 0 6px',padding:'12px 14px',borderRadius:10,background:C.blueSoft,border:`1px solid ${C.blue}`,maxWidth:620}}>
+          <div style={{fontSize:11,fontWeight:700,color:C.blue,textTransform:'uppercase',marginBottom:6}}>Final settlement</div>
+          <div style={{display:'flex',gap:14,flexWrap:'wrap',fontSize:12,marginBottom:6}}>
+            <label style={{display:'flex',alignItems:'center',gap:5,cursor:'pointer'}}><input type="radio" checked={settleBasis==='ours'} onChange={()=>setSettleBasis('ours')}/> Settle on my adjusted balance</label>
+            <label style={{display:'flex',alignItems:'center',gap:5,cursor:sc==null?'not-allowed':'pointer',opacity:sc==null?.5:1}}><input type="radio" disabled={sc==null} checked={settleBasis==='seller'} onChange={()=>setSettleBasis('seller')}/> Settle on the seller's balance (I accept it)</label>
+          </div>
+          <div style={{fontSize:22,fontWeight:800,color:settleAmt>0?C.red:C.green}}>
+            {settleAmt>0?'Pay '+party.name+' '+fmt(settleAmt):settleAmt<0?party.name+' owes you '+fmt(Math.abs(settleAmt)):'Nothing to pay — fully settled'}
+          </div>
+          {settleBasis==='ours'&&diff!=null&&diff!==0&&<div style={{fontSize:11,color:C.sub,marginTop:4}}>The {fmt(Math.abs(diff))} difference stays open with the seller until they confirm.</div>}
+        </div>
+        <div style={{marginTop:10}}>
+          <label style={{fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase'}}>Notes (kept with this reconciliation, added to the message to the seller)</label>
+          <textarea value={notes} onChange={e=>setNotes(e.target.value)} rows={2} style={{width:'100%',marginTop:3,padding:'6px 8px',borderRadius:6,border:`1.5px solid ${C.bdr}`,fontSize:12,fontFamily:'inherit',boxSizing:'border-box',resize:'vertical'}}/>
+        </div>
+      </>)}
+
+    <div style={{display:'flex',gap:8,justifyContent:'space-between',flexWrap:'wrap',position:'sticky',bottom:0,background:'#fff',padding:'10px 0 2px',borderTop:`1px solid ${C.bdr}`}}>
+      <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+        <Btn onClick={sendNote} variant="secondary" icon="📲">Note to seller</Btn>
+        <Btn onClick={clearAll} variant="ghost">Start over</Btn>
+      </div>
+      <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
+        <span style={{fontSize:11,color:C.muted}}>{plan.count>0?plan.count+' change'+(plan.count===1?'':'s')+' ready to post':'Draft autosaved'}</span>
+        <Btn onClick={onClose} variant="secondary">Save draft & close</Btn>
+        <Btn onClick={goReview} variant="success">Review & post →</Btn>
+      </div>
+    </div>
+  </Modal>;
+}
+
 function PartyLedger({party,onClose}){
   const mobile=useIsMobile();
   // 'both'-type parties (buy from AND sell to us) get the single merged,
@@ -4068,6 +4725,7 @@ function PartyLedger({party,onClose}){
   // Profit/Margin tile drill-down (request #23) — opens a separate page
   // instead of cramming per-sale profit/interest figures onto this ledger.
   const[showProfit,setShowProfit]=useState(false);
+  const[reconWin,setReconWin]=useState(null);
   const[exFrom,setExFrom]=useState('');
   const[exTo,setExTo]=useState(today());
   const{toast,TC}=useToast();
@@ -4545,6 +5203,7 @@ function PartyLedger({party,onClose}){
     {viewPurchase&&<PurchaseViewModal purchase={viewPurchase} onClose={()=>setViewPurchase(null)}/>}
     {showRepairModal&&<RepairExpenseModal party={party} onClose={()=>setShowRepairModal(false)} onSaved={()=>setShowRepairModal(false)}/>}
     {showProfit&&<PartySaleProfitModal party={party} onClose={()=>setShowProfit(false)}/>}
+    {reconWin&&<SupplierReconcileModal party={party} from={reconWin.from} to={reconWin.to} openingBalance={reconWin.openingBalance} closingBalance={reconWin.closingBalance} onClose={()=>setReconWin(null)}/>}
     {/* 'both'-type parties never reach this component (see the early return
         above) — the Customer/Supplier toggle that used to live here is gone. */}
     <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}}>
@@ -4577,6 +5236,7 @@ function PartyLedger({party,onClose}){
       <div style={{display:'flex',gap:8,width:mobile?'100%':'auto'}}>
         <Btn onClick={exportLedgerExcel} variant="secondary" size="sm" icon="⬇">Excel</Btn>
         <Btn onClick={exportLedgerPDF} variant="secondary" size="sm" icon="⬇">PDF</Btn>
+        {isSupplier&&<Btn onClick={()=>{const w=buildExportWindow();setReconWin({openingBalance:w.openingBalance,closingBalance:w.closingBalance,from:exFrom,to:exTo});}} variant="primary" size="sm" icon="⚖">Reconcile</Btn>}
       </div>
     </div>
 

@@ -1967,6 +1967,11 @@ export const state = {
   // was copied to the clipboard first. Saved once per group, reused on every
   // share (ShareItemModal/CatalogueShareModal) same as a party's phone.
   waGroups:         [],
+  // Supplier Reconciliation workspace (see SupplierReconcileModal in App.jsx):
+  // one 'draft' per supplier holds the user's typed-in seller figures between
+  // sessions; 'posted' records are the audit trail of what a finished
+  // reconciliation changed in the books.
+  supplierReconciliations: [],
   // Category Analytics: categories the user has chosen to hide from that
   // view entirely (task #133) — e.g. a junk/"Other" bucket, or a category
   // they just don't want cluttering the table. Soft hide only, same spirit
@@ -2032,6 +2037,10 @@ export const save = {
   dashboardHiddenOOS: mk('data:dashboardHiddenOOS', () => state.dashboardHiddenOOS),
   salesFollowupHidden: mk('data:salesFollowupHidden', () => state.salesFollowupHidden),
   waGroups:         mk('data:waGroups',         () => state.waGroups),
+  supplierReconciliations: mk('data:supplierReconciliations', () => state.supplierReconciliations),
+  // Silent twin used for the reconcile screen's autosave — a notifying save
+  // would remount the open screen (liveTick key) on every keystroke batch.
+  supplierReconciliationsSilent: mkSilent('data:supplierReconciliations', () => state.supplierReconciliations),
   hiddenCategories: mk('data:hiddenCategories', () => state.hiddenCategories),
 };
 
@@ -2201,6 +2210,7 @@ const STORAGE_KEY_TO_STATE = {
   'data:stockReconciliations':'stockReconciliations',
   'data:dashboardHiddenOOS':'dashboardHiddenOOS', 'data:salesFollowupHidden':'salesFollowupHidden',
   'data:waGroups':'waGroups', 'data:hiddenCategories':'hiddenCategories',
+  'data:supplierReconciliations':'supplierReconciliations',
 };
 const liveListeners = new Set();
 export function subscribeLive(fn) { liveListeners.add(fn); return () => liveListeners.delete(fn); }
@@ -2271,7 +2281,7 @@ export function updatePartyPhone(partyId, phone) {
 export async function loadAll() {
   if (state.loaded) return;
   try {
-    const [sales,payments,pe,pt,fu,txns,parties,items,purchases,supplierPayments,freightCharges,customCategories,categoryTags,cityTransport,orders,dispatchPhone,itemCustomerNames,cityOrder,repairExpenses,stockAdjustments,users,stockReconciliations,dashboardHiddenOOS,salesFollowupHidden,waGroups,hiddenCategories] = await Promise.all([
+    const [sales,payments,pe,pt,fu,txns,parties,items,purchases,supplierPayments,freightCharges,customCategories,categoryTags,cityTransport,orders,dispatchPhone,itemCustomerNames,cityOrder,repairExpenses,stockAdjustments,users,stockReconciliations,dashboardHiddenOOS,salesFollowupHidden,waGroups,hiddenCategories,supplierReconciliations] = await Promise.all([
       DB.get('data:sales'), DB.get('data:payments'), DB.get('data:phoneEdits'),
       DB.get('data:partyTransport'), DB.get('data:followups'), DB.get('data:txns'),
       DB.get('data:parties'), DB.get('data:items'), DB.get('data:purchases'), DB.get('data:supplierPayments'),
@@ -2279,7 +2289,7 @@ export async function loadAll() {
       DB.get('data:cityTransport'), DB.get('data:orders'), DB.get('data:dispatchPhone'), DB.get('data:itemCustomerNames'),
       DB.get('data:cityOrder'), DB.get('data:repairExpenses'), DB.get('data:stockAdjustments'), DB.get('data:users'),
       DB.get('data:stockReconciliations'), DB.get('data:dashboardHiddenOOS'), DB.get('data:salesFollowupHidden'),
-      DB.get('data:waGroups'), DB.get('data:hiddenCategories'),
+      DB.get('data:waGroups'), DB.get('data:hiddenCategories'), DB.get('data:supplierReconciliations'),
     ]);
     if (sales)    state.sales    = sales;
     if (payments) state.payments = payments;
@@ -2304,6 +2314,7 @@ export async function loadAll() {
     if (salesFollowupHidden) state.salesFollowupHidden = salesFollowupHidden;
     if (waGroups)         state.waGroups          = waGroups;
     if (hiddenCategories) state.hiddenCategories  = hiddenCategories;
+    if (supplierReconciliations) state.supplierReconciliations = supplierReconciliations;
     // One-time migration: persisted items predate two corrections in the seed
     // data — (1) `purch` used to be a flat 22% of `sale` instead of a real
     // rate, hiding per-item margins, and (2) `stock`/`stockValue` weren't yet
