@@ -4080,7 +4080,19 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
   const existing=useMemo(()=>state.supplierReconciliations.find(r=>r.partyId===party.id&&r.status==='draft'),[]);
   const lastPosted=useMemo(()=>state.supplierReconciliations.filter(r=>r.partyId===party.id&&r.status==='posted').sort((a,b)=>(b.postedAt||'').localeCompare(a.postedAt||''))[0],[]);
   const[draftId]=useState(existing?.id||uid('REC'));
-  const d0=existing||{};
+  // No open draft? Carry on from the last posted/finished reconciliation: the
+  // seller's side (their figures, statement balances, notes, flags) comes back,
+  // while my-books edits are NOT restored — those were posted into the books.
+  // Added rows come back only if they weren't posted (my books amount was 0).
+  const seed=useMemo(()=>(!existing&&lastPosted&&lastPosted.v===3)?lastPosted:null,[]);
+  const d0=existing||(seed?{
+    v:3,sellerClosing:seed.sellerClosing,sellerOpening:seed.sellerOpening,notes:seed.notes,settleBasis:seed.settleBasis,
+    lines:Object.fromEntries(Object.entries(seed.lines||{}).map(([k,v])=>{const{bQty,bRate,bAmt,res,...rest}=v||{};return[k,rest];})),
+    payChk:seed.payChk||{},payWas:seed.payWas||{},billOk:seed.billOk||{},noteMap:seed.noteMap||{},flags:seed.flags||{},
+    missed:(seed.missed||[]).filter(m=>(m.name||m.qty||m.rate)&&(num(m.bQty)!=null?num(m.bQty):(num(m.qty)||0))===0),
+    extras:(seed.extras||[]).filter(e=>(e.label||e.amount||e.bAmount)&&e.kind!=='writeoff'&&(e.kind==='opening'?(num(e.bAmount)||0):((e.sign==='minus'?-1:1)*(num(e.bAmount)!=null?num(e.bAmount):(num(e.amount)||0))))===0),
+  }:{});
+  const payWas=d0.payWas||{};   // payment amounts as they were before a posted correction
   // Drafts saved by the previous version stored an accept/adjust/dispute choice
   // per line. Turn those into explicit book-side figures so nothing already
   // typed is lost.
@@ -4160,7 +4172,7 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
       (p.items||[]).forEach((it,i)=>{
         const q=Number(it.qty)||0,rt=Number(it.rate)||0;
         const cat=it.itemId?state.items.find(x=>x.id===it.itemId):null;
-        lines.push({key:p.id+'#'+i,billKey:p.id,type:'item',idx:i,name:it.supplierName||cat?.supplier||it.customerName||it.itemName||'Item',oname:cat?.internal||it.itemName||it.customerName||'',itemId:it.itemId,qty:q,rate:rt,our:r2(q*rt),fixable:true});
+        lines.push({key:p.id+'#'+i,billKey:p.id,type:'item',idx:i,name:it.supplierName||cat?.supplier||it.customerName||it.itemName||'Item',oname:cat?.internal||it.itemName||it.customerName||'',seed:it.reconSeller||null,itemId:it.itemId,qty:q,rate:rt,our:r2(q*rt),fixable:true});
       });
       (p.extraCharges||[]).forEach((c,i)=>{
         lines.push({key:p.id+'!'+(c.id||i),billKey:p.id,type:'amount',chargeIdx:i,name:c.name||'Extra charge',our:r2(c.amount),fixable:true,isCharge:true});
@@ -4191,7 +4203,8 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
     const m={};
     allLines.forEach(l=>{
       const s=ls[l.key]||{};
-      let bQty=l.qty,bRate=l.rate,bAmt=l.our,sQty=l.qty,sRate=l.rate,sAmt=l.our,touched=false,edited=false;
+      // l.seed = the seller's own figure for an entry created by an earlier reconciliation
+      let bQty=l.qty,bRate=l.rate,bAmt=l.our,sQty=l.seed?l.seed.qty:l.qty,sRate=l.seed?l.seed.rate:l.rate,sAmt=l.our,touched=!!l.seed&&(l.seed.qty!==l.qty||l.seed.rate!==l.rate),edited=false;
       if(l.type==='item'){
         const bq=num(s.bQty),br=num(s.bRate);
         if(bq!=null)bQty=bq;
@@ -4213,7 +4226,8 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
       const delta=r2(sAmt-bAmt);          // seller − my (edited) books
       const change=r2(bAmt-l.our);        // my edit vs what I had recorded
       m[l.key]={bQty,bRate,bAmt,sQty,sRate,sAmt,checked,edited,delta,change,status:!checked?'unchecked':delta===0?'match':'mismatch',res:s.res==='adjust'?'adjust':'fix',note:s.note||'',
-        orig:checked?r2(sAmt-l.our):0,flag:!!flags[l.key]};   // orig = seller − what I originally recorded (kept even after I correct my books)
+        ref:s.was!=null?Number(s.was):l.our,wasCorrected:s.was!=null,
+        orig:checked?r2(sAmt-(s.was!=null?Number(s.was):l.our)):0,flag:!!flags[l.key]};   // orig = seller − what I originally recorded (kept even after I correct my books)
     });
     return m;
   },[allLines,ls,billOk,flags]);
@@ -4235,7 +4249,8 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
       const edited=bAmt!==p.amount,checked=sa!=null||edited;
       const delta=r2(bAmt-sAmt);
       m[p.key]={sAmt,bAmt,edited,checked,delta,balDelta:r2(p.amount-bAmt),res:payRes[p.key]==='adjust'?'adjust':'fix',mismatch:checked&&delta!==0,
-        orig:sa!=null?r2(p.amount-sAmt):0,flag:!!flags['p'+p.key]};
+        ref:payWas[p.key]!=null?Number(payWas[p.key]):p.amount,wasCorrected:payWas[p.key]!=null,
+        orig:sa!=null?r2((payWas[p.key]!=null?Number(payWas[p.key]):p.amount)-sAmt):0,flag:!!flags['p'+p.key]};
     });
     return m;
   },[pays,payChk,payBk,payRes,flags]);
@@ -4344,7 +4359,7 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
   const settleAmt=settleBasis==='seller'&&sc!=null?sc:ourAdjusted;
 
   // ── Autosave (debounced, silent) ───────────────────────────────────────────
-  const payload=useMemo(()=>({id:draftId,partyId:party.id,partyName:party.name,status:'draft',from:from||'',to:to||'',v:3,sellerClosing,sellerOpening,lines:ls,billOk,missed,extras,payChk,payBk,payRes,noteMap,flags,notes,settleBasis}),[draftId,party.id,party.name,from,to,sellerClosing,sellerOpening,ls,billOk,missed,extras,payChk,payBk,payRes,noteMap,flags,notes,settleBasis]);
+  const payload=useMemo(()=>({id:draftId,partyId:party.id,partyName:party.name,status:'draft',from:from||'',to:to||'',v:3,sellerClosing,sellerOpening,lines:ls,billOk,missed,extras,payChk,payBk,payRes,payWas,noteMap,flags,notes,settleBasis}),[draftId,party.id,party.name,from,to,sellerClosing,sellerOpening,ls,billOk,missed,extras,payChk,payBk,payRes,noteMap,flags,notes,settleBasis]);
   const lastSaved=useRef(JSON.stringify(payload));
   const latestPayload=useRef(payload);latestPayload.current=payload;
   // finished = this reconciliation was posted/saved as final; from then on the
@@ -4437,7 +4452,7 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
     editedLines.forEach(l=>{
       const c=calcs[l.key],bill=bills.find(b=>b.key===l.billKey);
       if(l.fixable&&c.res!=='adjust'){
-        fix.push({purchaseId:l.billKey,type:l.type,idx:l.idx,chargeIdx:l.chargeIdx,name:l.name,date:bill.date,
+        fix.push({key:l.key,purchaseId:l.billKey,type:l.type,idx:l.idx,chargeIdx:l.chargeIdx,name:l.name,date:bill.date,
           oldQty:l.qty,oldRate:l.rate,oldAmt:l.our,nQty:c.bQty,nRate:c.bRate,nAmt:c.bAmt,delta:c.change,
           itemId:l.itemId,received:bill.received});
       }else if(c.change!==0){
@@ -4449,7 +4464,7 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
       if(!p.hist&&c.res!=='adjust'&&c.bAmt>0)payFixes.push({id:p.key,txnId:p.txnId,date:p.date,desc:p.desc,oldAmt:p.amount,newAmt:c.bAmt,delta:c.balDelta});
       else if(c.balDelta!==0)payAdjs.push({date:p.date,name:'Reconciliation adj — payment '+fmtD(p.date)+' ('+p.desc+')',amount:c.balDelta});
     });
-    const miss=missedRows.map(m=>({...m,date:entryDate(m),qty:bkQty(m),rate:bkRate(m),amount:missedBk(m),sellerAmt:missedAmt(m)})).filter(m=>m.qty!==0);
+    const miss=missedRows.map(m=>({...m,sQty:num(m.qty),sRate:num(m.rate),date:entryDate(m),qty:bkQty(m),rate:bkRate(m),amount:missedBk(m),sellerAmt:missedAmt(m)})).filter(m=>m.qty!==0);
     const ext=extraRows.map(e=>({...e,date:entryDate(e),signed:extraBk(e),sellerSigned:extraSigned(e)})).filter(e=>e.signed!==0);
     return{fix,adj,payFixes,payAdjs,miss,ext,count:fix.length+adj.length+payFixes.length+payAdjs.length+miss.length+ext.length};
   })();
@@ -4487,7 +4502,12 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
   const summaryObj=()=>({ourClosing:closingBalance,ourAdjusted,sellerClosing:sc,sellerCalc,difference:diff,stillDifferent:remaining,openingDiff:openDiff,unexplained,settleBasis,settleAmt});
 
   const finalize=(nowIso,posted)=>{
-    const rec={...payload,status:'posted',postedAt:nowIso,summary:summaryObj(),posted};
+    // Remember what corrected lines/payments were before, so they stay in the
+    // "to discuss" list when this reconciliation is reopened.
+    const lines2={...payload.lines},payWas2={...payWas};
+    plan.fix.forEach(f=>{lines2[f.key]={...(lines2[f.key]||{}),was:(lines2[f.key]&&lines2[f.key].was!=null)?lines2[f.key].was:f.oldAmt};});
+    plan.payFixes.forEach(f=>{if(payWas2[f.id]==null)payWas2[f.id]=f.oldAmt;});
+    const rec={...payload,lines:lines2,payWas:payWas2,status:'posted',postedAt:nowIso,summary:summaryObj(),posted};
     const had=state.supplierReconciliations.some(r=>r.id===draftId);
     state.supplierReconciliations=had?state.supplierReconciliations.map(r=>r.id===draftId?{...r,...rec}:r):[rec,...state.supplierReconciliations];
   };
@@ -4557,20 +4577,21 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
 
     // A ledger-only entry (no catalogue item, no stock) carrying one signed
     // amount, so it shows in the supplier ledger with its reason.
-    const mkLedgerEntry=(date,name,amount,source)=>({id:newPurId(),date,bookedDate:date,receivedDate:date,status:'received',expectedDate:null,
+    // sellerAmt = what the SELLER has for this entry (0 for my own adjustments / write-offs) — remembered so it still shows as a difference next time
+    const mkLedgerEntry=(date,name,amount,source,sellerAmt)=>({id:newPurId(),date,bookedDate:date,receivedDate:date,status:'received',expectedDate:null,
       partyId:party.id,partyName:party.name,
-      items:[{itemId:'',itemName:name,customerName:name,supplierName:name,qty:1,rate:amount,amount,peti:1,freightPerPeti:0,freightAmount:0}],
+      items:[{itemId:'',itemName:name,customerName:name,supplierName:name,qty:1,rate:amount,amount,peti:1,freightPerPeti:0,freightAmount:0,...(sellerAmt!=null&&sellerAmt!==amount?{reconSeller:{qty:1,rate:sellerAmt}}:{})}],
       total:amount,bilty:'',extraCharges:[],extraChargesTotal:0,totalPetis:0,freightAmount:0,source,reconId:draftId,createdAt:nowIso});
 
     // Differences kept as separate adjustment entries instead of editing the original.
-    plan.adj.forEach(a=>{if(a.amount)created.push(mkLedgerEntry(a.date,a.name,a.amount,'reconciliation-adjustment'));});
-    plan.payAdjs.forEach(a=>{if(a.amount)created.push(mkLedgerEntry(a.date,a.name,a.amount,'reconciliation-adjustment'));});
+    plan.adj.forEach(a=>{if(a.amount)created.push(mkLedgerEntry(a.date,a.name,a.amount,'reconciliation-adjustment',0));});
+    plan.payAdjs.forEach(a=>{if(a.amount)created.push(mkLedgerEntry(a.date,a.name,a.amount,'reconciliation-adjustment',0));});
     // Charges / credits / payments added (my-books figure).
     plan.ext.forEach(e=>{
       if(!e.signed)return;
-      if(e.kind==='writeoff')created.push(mkLedgerEntry(e.date,'Write-off — '+e.label.trim(),e.signed,'reconciliation-writeoff'));
-      else if(e.kind==='opening')created.push(mkLedgerEntry(e.date,'Opening balance adjustment — '+e.label.trim(),e.signed,'reconciliation-opening'));
-      else created.push(mkLedgerEntry(e.date,'Reconciliation — '+e.label.trim(),e.signed,'reconciliation-extra'));
+      if(e.kind==='writeoff')created.push(mkLedgerEntry(e.date,'Write-off — '+e.label.trim(),e.signed,'reconciliation-writeoff',0));
+      else if(e.kind==='opening')created.push(mkLedgerEntry(e.date,'Opening balance adjustment — '+e.label.trim(),e.signed,'reconciliation-opening',e.sellerSigned));
+      else created.push(mkLedgerEntry(e.date,'Reconciliation — '+e.label.trim(),e.signed,'reconciliation-extra',e.sellerSigned));
     });
     // Missed items → real purchase lines (stock moves only when "received").
     const groups={};
@@ -4582,7 +4603,7 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
         const cat=m.itemId?state.items.find(x=>x.id===m.itemId):null;
         const q=num(m.qty),rt=num(m.rate);
         if(received&&m.itemId)stock[m.itemId]=(stock[m.itemId]||0)+q;
-        return{itemId:m.itemId||'',itemName:cat?.internal||m.name,customerName:cat?.internal||m.name,supplierName:m.name,qty:q,rate:rt,amount:r2(q*rt),peti:cat?.peti||1,freightPerPeti:0,freightAmount:0};
+        return{itemId:m.itemId||'',itemName:cat?.internal||m.name,customerName:cat?.internal||m.name,supplierName:m.name,qty:q,rate:rt,amount:r2(q*rt),peti:cat?.peti||1,freightPerPeti:0,freightAmount:0,...((m.sQty!==q||m.sRate!==rt)?{reconSeller:{qty:m.sQty,rate:m.sRate}}:{})};
       });
       created.push({id:newPurId(),date,bookedDate:date,receivedDate:received?date:null,status:received?'received':'ordered',expectedDate:null,
         partyId:party.id,partyName:party.name,items,total:r2(items.reduce((s,x)=>s+x.amount,0)),bilty:'',
@@ -4628,9 +4649,9 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
     // Where your figure differed from our record and we've corrected our books to agree
     allLines.filter(l=>calcs[l.key].orig!==0&&calcs[l.key].status!=='mismatch').forEach(l=>{
       const c=calcs[l.key],b=billOf(l.billKey);
-      fixedL.push('• '+fmtD(b.date)+' '+l.name+': we had '+fmt(l.our)+', corrected on our side to '+(l.type==='item'?c.bQty+' × ₹'+c.bRate+' = ':'')+fmt(c.bAmt)+(c.note?' — '+c.note:''));
+      fixedL.push('• '+fmtD(b.date)+' '+l.name+': we had '+fmt(c.ref)+', corrected on our side to '+(l.type==='item'?c.bQty+' × ₹'+c.bRate+' = ':'')+fmt(c.bAmt)+(c.note?' — '+c.note:''));
     });
-    pays.filter(p=>payCalcs[p.key].orig!==0&&!payCalcs[p.key].mismatch).forEach(p=>fixedL.push('• Payment '+fmtD(p.date)+': we had '+fmt(p.amount)+', corrected on our side to '+fmt(payCalcs[p.key].bAmt)));
+    pays.filter(p=>payCalcs[p.key].orig!==0&&!payCalcs[p.key].mismatch).forEach(p=>fixedL.push('• Payment '+fmtD(p.date)+': we had '+fmt(payCalcs[p.key].ref)+', corrected on our side to '+fmt(payCalcs[p.key].bAmt)));
     allLines.filter(l=>calcs[l.key].flag&&calcs[l.key].orig===0&&calcs[l.key].status!=='mismatch').forEach(l=>{const b=billOf(l.billKey);lines.push('• '+fmtD(b.date)+' '+l.name+': flagged for discussion'+(calcs[l.key].note?' — '+calcs[l.key].note:''));});
     const noteLines=[];
     bills.forEach(b=>{if((noteMap[b.key]||'').trim())noteLines.push('• '+fmtD(b.date)+' bill: '+noteMap[b.key].trim());});
@@ -4747,7 +4768,7 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
         <td style={td('left')}>
           <div style={{display:'flex',flexDirection:'column',gap:3,alignItems:'flex-start'}}>
             {mm?<div style={{display:'flex',alignItems:'center',gap:5}}><b style={{color:dcol(c.delta)}}>{sgn(c.delta)}</b>{miniBtn("← Take seller's",()=>takeLine(l))}</div>:statusBadge(c.status)}
-            {!mm&&c.orig!==0&&<div style={{fontSize:10,fontWeight:700,color:C.amber}}>✓ corrected on my books · seller {fmt(c.sAmt)} vs {fmt(l.our)} recorded ({sgn(c.orig)})</div>}
+            {!mm&&c.orig!==0&&<div style={{fontSize:10,fontWeight:700,color:C.amber}}>✓ corrected on my books · seller {fmt(c.sAmt)} vs {fmt(c.ref)} {c.wasCorrected?'before correction':'recorded'} ({sgn(c.orig)})</div>}
             {(c.edited||c.orig!==0||c.flag)&&!mm&&miniBtn(c.flag?'💬 Flagged to discuss':'💬 Flag to discuss',()=>setFlags(p=>({...p,[l.key]:!p[l.key]})),c.flag?C.amber:C.sub)}
             {c.edited&&<div style={{display:'flex',alignItems:'center',gap:5,flexWrap:'wrap'}}>
               {miniBtn('↺ Undo my edit',()=>revertLine(l),C.sub)}
@@ -4940,6 +4961,7 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
       Period: <b style={{color:C.txt}}>{from?fmtD(from):'Beginning'} → {to?fmtD(to):'Today'}</b>
       {' · '}<b>Left: your books</b> (edit any qty / rate / amount) · <b>right: the seller's</b> (type only where it differs — blank means "same as I recorded"). <b>← Take seller's</b> copies their figure into your books so that mismatch is resolved; only unresolved ones stay red.
       {existing&&<span style={{marginLeft:8,color:C.blue,fontWeight:600}}>↺ Resumed your saved draft</span>}
+      {seed&&<span style={{marginLeft:8,color:C.blue,fontWeight:600}}>↺ Continued from your last reconciliation ({fmtD((seed.postedAt||'').slice(0,10))}) — the seller's figures are back; corrections you posted are already in your books</span>}
       {lastPosted&&<span style={{marginLeft:8,color:C.muted}}>Last reconciled {fmtD((lastPosted.postedAt||'').slice(0,10))}{lastPosted.summary?.difference!=null?' · difference then '+fmt(Math.abs(lastPosted.summary.difference)):''}</span>}
     </div>
 
@@ -5058,7 +5080,7 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
                   <td style={td('left')}>
                     <div style={{display:'flex',flexDirection:'column',gap:3,alignItems:'flex-start'}}>
                       {pc.mismatch?<div style={{display:'flex',alignItems:'center',gap:5}}><b style={{color:dcol(pc.delta)}}>{sgn(pc.delta)}</b>{miniBtn("← Take seller's",()=>takePay(p))}</div>:(pc.checked?<Badge v="✓ Match" color="green"/>:<Badge v="Not checked" color="gray"/>)}
-                      {!pc.mismatch&&pc.orig!==0&&<div style={{fontSize:10,fontWeight:700,color:C.amber}}>✓ corrected on my books · seller {fmt(pc.sAmt)} vs {fmt(p.amount)} recorded</div>}
+                      {!pc.mismatch&&pc.orig!==0&&<div style={{fontSize:10,fontWeight:700,color:C.amber}}>✓ corrected on my books · seller {fmt(pc.sAmt)} vs {fmt(pc.ref)} {pc.wasCorrected?'before correction':'recorded'}</div>}
                       {(pc.edited||pc.orig!==0||pc.flag)&&!pc.mismatch&&miniBtn(pc.flag?'💬 Flagged to discuss':'💬 Flag to discuss',()=>setFlags(x=>({...x,['p'+p.key]:!x['p'+p.key]})),pc.flag?C.amber:C.sub)}
                       {pc.edited&&<div style={{display:'flex',alignItems:'center',gap:5,flexWrap:'wrap'}}>
                         {miniBtn('↺ Undo my edit',()=>revertPay(p),C.sub)}
