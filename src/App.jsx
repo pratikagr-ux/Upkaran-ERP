@@ -4068,6 +4068,109 @@ function MergedPartyLedger({party,onClose}){
 // Sign convention: balances are what WE OWE the seller (positive = payable);
 // Δ on a line = seller's figure − ours (accepting a Δ adds it to our payable).
 // ═════════════════════════════════════════════════════════════════════════════
+// ── Undo a posted supplier reconciliation ─────────────────────────────────────
+// Works out (reconUndoPlan) and then applies (reconUndoApply) the exact reverse
+// of what "Post to books" did for one reconciliation record: bill lines put
+// back to their old qty/rate/amount (with stock and freight re-derived), edited
+// payments and their bank/cash entries put back, and every entry the post
+// created (missed items, adjustments, write-offs, extras) removed with its stock.
+// The plan is computed first so the user can see — and a problem can block —
+// the undo before anything changes.
+function reconUndoPlan(rec){
+  const r2=n=>Math.round((Number(n)||0)*100)/100;
+  const same=(a,b)=>Math.abs(Number(a)-Number(b))<0.005;
+  const problems=[],lineRestores=[],stock={};
+  const purchaseEdits={};
+  const norm=v=>String(v||'').trim().toLowerCase();
+  state.purchases.forEach(p=>{
+    const mine=(p.reconFixes||[]).filter(f=>f.reconId===rec.id);
+    if(!mine.length)return;
+    const items=(p.items||[]).map(x=>({...x})),charges=(p.extraCharges||[]).map(c=>({...c}));
+    const usedI=new Set(),usedC=new Set();
+    let ok=true;
+    mine.forEach(f=>f.changes.forEach(c=>{
+      const isCharge=c.type?c.type==='amount':(c.newQty===undefined&&c.oldQty===undefined);
+      if(isCharge){
+        let idx=(c.chargeIdx!=null&&charges[c.chargeIdx]&&!usedC.has(c.chargeIdx)&&same(charges[c.chargeIdx].amount,c.newAmt))?c.chargeIdx:-1;
+        if(idx<0)idx=charges.findIndex((x,i)=>!usedC.has(i)&&same(x.amount,c.newAmt)&&norm(x.name||'Extra charge')===norm(c.name));
+        if(idx<0)idx=charges.findIndex((x,i)=>!usedC.has(i)&&same(x.amount,c.newAmt));
+        if(idx<0){ok=false;problems.push('Bill of '+p.date+': can\'t find the extra charge "'+c.name+'" at ₹'+c.newAmt+' any more (changed since?)');return;}
+        usedC.add(idx);charges[idx].amount=c.oldAmt;
+        lineRestores.push({date:p.date,name:c.name,was:'₹'+c.newAmt,becomes:'₹'+c.oldAmt});
+      }else{
+        const cat=it=>it.itemId?state.items.find(x=>x.id===it.itemId):null;
+        const fits=(x,i)=>!usedI.has(i)&&same(x.qty,c.newQty)&&same(x.rate,c.newRate);
+        let idx=(c.idx!=null&&items[c.idx]&&fits(items[c.idx],c.idx))?c.idx:-1;
+        if(idx<0)idx=items.findIndex((x,i)=>fits(x,i)&&[x.supplierName,x.customerName,x.itemName,cat(x)?.supplier,cat(x)?.internal].some(n=>norm(n)===norm(c.name)));
+        if(idx<0){const cand=items.map((x,i)=>i).filter(i=>fits(items[i],i));if(cand.length===1)idx=cand[0];}
+        if(idx<0){ok=false;problems.push('Bill of '+p.date+': can\'t find "'+c.name+'" at '+c.newQty+' × ₹'+c.newRate+' any more (changed since, or more than one matching line)');return;}
+        usedI.add(idx);
+        const it=items[idx];
+        it.qty=c.oldQty;it.rate=c.oldRate;it.amount=r2(c.oldQty*c.oldRate);
+        it.freightAmount=(c.oldQty/(it.peti||1))*(Number(it.freightPerPeti)||0);
+        // the post moved stock by (new − old) on a received bill — move it back
+        if(p.receivedDate&&it.itemId&&!same(c.oldQty,c.newQty))stock[it.itemId]=(stock[it.itemId]||0)+(Number(c.oldQty)-Number(c.newQty));
+        lineRestores.push({date:p.date,name:c.name,was:c.newQty+' × ₹'+c.newRate,becomes:c.oldQty+' × ₹'+c.oldRate});
+      }
+    }));
+    if(!ok)return;
+    const total=items.reduce((s,x)=>s+(Number(x.qty)||0)*(Number(x.rate)||0),0);
+    const extraChargesTotal=charges.reduce((s,c)=>s+(Number(c.amount)||0),0);
+    const freightAmount=Math.round(items.reduce((s,x)=>s+((Number(x.qty)||0)/(x.peti||1))*(Number(x.freightPerPeti)||0),0));
+    const totalPetis=items.reduce((s,x)=>s+((Number(x.qty)||0)/(x.peti||1)),0);
+    const left=(p.reconFixes||[]).filter(f=>f.reconId!==rec.id);
+    purchaseEdits[p.id]={items,extraCharges:charges,total,extraChargesTotal,freightAmount,totalPetis,reconFixes:left.length?left:undefined,
+      _freight:freightAmount!==(Number(p.freightAmount)||0)};
+  });
+  const payRestores=state.supplierPayments.filter(sp=>sp.reconEdited&&sp.reconEdited.reconId===rec.id)
+    .map(sp=>({id:sp.id,txnId:sp.txnId,date:sp.date,was:r2(sp.amount),becomes:r2(sp.reconEdited.was)}));
+  const removed=state.purchases.filter(p=>p.reconId===rec.id);
+  removed.forEach(p=>{
+    if(p.updatedAt)problems.push('Entry of '+p.date+' ("'+((p.items&&p.items[0]&&p.items[0].supplierName)||'entry')+'") was edited after the post — remove it by hand first');
+    if(p.receivedDate)(p.items||[]).forEach(it=>{if(it.itemId)stock[it.itemId]=(stock[it.itemId]||0)-(Number(it.qty)||0);});
+  });
+  const stockMoves=Object.entries(stock).filter(([,d])=>d).map(([id,d])=>({id,delta:d,name:(state.items.find(x=>x.id===id)||{}).internal||id}));
+  return{problems,lineRestores,payRestores,purchaseEdits,removed:removed.map(p=>({id:p.id,date:p.date,name:(p.items&&p.items[0]&&p.items[0].supplierName)||'entry',total:r2(p.total),source:p.source})),stockMoves,
+    nothing:!lineRestores.length&&!payRestores.length&&!removed.length};
+}
+function reconUndoApply(rec,plan){
+  const removeIds=new Set(plan.removed.map(x=>x.id));
+  state.purchases=state.purchases.filter(p=>!removeIds.has(p.id)).map(p=>{
+    const e=plan.purchaseEdits[p.id];
+    if(!e)return p;
+    const{_freight,...rest}=e;
+    const np={...p,...rest};
+    if(!rest.reconFixes)delete np.reconFixes;
+    return np;
+  });
+  let freightChanged=false;
+  Object.entries(plan.purchaseEdits).forEach(([pid,e])=>{
+    if(!e._freight)return;
+    state.freightCharges=state.freightCharges.map(fr=>fr.purchaseId===pid?{...fr,totalPetis:e.totalPetis,ratePerPeti:e.totalPetis>0?e.freightAmount/e.totalPetis:0,amount:e.freightAmount}:fr);
+    freightChanged=true;
+  });
+  let txnsChanged=false;
+  plan.payRestores.forEach(f=>{
+    state.supplierPayments=state.supplierPayments.map(sp=>{if(sp.id!==f.id)return sp;const{reconEdited,...rest}=sp;return{...rest,amount:f.becomes};});
+    if(f.txnId){state.txns=state.txns.map(t=>t.id===f.txnId?{...t,amount:(t.amount<0?-1:1)*f.becomes}:t);txnsChanged=true;}
+  });
+  save.purchases();
+  if(freightChanged)save.freightCharges();
+  if(plan.payRestores.length)save.supplierPayments();
+  if(txnsChanged)save.txns();
+  plan.stockMoves.forEach(m=>adjustStock(m.id,m.delta));
+  // The record goes back to being an open draft — all the figures typed on both
+  // sides come back so it can be redone properly — unless another draft is open.
+  const otherDraft=state.supplierReconciliations.some(r=>r.partyId===rec.partyId&&r.status==='draft'&&r.id!==rec.id);
+  state.supplierReconciliations=state.supplierReconciliations.map(r=>{
+    if(r.id!==rec.id)return r;
+    const{postedAt,summary,posted,...rest}=r;
+    return otherDraft?{...rest,status:'undone',undoneAt:new Date().toISOString(),postedAt,summary,posted}:{...rest,status:'draft',undoneAt:new Date().toISOString()};
+  });
+  save.supplierReconciliations();
+  return{otherDraft};
+}
+
 function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onClose}){
   const mobile=useIsMobile();
   const{toast,TC}=useToast();
@@ -4135,6 +4238,8 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
   const[noteOpen,setNoteOpen]=useState({});
   const[step,setStep]=useState('work');
   const[posting,setPosting]=useState(false);
+  const[undoPlan,setUndoPlan]=useState(null);
+  const postedCount=lastPosted?.posted?((lastPosted.posted.fixed||0)+(lastPosted.posted.adjusted||0)+(lastPosted.posted.paymentsFixed||0)+(lastPosted.posted.paymentsAdjusted||0)+(lastPosted.posted.missed||0)+(lastPosted.posted.extras||0)):0;
 
   // ── Our side of the picture ────────────────────────────────────────────────
   const bills=useMemo(()=>{
@@ -4556,7 +4661,7 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
       const freightAmount=Math.round(items.reduce((s,x)=>s+((Number(x.qty)||0)/(x.peti||1))*(Number(x.freightPerPeti)||0),0));
       const totalPetis=items.reduce((s,x)=>s+((Number(x.qty)||0)/(x.peti||1)),0);
       purchases=purchases.map(x=>x.id===pid?{...x,items,extraCharges:charges,total,extraChargesTotal,freightAmount,totalPetis,updatedAt:nowIso,
-        reconFixes:[...(x.reconFixes||[]),{reconId:draftId,at:nowIso,changes:fixes.map(f=>({name:f.name,oldQty:f.oldQty,oldRate:f.oldRate,oldAmt:f.oldAmt,newQty:f.nQty,newRate:f.nRate,newAmt:f.nAmt}))}]}:x);
+        reconFixes:[...(x.reconFixes||[]),{reconId:draftId,at:nowIso,changes:fixes.map(f=>({name:f.name,type:f.type,idx:f.idx,chargeIdx:f.chargeIdx,oldQty:f.oldQty,oldRate:f.oldRate,oldAmt:f.oldAmt,newQty:f.nQty,newRate:f.nRate,newAmt:f.nAmt}))}]}:x);
       if(freightAmount!==(Number(p.freightAmount)||0)){
         state.freightCharges=state.freightCharges.map(fr=>fr.purchaseId===pid?{...fr,totalPetis,ratePerPeti:totalPetis>0?freightAmount/totalPetis:0,amount:freightAmount}:fr);
         freightChanged=true;
@@ -4620,6 +4725,17 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
     save.supplierReconciliations();
     toast('Reconciliation posted ✓ '+plan.count+' change'+(plan.count===1?'':'s')+' applied to your books');
     setPosting(false);
+    onClose();
+  };
+
+  // ── Undo the last post ─────────────────────────────────────────────────────
+  const openUndo=()=>{if(!requireOwner(toast))return;setUndoPlan(reconUndoPlan(lastPosted));};
+  const doUndo=()=>{
+    if(!requireOwner(toast))return;
+    if(!undoPlan||undoPlan.problems.length)return;
+    finished.current=true;            // don't let this screen's autosave write anything over the restored draft
+    const r=reconUndoApply(lastPosted,undoPlan);
+    toast(r.otherDraft?'Post undone ✓ — your books are back as before':'Post undone ✓ — your books are back as before, and your reconciliation is a draft again');
     onClose();
   };
 
@@ -4952,11 +5068,37 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
   const diffColor=diff==null?C.muted:diff===0?C.green:C.red;
   const shown=walk.items.filter(showItem);
   const openGap=r2((so!=null?so:openingBalance)-openingBalance);
-  return <Modal title={'Reconcile with '+party.name} onClose={onClose} width={1240}>
+  const undoModal=undoPlan?<Modal title={'Undo the reconciliation posted '+fmtD((lastPosted.postedAt||'').slice(0,10))} onClose={()=>setUndoPlan(null)} width={720}>
+    <div style={{fontSize:12,color:C.sub,marginBottom:10}}>This puts your books back exactly as they were before that post — nothing else is touched. Your reconciliation returns as a draft with all the figures you typed, so you can redo it.</div>
+    {undoPlan.problems.length>0&&<div style={{padding:'8px 12px',borderRadius:8,background:C.redSoft,color:C.red,fontSize:12,marginBottom:10}}>
+      <b>Can't undo automatically — nothing has been changed.</b>
+      {undoPlan.problems.map((x,i)=><div key={i}>• {x}</div>)}</div>}
+    {undoPlan.nothing&&<div style={{padding:12,color:C.sub,fontSize:13}}>That post didn't change anything in your books.</div>}
+    {undoPlan.lineRestores.length>0&&<div style={{marginBottom:10}}>
+      <div style={{fontSize:12,fontWeight:700,marginBottom:4}}>Bill lines put back ({undoPlan.lineRestores.length})</div>
+      {undoPlan.lineRestores.map((x,i)=><div key={i} style={{fontSize:12,padding:'3px 0',borderBottom:`1px solid ${C.bdr}`}}>{fmtD(x.date)} · {x.name}: {x.was} → <b>{x.becomes}</b></div>)}</div>}
+    {undoPlan.payRestores.length>0&&<div style={{marginBottom:10}}>
+      <div style={{fontSize:12,fontWeight:700,marginBottom:4}}>Payments put back ({undoPlan.payRestores.length}) — with their bank/cash entries</div>
+      {undoPlan.payRestores.map((x,i)=><div key={i} style={{fontSize:12,padding:'3px 0',borderBottom:`1px solid ${C.bdr}`}}>{fmtD(x.date)}: {fmt(x.was)} → <b>{fmt(x.becomes)}</b></div>)}</div>}
+    {undoPlan.removed.length>0&&<div style={{marginBottom:10}}>
+      <div style={{fontSize:12,fontWeight:700,marginBottom:4}}>Entries removed ({undoPlan.removed.length}) — everything the post added</div>
+      {undoPlan.removed.map((x,i)=><div key={i} style={{fontSize:12,padding:'3px 0',borderBottom:`1px solid ${C.bdr}`,display:'flex',justifyContent:'space-between'}}><span>{fmtD(x.date)} · {x.name}</span><b>{sgn(x.total)}</b></div>)}</div>}
+    {undoPlan.stockMoves.length>0&&<div style={{marginBottom:10,fontSize:12}}>
+      <b>Stock put back:</b> {undoPlan.stockMoves.map(m=>m.name+' '+(m.delta>0?'+':'')+m.delta).join(' · ')}</div>}
+    <div style={{display:'flex',gap:8,justifyContent:'flex-end',marginTop:12}}>
+      <Btn onClick={()=>setUndoPlan(null)} variant="secondary">Cancel</Btn>
+      <Btn onClick={doUndo} variant="danger" disabled={undoPlan.problems.length>0||undoPlan.nothing}>↶ Undo that post</Btn>
+    </div>
+  </Modal>:null;
+  return <><Modal title={'Reconcile with '+party.name} onClose={onClose} width={1240}>
     <TC/>
     <div style={{padding:'7px 12px',borderRadius:8,background:C.greenSoft||'#EAF7EE',color:C.green,fontSize:12,fontWeight:600,marginBottom:8}}>
       🔒 Nothing in your books changes while you work here. Everything is a draft until you press <b>Review & post</b>.
     </div>
+    {postedCount>0&&<div style={{padding:'7px 12px',borderRadius:8,background:C.amberSoft,color:C.amber,fontSize:12,fontWeight:600,marginBottom:8,display:'flex',alignItems:'center',gap:10,flexWrap:'wrap'}}>
+      <span>↶ A reconciliation was posted on {fmtD((lastPosted.postedAt||'').slice(0,10))} ({postedCount} change{postedCount===1?'':'s'} went into your books). Made a mess?</span>
+      {miniBtn('Undo that post…',openUndo,C.red)}
+    </div>}
     <div style={{fontSize:12,color:C.sub,marginBottom:10}}>
       Period: <b style={{color:C.txt}}>{from?fmtD(from):'Beginning'} → {to?fmtD(to):'Today'}</b>
       {' · '}<b>Left: your books</b> (edit any qty / rate / amount) · <b>right: the seller's</b> (type only where it differs — blank means "same as I recorded"). <b>← Take seller's</b> copies their figure into your books so that mismatch is resolved; only unresolved ones stay red.
@@ -5180,7 +5322,7 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
         <Btn onClick={goReview} variant="success">Review & post →</Btn>
       </div>
     </div>
-  </Modal>;
+  </Modal>{undoModal}</>;
 }
 
 function PartyLedger({party,onClose}){
