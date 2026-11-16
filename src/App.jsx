@@ -4240,6 +4240,9 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
   const[posting,setPosting]=useState(false);
   const[undoPlan,setUndoPlan]=useState(null);
   const[full,setFull]=useState(false);
+  const[nameTick,setNameTick]=useState(0);      // bumps when a supplier name is saved, so line names refresh
+  const[nameOpen,setNameOpen]=useState({});
+  const[nameDraft,setNameDraft]=useState({});
   const[showReport,setShowReport]=useState(false);
   const postedCount=lastPosted?.posted?((lastPosted.posted.fixed||0)+(lastPosted.posted.adjusted||0)+(lastPosted.posted.paymentsFixed||0)+(lastPosted.posted.paymentsAdjusted||0)+(lastPosted.posted.missed||0)+(lastPosted.posted.extras||0)):0;
 
@@ -4261,7 +4264,7 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
         if(Array.isArray(x)&&x[1]!=null&&x[2]!=null){
           const q=Number(x[1])||0,rt=Number(x[2])||0;
           const cat=catByName.get(String(x[0]).trim().toLowerCase());
-          lines.push({key:key+'#'+i,billKey:key,type:'item',idx:i,name:(cat&&cat.supplier&&cat.supplier.trim())||x[0],oname:cat?.internal||'',qty:q,rate:rt,our:r2(q*rt),fixable:false});
+          lines.push({key:key+'#'+i,billKey:key,type:'item',idx:i,name:(cat&&cat.supplier&&cat.supplier.trim())||x[0],oname:cat?.internal||'',catId:cat?cat.id:null,hasSupp:!!(cat&&cat.supplier&&cat.supplier.trim()),qty:q,rate:rt,our:r2(q*rt),fixable:false});
           sum+=q*rt;
         }
       });
@@ -4280,7 +4283,7 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
         const q=Number(it.qty)||0,rt=Number(it.rate)||0;
         // the supplier's name comes from the item's Naming Conventions entry; the name stored on the bill is the fallback
         const cat=(it.itemId?state.items.find(x=>x.id===it.itemId):null)||catByName.get(String(it.itemName||it.customerName||it.supplierName||'').trim().toLowerCase())||null;
-        lines.push({key:p.id+'#'+i,billKey:p.id,type:'item',idx:i,name:(cat&&cat.supplier&&cat.supplier.trim())||it.supplierName||it.customerName||it.itemName||'Item',oname:cat?.internal||it.itemName||it.customerName||'',seed:it.reconSeller||null,itemId:it.itemId,qty:q,rate:rt,our:r2(q*rt),fixable:true});
+        lines.push({key:p.id+'#'+i,billKey:p.id,type:'item',idx:i,name:(cat&&cat.supplier&&cat.supplier.trim())||it.supplierName||it.customerName||it.itemName||'Item',oname:cat?.internal||it.itemName||it.customerName||'',catId:cat?cat.id:null,hasSupp:!!(cat&&cat.supplier&&cat.supplier.trim()),seed:it.reconSeller||null,itemId:it.itemId,qty:q,rate:rt,our:r2(q*rt),fixable:true});
       });
       (p.extraCharges||[]).forEach((c,i)=>{
         lines.push({key:p.id+'!'+(c.id||i),billKey:p.id,type:'amount',chargeIdx:i,name:c.name||'Extra charge',our:r2(c.amount),fixable:true,isCharge:true});
@@ -4288,7 +4291,7 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
       out.push({key:p.id,hist:false,date:p.date,ref:p.bilty?('LR '+p.bilty):(p.source?'Reconciliation entry':p.id),purchase:p,total:r2((p.total||0)+(p.extraChargesTotal||0)),lines,received:!!p.receivedDate});
     });
     return out.sort((a,b)=>a.date.localeCompare(b.date));
-  },[party.id]);
+  },[party.id,nameTick]);
   const allLines=useMemo(()=>bills.flatMap(b=>b.lines),[bills]);
   const billKeys=useMemo(()=>new Set(bills.map(b=>b.key)),[bills]);
 
@@ -4828,6 +4831,19 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
     onClose({reportRecId:draftId});
   };
 
+  // Save a supplier name for an item straight into Naming Conventions (the same
+  // field the Naming Conventions screen edits), so this and every other screen
+  // shows the supplier's name for that item from now on.
+  const setSupplierName=(catId,key,val)=>{
+    const v=String(val||'').trim();
+    if(!v)return toast('Type the supplier\'s name for this item','error');
+    state.items=state.items.map(x=>x.id===catId?{...x,supplier:v}:x);
+    save.itemsSilent();
+    setNameOpen(p=>({...p,[key]:false}));
+    setNameTick(t=>t+1);
+    toast('Supplier name saved in Naming Conventions ✓');
+  };
+
   // ── Undo the last post ─────────────────────────────────────────────────────
   const openUndo=()=>{if(!requireOwner(toast))return;setUndoPlan(reconUndoPlan(lastPosted));};
   const doUndo=()=>{
@@ -4902,9 +4918,12 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
 
   // ── Rendering helpers (plain functions — NOT components — so inputs keep
   //    focus across re-renders) ───────────────────────────────────────────────
-  const inp={width:62,padding:'3px 5px',borderRadius:5,border:`1.5px solid ${C.bdr}`,fontSize:12,textAlign:'right',fontFamily:'inherit',outline:'none',boxSizing:'border-box',background:'#fff',color:C.txt};
-  const th=(al='right',extra)=>({padding:'6px 7px',fontSize:10,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:.4,textAlign:al,borderBottom:`1px solid ${C.bdr}`,whiteSpace:'nowrap',background:'#F6F8FA',...extra});
-  const td=(al='right',extra)=>({padding:'4px 7px',fontSize:12,textAlign:al,color:C.txt,fontVariantNumeric:'tabular-nums',whiteSpace:al==='left'?'normal':'nowrap',...extra});
+  // Full-screen mode: the table uses fixed, percentage-width columns that fit the
+  // screen (no sideways scrolling), so inputs fill their cell instead of a set width.
+  const W=n=>full?'100%':n;
+  const inp={width:W(62),minWidth:0,padding:full?'3px 3px':'3px 5px',borderRadius:5,border:`1.5px solid ${C.bdr}`,fontSize:12,textAlign:'right',fontFamily:'inherit',outline:'none',boxSizing:'border-box',background:'#fff',color:C.txt};
+  const th=(al='right',extra)=>({padding:full?'5px 4px':'6px 7px',fontSize:full?9:10,fontWeight:700,color:C.sub,textTransform:'uppercase',letterSpacing:full?.2:.4,textAlign:al,borderBottom:`1px solid ${C.bdr}`,whiteSpace:full?'normal':'nowrap',background:'#F6F8FA',...extra});
+  const td=(al='right',extra)=>({padding:full?'3px 4px':'4px 7px',fontSize:full?11.5:12,textAlign:al,color:C.txt,fontVariantNumeric:'tabular-nums',whiteSpace:al==='left'?'normal':'nowrap',...extra});
   const SEL={borderLeft:`2px solid ${C.blue}`};      // first column of the seller block
   const ed=on=>on?{borderColor:C.amber,background:'#FFFBEB'}:{};   // an edited book figure
   const dcol=n=>n>0?C.red:n<0?C.green:C.muted;        // + = I owe more
@@ -4912,13 +4931,13 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
   const xbtn=onClick=><button onClick={onClick} title="Remove" style={{border:'none',background:'transparent',color:C.red,cursor:'pointer',fontSize:14,padding:'0 4px'}}>✕</button>;
   const miniBtn=(label,onClick,color=C.blue)=><button onClick={onClick} style={{padding:'2px 9px',borderRadius:12,border:`1px solid ${color}`,background:'#fff',color,fontSize:11,fontWeight:600,cursor:'pointer',fontFamily:'inherit',whiteSpace:'nowrap'}}>{label}</button>;
   // "was ₹X · +₹Y" under a book figure that has been edited
-  const chg=(was,change)=>change!==0?<div style={{fontSize:10,fontWeight:600,color:dcol(change)}}>was {fmt(was)} · {sgn(change)}</div>:null;
+  const chg=(was,change)=>change!==0?<div style={{fontSize:10,fontWeight:600,color:dcol(change),whiteSpace:'normal'}}>was {fmt(was)} · {sgn(change)}</div>:null;
   // "+₹20 vs mine" under a seller qty / rate that differs from my books figure
   const dtag=(d,pre='')=>d!==0?<div style={{fontSize:10,fontWeight:700,color:dcol(d)}}>{(d>0?'+':'−')+pre+Math.abs(d)} vs mine</div>:null;
   const balCells=(b,gapBold)=>{
     const gap=r2(b.sel-b.our),ch=r2(b.our-b.rec);
     return <>
-      <td style={{...td(),fontWeight:700}}><div>{fmt(b.our)}</div>{ch!==0&&<div style={{fontSize:10,fontWeight:600,color:dcol(ch)}}>{'recorded '+fmt(b.rec)+' · '+sgn(ch)}</div>}</td>
+      <td style={{...td(),fontWeight:700}}><div>{fmt(b.our)}</div>{ch!==0&&<div style={{fontSize:10,fontWeight:600,color:dcol(ch),whiteSpace:'normal'}}>{'recorded '+fmt(b.rec)+' · '+sgn(ch)}</div>}</td>
       <td style={{...td(),...SEL,fontWeight:700}}>{fmt(b.sel)}</td>
       <td style={{...td(),fontWeight:gapBold?800:600,color:gap===0?C.muted:gap>0?C.red:C.green}}>{gap===0?'—':sgn(gap)}</td>
     </>;
@@ -4964,14 +4983,19 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
       <tr style={{borderTop:`1px solid ${C.bdr}`,background:mm?'#FFF8F8':(c.edited||c.orig!==0||c.flag)?'#FFFDF5':'transparent'}}>
         <td style={td('left')}></td>
         <td style={td('left')}>{l.name}{l.isCharge&&<span style={{fontSize:10,color:C.muted}}> (extra charge)</span>}
-          {l.oname&&l.oname.trim().toLowerCase()!==String(l.name).trim().toLowerCase()&&<div style={{fontSize:10,color:C.muted}}>my name: {l.oname}</div>}</td>
+          {l.oname&&l.oname.trim().toLowerCase()!==String(l.name).trim().toLowerCase()&&<div style={{fontSize:10,color:C.muted}}>my name: {l.oname}</div>}
+          {l.type==='item'&&l.catId&&!l.hasSupp&&(!l.oname||String(l.name).trim().toLowerCase()===String(l.oname).trim().toLowerCase())&&(nameOpen[l.key]
+            ?<div style={{display:'flex',gap:4,marginTop:2}}>
+              <input autoFocus value={nameDraft[l.key]??''} onChange={e=>setNameDraft(p=>({...p,[l.key]:e.target.value}))} onKeyDown={e=>{if(e.key==='Enter')setSupplierName(l.catId,l.key,nameDraft[l.key]);}} placeholder="Supplier's name for this item" style={{...inp,width:W(170),textAlign:'left',fontSize:11}}/>
+              {miniBtn('Save',()=>setSupplierName(l.catId,l.key,nameDraft[l.key]))}</div>
+            :<div style={{fontSize:10,color:C.amber}}>no supplier name set — {miniBtn('✎ set it',()=>setNameOpen(p=>({...p,[l.key]:true})),C.amber)}</div>)}</td>
         {l.type==='item'?<>
           <td style={td()}><input value={s.bQty??''} onChange={e=>setL(l.key,{bQty:e.target.value})} inputMode="text" placeholder={String(l.qty)} style={{...inp,...ed(c.bQty!==l.qty)}}/></td>
           <td style={td()}><input value={s.bRate??''} onChange={e=>setL(l.key,{bRate:e.target.value})} inputMode="text" placeholder={String(l.rate)} style={{...inp,...ed(c.bRate!==l.rate)}}/></td>
           <td style={{...td(),fontWeight:600}}>{fmt(c.bAmt)}{chg(l.our,c.change)}</td>
         </>:<>
           <td style={td()}>—</td><td style={td()}>—</td>
-          <td style={td()}><input value={s.bAmt??''} onChange={e=>setL(l.key,{bAmt:e.target.value})} inputMode="text" placeholder={String(l.our)} style={{...inp,width:80,...ed(c.edited)}}/>{chg(l.our,c.change)}</td>
+          <td style={td()}><input value={s.bAmt??''} onChange={e=>setL(l.key,{bAmt:e.target.value})} inputMode="text" placeholder={String(l.our)} style={{...inp,width:W(80),...ed(c.edited)}}/>{chg(l.our,c.change)}</td>
         </>}
         {l.type==='item'?<>
           <td style={{...td(),...SEL}}><input value={s.sQty??''} onChange={e=>setL(l.key,{sQty:e.target.value})} inputMode="text" placeholder={String(l.qty)} style={inp}/>{dtag(r2(c.sQty-c.bQty))}</td>
@@ -4979,7 +5003,7 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
           <td style={{...td(),color:c.checked?C.txt:C.muted}}>{fmt(c.sAmt)}</td>
         </>:<>
           <td style={{...td(),...SEL}}>—</td><td style={td()}>—</td>
-          <td style={td()}><input value={s.sAmt??''} onChange={e=>setL(l.key,{sAmt:e.target.value})} inputMode="text" placeholder={String(l.our)} style={{...inp,width:80}}/></td>
+          <td style={td()}><input value={s.sAmt??''} onChange={e=>setL(l.key,{sAmt:e.target.value})} inputMode="text" placeholder={String(l.our)} style={{...inp,width:W(80)}}/></td>
         </>}
         <td style={td('left')}>
           <div style={{display:'flex',flexDirection:'column',gap:3,alignItems:'flex-start'}}>
@@ -5010,10 +5034,10 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
     const b=walk.B['m'+m.id]||{rec:0,our:0,sel:0};
     const gap=missedGap(m);
     return <tr key={'m'+m.id} style={{background:'#F3F9FF',borderTop:`1px solid ${C.bdr}`}}>
-      <td style={td('left')}>{standalone?<input type="date" value={m.date} onChange={e=>editMissed(m.id,{date:e.target.value})} style={{...inp,width:118,textAlign:'left'}}/>:''}</td>
+      <td style={td('left')}>{standalone?<input type="date" value={m.date} onChange={e=>editMissed(m.id,{date:e.target.value})} style={{...inp,width:W(118),textAlign:'left'}}/>:''}</td>
       <td style={td('left')}>
         <div style={{display:'flex',alignItems:'center',gap:6}}><Badge v="➕ missed item" color="blue"/>
-          <input list="recon-item-names" value={m.name} onChange={e=>setMissedName(m.id,e.target.value)} placeholder="Item name…" style={{...inp,width:mobile?150:210,textAlign:'left'}}/></div>
+          <input list="recon-item-names" value={m.name} onChange={e=>setMissedName(m.id,e.target.value)} placeholder="Item name…" style={{...inp,width:W(mobile?150:210),textAlign:'left'}}/></div>
         <div style={{fontSize:10,marginLeft:2,color:m.itemId?C.green:(m.name?C.amber:C.muted)}}>{m.itemId?('✓ my item: '+((state.items.find(x=>x.id===m.itemId)||{}).internal||'catalogue')):(m.name?'not in catalogue — no stock change':' ')}</div></td>
       <td style={td()}><input value={m.bQty??''} onChange={e=>editMissed(m.id,{bQty:e.target.value})} inputMode="text" placeholder={m.qty||'qty'} style={{...inp,...ed(m.bQty!==''&&m.bQty!=null)}}/></td>
       <td style={td()}><input value={m.bRate??''} onChange={e=>editMissed(m.id,{bRate:e.target.value})} inputMode="text" placeholder={m.rate||'rate'} style={{...inp,...ed(m.bRate!==''&&m.bRate!=null)}}/></td>
@@ -5036,12 +5060,12 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
     const b=walk.B['x'+e.id]||{rec:0,our:0,sel:0};
     const col=e.sign==='minus'?C.green:C.red;
     return <tr key={'x'+e.id} style={{background:'#FBF5FF',borderTop:`1px solid ${C.bdr}`}}>
-      <td style={td('left')}><input type="date" value={e.date} onChange={ev=>editExtra(e.id,{date:ev.target.value})} style={{...inp,width:118,textAlign:'left'}}/></td>
+      <td style={td('left')}><input type="date" value={e.date} onChange={ev=>editExtra(e.id,{date:ev.target.value})} style={{...inp,width:W(118),textAlign:'left'}}/></td>
       <td style={td('left')}>
         <div style={{display:'flex',alignItems:'center',gap:6}}><Badge v="✂ write-off · my books only" color="gray"/>
-          <input value={e.label} onChange={ev=>editExtra(e.id,{label:ev.target.value})} placeholder="Reason" style={{...inp,width:mobile?150:210,textAlign:'left'}}/></div></td>
+          <input value={e.label} onChange={ev=>editExtra(e.id,{label:ev.target.value})} placeholder="Reason" style={{...inp,width:W(mobile?150:210),textAlign:'left'}}/></div></td>
       <td style={td()}>—</td><td style={td()}>—</td>
-      <td style={td()}><input value={e.bAmount??''} onChange={ev=>editExtra(e.id,{bAmount:ev.target.value})} inputMode="text" placeholder="amount" style={{...inp,width:80,fontWeight:700,color:col,...ed(true)}}/></td>
+      <td style={td()}><input value={e.bAmount??''} onChange={ev=>editExtra(e.id,{bAmount:ev.target.value})} inputMode="text" placeholder="amount" style={{...inp,width:W(80),fontWeight:700,color:col,...ed(true)}}/></td>
       <td style={{...td(),...SEL}}>—</td><td style={td()}>—</td>
       <td style={{...td(),fontSize:10,color:C.muted}}>not on seller's side</td>
       <td style={td('left')}>
@@ -5059,16 +5083,16 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
     const info=openInfo[e.id]||{mine:0,sel:0};
     const d=openDelta[e.id]||0,gap=extraGap(e);
     return <tr key={'x'+e.id} style={{background:'#F5F3FF',borderTop:`2px solid ${C.bdr}`}}>
-      <td style={td('left')}><input type="date" value={e.date} onChange={ev=>editExtra(e.id,{date:ev.target.value})} style={{...inp,width:118,textAlign:'left'}}/></td>
+      <td style={td('left')}><input type="date" value={e.date} onChange={ev=>editExtra(e.id,{date:ev.target.value})} style={{...inp,width:W(118),textAlign:'left'}}/></td>
       <td style={td('left')}>
         <div style={{display:'flex',alignItems:'center',gap:6}}><Badge v="📅 opening balance on this date" color="blue"/>
-          <input value={e.label} onChange={ev=>editExtra(e.id,{label:ev.target.value})} placeholder="Label" style={{...inp,width:mobile?130:170,textAlign:'left'}}/></div>
+          <input value={e.label} onChange={ev=>editExtra(e.id,{label:ev.target.value})} placeholder="Label" style={{...inp,width:W(mobile?130:170),textAlign:'left'}}/></div>
         <div style={{fontSize:10,color:C.muted}}>my balance just before this: {balTxt(info.mine)}</div></td>
       <td style={td()}>—</td><td style={td()}>—</td>
-      <td style={td()}><input value={e.bAmount??''} onChange={ev=>editExtra(e.id,{bAmount:ev.target.value})} inputMode="text" placeholder="0" title="Adjustment to post on MY books (+ = I owe more). Blank = leave my books as they are." style={{...inp,width:80,fontWeight:700,...ed(e.bAmount!==''&&e.bAmount!=null)}}/>
+      <td style={td()}><input value={e.bAmount??''} onChange={ev=>editExtra(e.id,{bAmount:ev.target.value})} inputMode="text" placeholder="0" title="Adjustment to post on MY books (+ = I owe more). Blank = leave my books as they are." style={{...inp,width:W(80),fontWeight:700,...ed(e.bAmount!==''&&e.bAmount!=null)}}/>
         <div style={{fontSize:10,color:C.muted}}>adjust my books by</div></td>
       <td style={{...td(),...SEL}}>—</td><td style={td()}>—</td>
-      <td style={td()}><input value={e.amount} onChange={ev=>editExtra(e.id,{amount:ev.target.value})} inputMode="text" placeholder="their balance" style={{...inp,width:90,fontWeight:700}}/>
+      <td style={td()}><input value={e.amount} onChange={ev=>editExtra(e.id,{amount:ev.target.value})} inputMode="text" placeholder="their balance" style={{...inp,width:W(90),fontWeight:700}}/>
         {num(e.amount)!=null&&<div style={{fontSize:10,fontWeight:700,color:dcol(d)}}>{d===0?'same as their running':sgn(d)+' vs their running '+balTxt(info.sel)}</div>}</td>
       <td style={td('left')}>
         <div style={{display:'flex',flexDirection:'column',gap:3,alignItems:'flex-start'}}>
@@ -5088,14 +5112,14 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
     const gap=extraGap(e);
     const col=e.sign==='minus'?C.green:C.red;
     return <tr key={'x'+e.id} style={{background:isPay?'#F6FFF6':'#FFF9F0',borderTop:`1px solid ${C.bdr}`}}>
-      <td style={td('left')}>{standalone?<input type="date" value={e.date} onChange={ev=>editExtra(e.id,{date:ev.target.value})} style={{...inp,width:118,textAlign:'left'}}/>:''}</td>
+      <td style={td('left')}>{standalone?<input type="date" value={e.date} onChange={ev=>editExtra(e.id,{date:ev.target.value})} style={{...inp,width:W(118),textAlign:'left'}}/>:''}</td>
       <td style={td('left')}>
         <div style={{display:'flex',alignItems:'center',gap:6}}><Badge v={isPay?'➕ payment':'➕ charge / credit'} color={isPay?'green':'amber'}/>
-          <input list="recon-extra-names" value={e.label} onChange={ev=>editExtra(e.id,{label:ev.target.value})} placeholder="e.g. Freight, Interest, Discount" style={{...inp,width:mobile?150:210,textAlign:'left'}}/></div></td>
+          <input list="recon-extra-names" value={e.label} onChange={ev=>editExtra(e.id,{label:ev.target.value})} placeholder="e.g. Freight, Interest, Discount" style={{...inp,width:W(mobile?150:210),textAlign:'left'}}/></div></td>
       <td style={td()}>—</td><td style={td()}>—</td>
-      <td style={td()}><input value={e.bAmount??''} onChange={ev=>editExtra(e.id,{bAmount:ev.target.value})} inputMode="text" placeholder={e.amount||'amount'} style={{...inp,width:80,fontWeight:700,color:col,...ed(e.bAmount!==''&&e.bAmount!=null)}}/></td>
+      <td style={td()}><input value={e.bAmount??''} onChange={ev=>editExtra(e.id,{bAmount:ev.target.value})} inputMode="text" placeholder={e.amount||'amount'} style={{...inp,width:W(80),fontWeight:700,color:col,...ed(e.bAmount!==''&&e.bAmount!=null)}}/></td>
       <td style={{...td(),...SEL}}>—</td><td style={td()}>—</td>
-      <td style={td()}><input value={e.amount} onChange={ev=>editExtra(e.id,{amount:ev.target.value})} inputMode="text" placeholder="amount" style={{...inp,width:80,fontWeight:700,color:col}}/></td>
+      <td style={td()}><input value={e.amount} onChange={ev=>editExtra(e.id,{amount:ev.target.value})} inputMode="text" placeholder="amount" style={{...inp,width:W(80),fontWeight:700,color:col}}/></td>
       <td style={td('left')}>
         <div style={{display:'flex',flexDirection:'column',gap:3,alignItems:'flex-start'}}>
           {gap!==0?<div style={{display:'flex',alignItems:'center',gap:5}}><b style={{color:dcol(gap)}}>{sgn(gap)}</b>{miniBtn("← Take seller's",()=>editExtra(e.id,{bAmount:''}))}</div>:<Badge v="✓ Same both sides" color="green"/>}
@@ -5245,7 +5269,8 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
 
     <div style={{border:`1px solid ${C.bdr}`,borderRadius:10,overflow:'hidden',marginBottom:14,background:C.surf}}>
       <div style={{overflowX:'auto',maxHeight:mobile?undefined:(full?'calc(100vh - 420px)':'58vh'),overflowY:'auto'}}>
-      <table style={{width:'100%',borderCollapse:'collapse',minWidth:1180}}>
+      <table style={{width:'100%',borderCollapse:'collapse',minWidth:full?0:1180,tableLayout:full?'fixed':'auto'}}>
+        {full&&<colgroup>{[8.5,15,5,6,8,5,6,7.5,16,8.5,8.5,6].map((w,i)=><col key={i} style={{width:w+'%'}}/>)}</colgroup>}
         <thead style={{position:'sticky',top:0,zIndex:2}}>
           <tr>
             <th colSpan={5} style={{...th('left'),background:'#EEF2F6',textAlign:'center'}}>MY BOOKS (editable — staged until you post)</th>
@@ -5265,7 +5290,7 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
             <td colSpan={3}></td><td style={SEL} colSpan={3}></td>
             <td style={td('left')}>{so!=null&&openGap!==0&&<span style={{fontSize:10,color:C.amber,fontWeight:600}}>differs {sgn(openGap)}</span>}</td>
             <td style={{...td(),fontWeight:700}}>{fmt(openingBalance)}</td>
-            <td style={{...td(),...SEL}}><input value={sellerOpening} onChange={e=>setSellerOpening(e.target.value)} inputMode="text" placeholder={String(openingBalance)} style={{...inp,width:84,fontWeight:700}}/></td>
+            <td style={{...td(),...SEL}}><input value={sellerOpening} onChange={e=>setSellerOpening(e.target.value)} inputMode="text" placeholder={String(openingBalance)} style={{...inp,width:W(84),fontWeight:700}}/></td>
             <td style={td()}>{openGap===0?'—':sgn(openGap)}</td>
           </tr>
           {shown.length===0&&<tr><td colSpan={COLS} style={{padding:14,textAlign:'center',color:C.sub,fontSize:12}}>{walk.items.length===0?'No bills or payments for this supplier in the selected period.':filter==='attention'?'🎉 No unresolved mismatches.':'Nothing in this view.'}</td></tr>}
@@ -5317,10 +5342,10 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
                   <td style={{...td('left'),fontWeight:700}}>💸 {fmtD(p.date)}</td>
                   <td style={td('left')}>{p.desc}{p.hist&&<span style={{marginLeft:6}}><Badge v="pre-ERP" color="gray"/></span>} {noteToggle('p'+p.key)}</td>
                   <td style={td()}>—</td><td style={td()}>—</td>
-                  <td style={td()}><div style={{display:'inline-flex',alignItems:'center',gap:3}}><span style={{color:C.green,fontWeight:700}}>−</span><input value={payBk[p.key]??''} onChange={e=>setPayBk(x=>({...x,[p.key]:e.target.value}))} inputMode="text" placeholder={String(p.amount)} style={{...inp,width:80,color:C.green,fontWeight:700,...ed(pc.edited)}}/></div>
+                  <td style={td()}><div style={{display:'inline-flex',alignItems:'center',gap:3}}><span style={{color:C.green,fontWeight:700}}>−</span><input value={payBk[p.key]??''} onChange={e=>setPayBk(x=>({...x,[p.key]:e.target.value}))} inputMode="text" placeholder={String(p.amount)} style={{...inp,width:W(80),color:C.green,fontWeight:700,...ed(pc.edited)}}/></div>
                     {pc.edited&&<div style={{fontSize:10,fontWeight:600,color:dcol(pc.balDelta)}}>was {fmt(p.amount)} · {sgn(pc.balDelta)}</div>}</td>
                   <td style={{...td(),...SEL}}>—</td><td style={td()}>—</td>
-                  <td style={td()}><input value={payChk[p.key]??''} onChange={e=>setPayChk(x=>({...x,[p.key]:e.target.value}))} inputMode="text" placeholder={String(p.amount)} style={{...inp,width:80}}/></td>
+                  <td style={td()}><input value={payChk[p.key]??''} onChange={e=>setPayChk(x=>({...x,[p.key]:e.target.value}))} inputMode="text" placeholder={String(p.amount)} style={{...inp,width:W(80)}}/></td>
                   <td style={td('left')}>
                     <div style={{display:'flex',flexDirection:'column',gap:3,alignItems:'flex-start'}}>
                       {pc.mismatch?<div style={{display:'flex',alignItems:'center',gap:5}}><b style={{color:dcol(pc.delta)}}>{sgn(pc.delta)}</b>{miniBtn("← Take seller's",()=>takePay(p))}</div>:(pc.checked?<Badge v="✓ Match" color="green"/>:<Badge v="Not checked" color="gray"/>)}
@@ -5458,8 +5483,8 @@ function ReconReportModal({report,onClose}){
   const dcol=n=>n>0?C.red:n<0?C.green:C.muted;
   const bl=report.balances||{};
   const balTxt=n=>n==null?'—':fmt(Math.abs(n))+(n<0?' (advance)':'');
-  const th=(al='right')=>({padding:'5px 6px',fontSize:10,fontWeight:700,color:C.sub,textTransform:'uppercase',textAlign:al,borderBottom:`1px solid ${C.bdr}`,background:'#F6F8FA',whiteSpace:'nowrap'});
-  const td=(al='right',x)=>({padding:'3px 6px',fontSize:11,textAlign:al,fontVariantNumeric:'tabular-nums',borderBottom:'1px solid #E5E7EB',whiteSpace:al==='left'?'normal':'nowrap',...x});
+  const th=(al='right')=>({padding:full?'4px 3px':'5px 6px',fontSize:full?9:10,fontWeight:700,color:C.sub,textTransform:'uppercase',textAlign:al,borderBottom:`1px solid ${C.bdr}`,background:'#F6F8FA',whiteSpace:full?'normal':'nowrap'});
+  const td=(al='right',x)=>({padding:full?'3px 3px':'3px 6px',fontSize:full?10.5:11,textAlign:al,fontVariantNumeric:'tabular-nums',borderBottom:'1px solid #E5E7EB',whiteSpace:al==='left'?'normal':'nowrap',...x});
   const tone=t=>t==='red'?C.red:t==='green'?C.green:t==='amber'?C.amber:C.muted;
   const f=v=>v==null?'—':fmt(v);
   const rq=v=>v==null?'—':String(v);
@@ -5520,7 +5545,8 @@ function ReconReportModal({report,onClose}){
 
       {(report.rows||[]).length>0&&<div style={{marginBottom:14,overflowX:'auto'}}>
         <h3 style={{fontSize:13}}>Ledger — my books vs the seller's</h3>
-        <table style={{width:'100%',borderCollapse:'collapse',minWidth:1180}}>
+        <table style={{width:'100%',borderCollapse:'collapse',minWidth:full?0:1180,tableLayout:full?'fixed':'auto'}}>
+          {full&&<colgroup>{[7,15,4.5,5.5,7,4.5,5.5,7,14,8,8,8,6].map((w,i)=><col key={i} style={{width:w+'%'}}/>)}</colgroup>}
           <thead>
             <tr><th style={th('left')} colSpan={2}></th><th style={{...th(),textAlign:'center'}} colSpan={3}>As I had recorded</th><th style={{...th(),textAlign:'center',borderLeft:`2px solid ${C.blue}`}} colSpan={3}>Seller's</th><th style={{...th(),textAlign:'center'}} colSpan={2}>My books after</th><th style={{...th(),textAlign:'center'}} colSpan={3}>Running balance</th></tr>
             <tr><th style={th('left')}>Date</th><th style={th('left')}>Particulars (supplier's names)</th><th style={th()}>Qty</th><th style={th()}>Rate</th><th style={th()}>Amount</th>
@@ -10213,6 +10239,8 @@ function DeliveriesModule(){
 function PurchaseEntry({onSaved}){
   const[date,setDate]=useState(today());
   const[receivedDate,setReceivedDate]=useState(today());
+  // Restoring a purchase record that was lost: the stock it added is already in the item, so only the record itself is re-created.
+  const[restoreOnly,setRestoreOnly]=useState(false);
   const[partyId,setPartyId]=useState('');
   const[lines,setLines]=useState([]);
   const[input,setInput]=useState('');
@@ -10332,6 +10360,7 @@ function PurchaseEntry({onSaved}){
   const doSave=()=>{
     if(!partyId)return toast('Select a supplier','error');
     if(!lines.length)return toast('Add at least one item','error');
+    if(restoreOnly&&!requireOwner(toast))return;
     setSaving(true);
     const id=uid('PUR');
     const allItems=lines.map(l=>({itemId:l.itemId,itemName:l.itemName,customerName:l.customerName,supplierName:l.supplierName,qty:l.qty,rate:l.rate,amount:l.qty*l.rate,peti:l.peti||1,
@@ -10345,20 +10374,21 @@ function PurchaseEntry({onSaved}){
       totalPetis,freightAmount,
       createdAt:new Date().toISOString()};
     state.purchases=[purchase,...state.purchases];save.purchases();
-    if(receivedDate)lines.forEach(l=>adjustStock(l.itemId,l.qty));
-    if(paidNow&&supplierTotal>0){
+    if(receivedDate&&!restoreOnly)lines.forEach(l=>adjustStock(l.itemId,l.qty));
+    if(paidNow&&supplierTotal>0&&!restoreOnly){
       const t={id:uid('TXN'),date,type:'payment',account:paidAccount,amount:supplierTotal,payee:sel?.name||'',partyId,partyName:sel?.name||'',category:'vendor',notes:'Purchase '+id,purchaseId:id,createdAt:new Date().toISOString()};
       state.txns=[t,...state.txns];save.txns();
       const sp={id:uid('SPMT'),txnId:t.id,date,partyId,partyName:sel?.name||'',amount:supplierTotal,account:paidAccount,notes:'Purchase '+id,purchaseId:id};
       state.supplierPayments=[sp,...state.supplierPayments];save.supplierPayments();
     }
-    if(selTr&&freightAmount>0){
+    if(selTr&&freightAmount>0&&!restoreOnly){
       const frt={id:uid('FRT'),date,transporterId:selTr.id,transporterName:selTr.name,purchaseId:id,
         totalPetis,ratePerPeti:totalPetis>0?freightAmount/totalPetis:0,amount:freightAmount,notes:'Freight for purchase '+id+(bilty?' · LR '+bilty:''),createdAt:new Date().toISOString()};
       state.freightCharges=[frt,...state.freightCharges];save.freightCharges();
     }
     setSaving(false);
-    toast('Purchase recorded ✓ '+fmt(grandTotal));
+    toast(restoreOnly?'Purchase record restored ✓ '+fmt(grandTotal)+' — stock, payments and freight left untouched':'Purchase recorded ✓ '+fmt(grandTotal));
+    setRestoreOnly(false);
     setPartyId('');setPq('');setLines([]);setStep('item');setInput('');setPaidNow(false);
     setTransporterId('');setPqTr('');setBilty('');setFreightPerPeti('');setExtraCharges([]);
     setDate(today());setReceivedDate(today());
@@ -10378,6 +10408,10 @@ function PurchaseEntry({onSaved}){
       <div style={{flex:'0 0 155px'}}><Inp label="Received Date" value={receivedDate} onChange={setReceivedDate} type="date" hint="Blank = not received yet"/></div>
     </div>
     {!receivedDate&&<div style={{fontSize:11,color:C.amber,fontWeight:600,marginBottom:10}}>⏳ Stock won't update until received</div>}
+    <label style={{display:'flex',alignItems:'flex-start',gap:6,fontSize:11,color:restoreOnly?C.red:C.sub,fontWeight:restoreOnly?700:500,marginBottom:10,cursor:'pointer'}}>
+      <input type="checkbox" checked={restoreOnly} onChange={e=>setRestoreOnly(e.target.checked)} style={{marginTop:2}}/>
+      <span>Restoring a lost entry (owner only) — only re-creates this purchase record. Stock, payments and freight records are NOT touched again, because they were already saved the first time.</span>
+    </label>
 
     {/* Supplier */}
     <div style={{marginBottom:10}}>
