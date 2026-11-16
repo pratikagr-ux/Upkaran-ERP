@@ -4449,30 +4449,30 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
       if(!p.hist&&c.res!=='adjust'&&c.bAmt>0)payFixes.push({id:p.key,txnId:p.txnId,date:p.date,desc:p.desc,oldAmt:p.amount,newAmt:c.bAmt,delta:c.balDelta});
       else if(c.balDelta!==0)payAdjs.push({date:p.date,name:'Reconciliation adj — payment '+fmtD(p.date)+' ('+p.desc+')',amount:c.balDelta});
     });
-    const miss=missedRows.map(m=>({...m,date:entryDate(m),qty:bkQty(m),rate:bkRate(m),amount:missedBk(m),sellerAmt:missedAmt(m)})).filter(m=>m.qty>0);
+    const miss=missedRows.map(m=>({...m,date:entryDate(m),qty:bkQty(m),rate:bkRate(m),amount:missedBk(m),sellerAmt:missedAmt(m)})).filter(m=>m.qty!==0);
     const ext=extraRows.map(e=>({...e,date:entryDate(e),signed:extraBk(e),sellerSigned:extraSigned(e)})).filter(e=>e.signed!==0);
     return{fix,adj,payFixes,payAdjs,miss,ext,count:fix.length+adj.length+payFixes.length+payAdjs.length+miss.length+ext.length};
   })();
 
   const validate=()=>{
-    const bad=v=>v!==''&&v!=null&&(num(v)==null||num(v)<0);
+    const bad=v=>v!==''&&v!=null&&num(v)==null;   // any number is fine — negatives are rate differences / discounts / returns
     for(const m of missedRows){
       if(!m.name.trim())return'A missed-item row has no item name';
-      if(!(num(m.qty)>0))return'Missed item "'+m.name+'" needs a quantity greater than 0 (the seller\'s figure)';
-      if(num(m.rate)==null||num(m.rate)<0)return'Missed item "'+m.name+'" needs a rate';
-      if(bad(m.bQty)||bad(m.bRate))return'Missed item "'+m.name+'": my-books qty/rate must be a number, 0 or more';
+      if(num(m.qty)==null||num(m.qty)===0)return'Missed item "'+m.name+'" needs a quantity (the seller\'s figure; negative for a return)';
+      if(num(m.rate)==null)return'Missed item "'+m.name+'" needs a rate (negative for a discount / rate difference)';
+      if(bad(m.bQty)||bad(m.bRate))return'Missed item "'+m.name+'": my-books qty/rate must be a number';
       if(!entryDate(m))return'Missed item "'+m.name+'" needs a date';
     }
     for(const e of extraRows){
       if(!e.label.trim())return'An extra/entry row has no description';
       if(e.kind==='writeoff'){
-        if(!(num(e.bAmount)>0))return'Write-off "'+e.label+'" needs an amount greater than 0 (use the +/− choice to say whether you owe more or less)';
+        if(num(e.bAmount)==null||num(e.bAmount)===0)return'Write-off "'+e.label+'" needs an amount (use the +/− choice to say whether you owe more or less)';
       }else if(e.kind==='opening'){
         if(num(e.amount)==null)return'Opening balance "'+e.label+'" needs the seller\'s balance on that date';
         if(e.bAmount!==''&&e.bAmount!=null&&num(e.bAmount)==null)return'Opening balance "'+e.label+'": my-books adjustment must be a number';
       }else{
-        if(!(num(e.amount)>0))return'"'+e.label+'" needs an amount greater than 0 (use the +/− choice for credits)';
-        if(bad(e.bAmount))return'"'+e.label+'": my-books amount must be a number, 0 or more';
+        if(num(e.amount)==null||num(e.amount)===0)return'"'+e.label+'" needs an amount (negative for a discount / credit, or use the +/− choice)';
+        if(bad(e.bAmount))return'"'+e.label+'": my-books amount must be a number';
       }
       if(!entryDate(e))return'"'+e.label+'" needs a date';
     }
@@ -4729,20 +4729,20 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
         <td style={td('left')}>{l.name}{l.isCharge&&<span style={{fontSize:10,color:C.muted}}> (extra charge)</span>}
           {l.oname&&l.oname.trim().toLowerCase()!==String(l.name).trim().toLowerCase()&&<div style={{fontSize:10,color:C.muted}}>my name: {l.oname}</div>}</td>
         {l.type==='item'?<>
-          <td style={td()}><input value={s.bQty??''} onChange={e=>setL(l.key,{bQty:e.target.value})} inputMode="decimal" placeholder={String(l.qty)} style={{...inp,...ed(c.bQty!==l.qty)}}/></td>
-          <td style={td()}><input value={s.bRate??''} onChange={e=>setL(l.key,{bRate:e.target.value})} inputMode="decimal" placeholder={String(l.rate)} style={{...inp,...ed(c.bRate!==l.rate)}}/></td>
+          <td style={td()}><input value={s.bQty??''} onChange={e=>setL(l.key,{bQty:e.target.value})} inputMode="text" placeholder={String(l.qty)} style={{...inp,...ed(c.bQty!==l.qty)}}/></td>
+          <td style={td()}><input value={s.bRate??''} onChange={e=>setL(l.key,{bRate:e.target.value})} inputMode="text" placeholder={String(l.rate)} style={{...inp,...ed(c.bRate!==l.rate)}}/></td>
           <td style={{...td(),fontWeight:600}}>{fmt(c.bAmt)}{chg(l.our,c.change)}</td>
         </>:<>
           <td style={td()}>—</td><td style={td()}>—</td>
-          <td style={td()}><input value={s.bAmt??''} onChange={e=>setL(l.key,{bAmt:e.target.value})} inputMode="decimal" placeholder={String(l.our)} style={{...inp,width:80,...ed(c.edited)}}/>{chg(l.our,c.change)}</td>
+          <td style={td()}><input value={s.bAmt??''} onChange={e=>setL(l.key,{bAmt:e.target.value})} inputMode="text" placeholder={String(l.our)} style={{...inp,width:80,...ed(c.edited)}}/>{chg(l.our,c.change)}</td>
         </>}
         {l.type==='item'?<>
-          <td style={{...td(),...SEL}}><input value={s.sQty??''} onChange={e=>setL(l.key,{sQty:e.target.value})} inputMode="decimal" placeholder={String(l.qty)} style={inp}/>{dtag(r2(c.sQty-c.bQty))}</td>
-          <td style={td()}><input value={s.sRate??''} onChange={e=>setL(l.key,{sRate:e.target.value})} inputMode="decimal" placeholder={String(l.rate)} style={inp}/>{dtag(r2(c.sRate-c.bRate),'₹')}</td>
+          <td style={{...td(),...SEL}}><input value={s.sQty??''} onChange={e=>setL(l.key,{sQty:e.target.value})} inputMode="text" placeholder={String(l.qty)} style={inp}/>{dtag(r2(c.sQty-c.bQty))}</td>
+          <td style={td()}><input value={s.sRate??''} onChange={e=>setL(l.key,{sRate:e.target.value})} inputMode="text" placeholder={String(l.rate)} style={inp}/>{dtag(r2(c.sRate-c.bRate),'₹')}</td>
           <td style={{...td(),color:c.checked?C.txt:C.muted}}>{fmt(c.sAmt)}</td>
         </>:<>
           <td style={{...td(),...SEL}}>—</td><td style={td()}>—</td>
-          <td style={td()}><input value={s.sAmt??''} onChange={e=>setL(l.key,{sAmt:e.target.value})} inputMode="decimal" placeholder={String(l.our)} style={{...inp,width:80}}/></td>
+          <td style={td()}><input value={s.sAmt??''} onChange={e=>setL(l.key,{sAmt:e.target.value})} inputMode="text" placeholder={String(l.our)} style={{...inp,width:80}}/></td>
         </>}
         <td style={td('left')}>
           <div style={{display:'flex',flexDirection:'column',gap:3,alignItems:'flex-start'}}>
@@ -4778,11 +4778,11 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
         <div style={{display:'flex',alignItems:'center',gap:6}}><Badge v="➕ missed item" color="blue"/>
           <input list="recon-item-names" value={m.name} onChange={e=>setMissedName(m.id,e.target.value)} placeholder="Item name…" style={{...inp,width:mobile?150:210,textAlign:'left'}}/></div>
         <div style={{fontSize:10,marginLeft:2,color:m.itemId?C.green:(m.name?C.amber:C.muted)}}>{m.itemId?('✓ my item: '+((state.items.find(x=>x.id===m.itemId)||{}).internal||'catalogue')):(m.name?'not in catalogue — no stock change':' ')}</div></td>
-      <td style={td()}><input value={m.bQty??''} onChange={e=>editMissed(m.id,{bQty:e.target.value})} inputMode="decimal" placeholder={m.qty||'qty'} style={{...inp,...ed(m.bQty!==''&&m.bQty!=null)}}/></td>
-      <td style={td()}><input value={m.bRate??''} onChange={e=>editMissed(m.id,{bRate:e.target.value})} inputMode="decimal" placeholder={m.rate||'rate'} style={{...inp,...ed(m.bRate!==''&&m.bRate!=null)}}/></td>
+      <td style={td()}><input value={m.bQty??''} onChange={e=>editMissed(m.id,{bQty:e.target.value})} inputMode="text" placeholder={m.qty||'qty'} style={{...inp,...ed(m.bQty!==''&&m.bQty!=null)}}/></td>
+      <td style={td()}><input value={m.bRate??''} onChange={e=>editMissed(m.id,{bRate:e.target.value})} inputMode="text" placeholder={m.rate||'rate'} style={{...inp,...ed(m.bRate!==''&&m.bRate!=null)}}/></td>
       <td style={{...td(),fontWeight:700}}>{fmt(missedBk(m))}</td>
-      <td style={{...td(),...SEL}}><input value={m.qty} onChange={e=>editMissed(m.id,{qty:e.target.value})} inputMode="decimal" placeholder="qty" style={inp}/>{dtag(r2((num(m.qty)||0)-bkQty(m)))}</td>
-      <td style={td()}><input value={m.rate} onChange={e=>editMissed(m.id,{rate:e.target.value})} inputMode="decimal" placeholder="rate" style={inp}/>{dtag(r2((num(m.rate)||0)-bkRate(m)),'₹')}</td>
+      <td style={{...td(),...SEL}}><input value={m.qty} onChange={e=>editMissed(m.id,{qty:e.target.value})} inputMode="text" placeholder="qty" style={inp}/>{dtag(r2((num(m.qty)||0)-bkQty(m)))}</td>
+      <td style={td()}><input value={m.rate} onChange={e=>editMissed(m.id,{rate:e.target.value})} inputMode="text" placeholder="rate" style={inp}/>{dtag(r2((num(m.rate)||0)-bkRate(m)),'₹')}</td>
       <td style={{...td(),fontWeight:700}}>{fmt(missedAmt(m))}</td>
       <td style={td('left')}>
         <div style={{display:'flex',flexDirection:'column',gap:3,alignItems:'flex-start'}}>
@@ -4804,7 +4804,7 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
         <div style={{display:'flex',alignItems:'center',gap:6}}><Badge v="✂ write-off · my books only" color="gray"/>
           <input value={e.label} onChange={ev=>editExtra(e.id,{label:ev.target.value})} placeholder="Reason" style={{...inp,width:mobile?150:210,textAlign:'left'}}/></div></td>
       <td style={td()}>—</td><td style={td()}>—</td>
-      <td style={td()}><input value={e.bAmount??''} onChange={ev=>editExtra(e.id,{bAmount:ev.target.value})} inputMode="decimal" placeholder="amount" style={{...inp,width:80,fontWeight:700,color:col,...ed(true)}}/></td>
+      <td style={td()}><input value={e.bAmount??''} onChange={ev=>editExtra(e.id,{bAmount:ev.target.value})} inputMode="text" placeholder="amount" style={{...inp,width:80,fontWeight:700,color:col,...ed(true)}}/></td>
       <td style={{...td(),...SEL}}>—</td><td style={td()}>—</td>
       <td style={{...td(),fontSize:10,color:C.muted}}>not on seller's side</td>
       <td style={td('left')}>
@@ -4828,10 +4828,10 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
           <input value={e.label} onChange={ev=>editExtra(e.id,{label:ev.target.value})} placeholder="Label" style={{...inp,width:mobile?130:170,textAlign:'left'}}/></div>
         <div style={{fontSize:10,color:C.muted}}>my balance just before this: {balTxt(info.mine)}</div></td>
       <td style={td()}>—</td><td style={td()}>—</td>
-      <td style={td()}><input value={e.bAmount??''} onChange={ev=>editExtra(e.id,{bAmount:ev.target.value})} inputMode="decimal" placeholder="0" title="Adjustment to post on MY books (+ = I owe more). Blank = leave my books as they are." style={{...inp,width:80,fontWeight:700,...ed(e.bAmount!==''&&e.bAmount!=null)}}/>
+      <td style={td()}><input value={e.bAmount??''} onChange={ev=>editExtra(e.id,{bAmount:ev.target.value})} inputMode="text" placeholder="0" title="Adjustment to post on MY books (+ = I owe more). Blank = leave my books as they are." style={{...inp,width:80,fontWeight:700,...ed(e.bAmount!==''&&e.bAmount!=null)}}/>
         <div style={{fontSize:10,color:C.muted}}>adjust my books by</div></td>
       <td style={{...td(),...SEL}}>—</td><td style={td()}>—</td>
-      <td style={td()}><input value={e.amount} onChange={ev=>editExtra(e.id,{amount:ev.target.value})} inputMode="decimal" placeholder="their balance" style={{...inp,width:90,fontWeight:700}}/>
+      <td style={td()}><input value={e.amount} onChange={ev=>editExtra(e.id,{amount:ev.target.value})} inputMode="text" placeholder="their balance" style={{...inp,width:90,fontWeight:700}}/>
         {num(e.amount)!=null&&<div style={{fontSize:10,fontWeight:700,color:dcol(d)}}>{d===0?'same as their running':sgn(d)+' vs their running '+balTxt(info.sel)}</div>}</td>
       <td style={td('left')}>
         <div style={{display:'flex',flexDirection:'column',gap:3,alignItems:'flex-start'}}>
@@ -4856,9 +4856,9 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
         <div style={{display:'flex',alignItems:'center',gap:6}}><Badge v={isPay?'➕ payment':'➕ charge / credit'} color={isPay?'green':'amber'}/>
           <input list="recon-extra-names" value={e.label} onChange={ev=>editExtra(e.id,{label:ev.target.value})} placeholder="e.g. Freight, Interest, Discount" style={{...inp,width:mobile?150:210,textAlign:'left'}}/></div></td>
       <td style={td()}>—</td><td style={td()}>—</td>
-      <td style={td()}><input value={e.bAmount??''} onChange={ev=>editExtra(e.id,{bAmount:ev.target.value})} inputMode="decimal" placeholder={e.amount||'amount'} style={{...inp,width:80,fontWeight:700,color:col,...ed(e.bAmount!==''&&e.bAmount!=null)}}/></td>
+      <td style={td()}><input value={e.bAmount??''} onChange={ev=>editExtra(e.id,{bAmount:ev.target.value})} inputMode="text" placeholder={e.amount||'amount'} style={{...inp,width:80,fontWeight:700,color:col,...ed(e.bAmount!==''&&e.bAmount!=null)}}/></td>
       <td style={{...td(),...SEL}}>—</td><td style={td()}>—</td>
-      <td style={td()}><input value={e.amount} onChange={ev=>editExtra(e.id,{amount:ev.target.value})} inputMode="decimal" placeholder="amount" style={{...inp,width:80,fontWeight:700,color:col}}/></td>
+      <td style={td()}><input value={e.amount} onChange={ev=>editExtra(e.id,{amount:ev.target.value})} inputMode="text" placeholder="amount" style={{...inp,width:80,fontWeight:700,color:col}}/></td>
       <td style={td('left')}>
         <div style={{display:'flex',flexDirection:'column',gap:3,alignItems:'flex-start'}}>
           {gap!==0?<div style={{display:'flex',alignItems:'center',gap:5}}><b style={{color:dcol(gap)}}>{sgn(gap)}</b>{miniBtn("← Take seller's",()=>editExtra(e.id,{bAmount:''}))}</div>:<Badge v="✓ Same both sides" color="green"/>}
@@ -4907,7 +4907,7 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
       </div>}
       {plan.miss.length>0&&<div style={{marginBottom:14}}>
         {secT('Missed items added to my books as new purchases ('+plan.miss.length+')')}
-        {plan.miss.map((m,i)=><div key={i}>{rowL(<>{fmtD(m.date)} · {m.name} · {m.qty} × ₹{m.rate}<span style={{color:m.receive&&m.itemId?C.blue:C.muted,marginLeft:8}}>{m.receive?(m.itemId?'stock +'+m.qty:'received · not a catalogue item, no stock change'):'not received yet (shows as a pending purchase)'}</span>{m.amount!==m.sellerAmt&&<span style={{color:C.amber,marginLeft:8}}>seller has {fmt(m.sellerAmt)}</span>}</>,sgn(m.amount),C.red)}</div>)}
+        {plan.miss.map((m,i)=><div key={i}>{rowL(<>{fmtD(m.date)} · {m.name} · {m.qty} × ₹{m.rate}<span style={{color:m.receive&&m.itemId?C.blue:C.muted,marginLeft:8}}>{m.receive?(m.itemId?'stock '+(m.qty>0?'+':'')+m.qty:'received · not a catalogue item, no stock change'):'not received yet (shows as a pending purchase)'}</span>{m.amount!==m.sellerAmt&&<span style={{color:C.amber,marginLeft:8}}>seller has {fmt(m.sellerAmt)}</span>}</>,sgn(m.amount),C.red)}</div>)}
       </div>}
       {plan.ext.length>0&&<div style={{marginBottom:14}}>
         {secT('Entries added to my books ('+plan.ext.length+') — charges, credits, payments, write-offs, opening-balance adjustments · ledger entries only, no bank/cash movement')}
@@ -4950,7 +4950,7 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
         <div style={{fontSize:10,fontWeight:600,color:bookChange===0?C.muted:dcol(bookChange)}}>{bookChange===0?'no changes yet · recorded '+balTxt(closingBalance):'recorded '+balTxt(closingBalance)+' · '+sgn(bookChange)+' from my edits'}</div></div>
       <div style={{padding:'8px 12px',borderRadius:8,border:`1.5px solid ${C.blue}`,background:C.blueSoft}}>
         <div style={{fontSize:10,fontWeight:700,color:C.blue,textTransform:'uppercase'}}>Seller's closing balance ★</div>
-        <input value={sellerClosing} onChange={e=>setSellerClosing(e.target.value)} inputMode="decimal" placeholder="From their statement"
+        <input value={sellerClosing} onChange={e=>setSellerClosing(e.target.value)} inputMode="text" placeholder="From their statement"
           style={{...inp,width:'100%',textAlign:'left',fontSize:15,fontWeight:700,marginTop:2}}/></div>
       <div style={{padding:'8px 12px',borderRadius:8,border:`1px solid ${C.bdr}`,background:C.surf}}>
         <div style={{fontSize:10,fontWeight:700,color:C.sub,textTransform:'uppercase'}}>Seller's figures add up to</div>
@@ -4999,7 +4999,7 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
             <td colSpan={3}></td><td style={SEL} colSpan={3}></td>
             <td style={td('left')}>{so!=null&&openGap!==0&&<span style={{fontSize:10,color:C.amber,fontWeight:600}}>differs {sgn(openGap)}</span>}</td>
             <td style={{...td(),fontWeight:700}}>{fmt(openingBalance)}</td>
-            <td style={{...td(),...SEL}}><input value={sellerOpening} onChange={e=>setSellerOpening(e.target.value)} inputMode="decimal" placeholder={String(openingBalance)} style={{...inp,width:84,fontWeight:700}}/></td>
+            <td style={{...td(),...SEL}}><input value={sellerOpening} onChange={e=>setSellerOpening(e.target.value)} inputMode="text" placeholder={String(openingBalance)} style={{...inp,width:84,fontWeight:700}}/></td>
             <td style={td()}>{openGap===0?'—':sgn(openGap)}</td>
           </tr>
           {shown.length===0&&<tr><td colSpan={COLS} style={{padding:14,textAlign:'center',color:C.sub,fontSize:12}}>{walk.items.length===0?'No bills or payments for this supplier in the selected period.':filter==='attention'?'🎉 No unresolved mismatches.':'Nothing in this view.'}</td></tr>}
@@ -5051,10 +5051,10 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
                   <td style={{...td('left'),fontWeight:700}}>💸 {fmtD(p.date)}</td>
                   <td style={td('left')}>{p.desc}{p.hist&&<span style={{marginLeft:6}}><Badge v="pre-ERP" color="gray"/></span>} {noteToggle('p'+p.key)}</td>
                   <td style={td()}>—</td><td style={td()}>—</td>
-                  <td style={td()}><div style={{display:'inline-flex',alignItems:'center',gap:3}}><span style={{color:C.green,fontWeight:700}}>−</span><input value={payBk[p.key]??''} onChange={e=>setPayBk(x=>({...x,[p.key]:e.target.value}))} inputMode="decimal" placeholder={String(p.amount)} style={{...inp,width:80,color:C.green,fontWeight:700,...ed(pc.edited)}}/></div>
+                  <td style={td()}><div style={{display:'inline-flex',alignItems:'center',gap:3}}><span style={{color:C.green,fontWeight:700}}>−</span><input value={payBk[p.key]??''} onChange={e=>setPayBk(x=>({...x,[p.key]:e.target.value}))} inputMode="text" placeholder={String(p.amount)} style={{...inp,width:80,color:C.green,fontWeight:700,...ed(pc.edited)}}/></div>
                     {pc.edited&&<div style={{fontSize:10,fontWeight:600,color:dcol(pc.balDelta)}}>was {fmt(p.amount)} · {sgn(pc.balDelta)}</div>}</td>
                   <td style={{...td(),...SEL}}>—</td><td style={td()}>—</td>
-                  <td style={td()}><input value={payChk[p.key]??''} onChange={e=>setPayChk(x=>({...x,[p.key]:e.target.value}))} inputMode="decimal" placeholder={String(p.amount)} style={{...inp,width:80}}/></td>
+                  <td style={td()}><input value={payChk[p.key]??''} onChange={e=>setPayChk(x=>({...x,[p.key]:e.target.value}))} inputMode="text" placeholder={String(p.amount)} style={{...inp,width:80}}/></td>
                   <td style={td('left')}>
                     <div style={{display:'flex',flexDirection:'column',gap:3,alignItems:'flex-start'}}>
                       {pc.mismatch?<div style={{display:'flex',alignItems:'center',gap:5}}><b style={{color:dcol(pc.delta)}}>{sgn(pc.delta)}</b>{miniBtn("← Take seller's",()=>takePay(p))}</div>:(pc.checked?<Badge v="✓ Match" color="green"/>:<Badge v="Not checked" color="gray"/>)}
