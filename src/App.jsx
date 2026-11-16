@@ -810,7 +810,7 @@ function Sel({label,value,onChange,options,placeholder,required}){
 }
 
 let modalIdCounter = 0;
-function Modal({title,onClose,children,width=560}){
+function Modal({title,onClose,children,width=560,full=false}){
   const mobile = useIsMobile();
   // Make the hardware/browser Back button close this modal instead of
   // navigating away underneath it (or exiting the PWA). We push one dummy
@@ -854,11 +854,11 @@ function Modal({title,onClose,children,width=560}){
     };
   }, []);
   return <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.5)',zIndex:1000,
-    display:'flex',alignItems:'center',justifyContent:'center',padding:mobile?0:16}}
+    display:'flex',alignItems:'center',justifyContent:'center',padding:(mobile||full)?0:16}}
     onClick={e=>{if(e.target===e.currentTarget)onClose();}}>
-    <div style={{background:C.surf,borderRadius:mobile?0:12,width:'100%',maxWidth:mobile?'100%':width,
-      height:mobile?'100%':'auto',maxHeight:mobile?'100%':'90vh',
-      overflow:'auto',boxShadow:mobile?'none':'0 20px 60px rgba(0,0,0,0.3)'}}>
+    <div style={{background:C.surf,borderRadius:(mobile||full)?0:12,width:'100%',maxWidth:(mobile||full)?'100%':width,
+      height:(mobile||full)?'100%':'auto',maxHeight:(mobile||full)?'100%':'90vh',
+      overflow:'auto',boxShadow:(mobile||full)?'none':'0 20px 60px rgba(0,0,0,0.3)'}}>
       <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'16px 22px',
         borderBottom:`1px solid ${C.bdr}`,position:'sticky',top:0,background:C.surf,zIndex:1}}>
         <h2 style={{margin:0,fontSize:16,fontWeight:700,color:C.txt}}>{title}</h2>
@@ -4239,6 +4239,8 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
   const[step,setStep]=useState('work');
   const[posting,setPosting]=useState(false);
   const[undoPlan,setUndoPlan]=useState(null);
+  const[full,setFull]=useState(false);
+  const[showReport,setShowReport]=useState(false);
   const postedCount=lastPosted?.posted?((lastPosted.posted.fixed||0)+(lastPosted.posted.adjusted||0)+(lastPosted.posted.paymentsFixed||0)+(lastPosted.posted.paymentsAdjusted||0)+(lastPosted.posted.missed||0)+(lastPosted.posted.extras||0)):0;
 
   // ── Our side of the picture ────────────────────────────────────────────────
@@ -4247,7 +4249,7 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
     // Names as the SUPPLIER calls the items (catalogue "supplier" name), with my
     // own name kept alongside so lines are recognisable on both sides.
     const catByName=new Map();
-    state.items.forEach(it=>{[it.supplier,it.internal,it.name].filter(Boolean).forEach(n=>{const k=String(n).trim().toLowerCase();if(!catByName.has(k))catByName.set(k,it);});});
+    state.items.forEach(it=>{[it.internal,it.supplier,it.customer,it.dispatchName,it.name].filter(Boolean).forEach(n=>{const k=String(n).trim().toLowerCase();if(!catByName.has(k))catByName.set(k,it);});});
     // Pre-ERP history: visible with its real qty/rate lines. Read-only (it also
     // feeds stock/FIFO costing), so a difference on these is resolved with an
     // adjustment entry, which moves the ledger balance identically.
@@ -4259,7 +4261,7 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
         if(Array.isArray(x)&&x[1]!=null&&x[2]!=null){
           const q=Number(x[1])||0,rt=Number(x[2])||0;
           const cat=catByName.get(String(x[0]).trim().toLowerCase());
-          lines.push({key:key+'#'+i,billKey:key,type:'item',idx:i,name:cat?.supplier||x[0],oname:cat?.internal||'',qty:q,rate:rt,our:r2(q*rt),fixable:false});
+          lines.push({key:key+'#'+i,billKey:key,type:'item',idx:i,name:(cat&&cat.supplier&&cat.supplier.trim())||x[0],oname:cat?.internal||'',qty:q,rate:rt,our:r2(q*rt),fixable:false});
           sum+=q*rt;
         }
       });
@@ -4276,8 +4278,9 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
       const lines=[];
       (p.items||[]).forEach((it,i)=>{
         const q=Number(it.qty)||0,rt=Number(it.rate)||0;
-        const cat=it.itemId?state.items.find(x=>x.id===it.itemId):null;
-        lines.push({key:p.id+'#'+i,billKey:p.id,type:'item',idx:i,name:it.supplierName||cat?.supplier||it.customerName||it.itemName||'Item',oname:cat?.internal||it.itemName||it.customerName||'',seed:it.reconSeller||null,itemId:it.itemId,qty:q,rate:rt,our:r2(q*rt),fixable:true});
+        // the supplier's name comes from the item's Naming Conventions entry; the name stored on the bill is the fallback
+        const cat=(it.itemId?state.items.find(x=>x.id===it.itemId):null)||catByName.get(String(it.itemName||it.customerName||it.supplierName||'').trim().toLowerCase())||null;
+        lines.push({key:p.id+'#'+i,billKey:p.id,type:'item',idx:i,name:(cat&&cat.supplier&&cat.supplier.trim())||it.supplierName||it.customerName||it.itemName||'Item',oname:cat?.internal||it.itemName||it.customerName||'',seed:it.reconSeller||null,itemId:it.itemId,qty:q,rate:rt,our:r2(q*rt),fixable:true});
       });
       (p.extraCharges||[]).forEach((c,i)=>{
         lines.push({key:p.id+'!'+(c.id||i),billKey:p.id,type:'amount',chargeIdx:i,name:c.name||'Extra charge',our:r2(c.amount),fixable:true,isCharge:true});
@@ -4463,6 +4466,35 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
   const unexplained=sc==null?null:r2(sc-sellerCalc);
   const settleAmt=settleBasis==='seller'&&sc!=null?sc:ourAdjusted;
 
+  // ── Where the difference comes from ────────────────────────────────────────
+  // For each source: what the seller's figures differ from my ORIGINAL record by,
+  // how much of that I've corrected on my books, and what is still different.
+  // + = I owe more. Item lines split exactly into a rate part and a qty part.
+  const brkRows=(()=>{
+    let rateF=0,rateC=0,qtyF=0,qtyC=0,amtF=0,amtC=0;
+    allLines.forEach(l=>{
+      const c=calcs[l.key];
+      if(l.type==='item'){
+        rateF+=(c.sRate-l.rate)*c.sQty;qtyF+=(c.sQty-l.qty)*l.rate;
+        rateC+=(c.bRate-l.rate)*c.bQty;qtyC+=(c.bQty-l.qty)*l.rate;
+      }else{amtF+=c.sAmt-l.our;amtC+=c.bAmt-l.our;}
+    });
+    const openRows=extraRows.filter(e=>e.kind==='opening');
+    const opS=r2(openRows.reduce((t,e)=>t+extraSigned(e),0)),opB=r2(openRows.reduce((t,e)=>t+extraBk(e),0));
+    return[
+      ['Rate differences on items',rateF,rateC],
+      ['Quantity differences on items',qtyF,qtyC],
+      ['Extra charges, discounts & bill totals',amtF,amtC],
+      ['Items missing from my books',missedSell,missedBkTot],
+      ['Charges / credits / payments added',extrasSell-opS,extrasBkTot-opB-woTot],
+      ['Payments that differ',sellPay,bookPay],
+      ['Opening balance',openDiff+opS,opB],
+      ['Write-offs on my side',0,woTot],
+    ].map(([label,f,c])=>({label,found:r2(f),corrected:r2(c),open:r2(r2(f)-r2(c))})).filter(x=>x.found!==0||x.corrected!==0);
+  })();
+  const brkTot={found:r2(brkRows.reduce((t,x)=>t+x.found,0)),corrected:r2(brkRows.reduce((t,x)=>t+x.corrected,0)),open:r2(brkRows.reduce((t,x)=>t+x.open,0))};
+  const shownDiff=diff!=null?diff:remaining;   // vs their statement when entered, else vs the figures typed here
+
   // ── Autosave (debounced, silent) ───────────────────────────────────────────
   const payload=useMemo(()=>({id:draftId,partyId:party.id,partyName:party.name,status:'draft',from:from||'',to:to||'',v:3,sellerClosing,sellerOpening,lines:ls,billOk,missed,extras,payChk,payBk,payRes,payWas,noteMap,flags,notes,settleBasis}),[draftId,party.id,party.name,from,to,sellerClosing,sellerOpening,ls,billOk,missed,extras,payChk,payBk,payRes,noteMap,flags,notes,settleBasis]);
   const lastSaved=useRef(JSON.stringify(payload));
@@ -4553,7 +4585,7 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
   // ── What "Post to books" will do ───────────────────────────────────────────
   // Everything staged on the books side. Nothing here has touched the books yet.
   const plan=(()=>{
-    const fix=[],adj=[],payFixes=[],payAdjs=[];
+    const fix=[],adjBy={},payAdjs=[];
     editedLines.forEach(l=>{
       const c=calcs[l.key],bill=bills.find(b=>b.key===l.billKey);
       if(l.fixable&&c.res!=='adjust'){
@@ -4561,17 +4593,23 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
           oldQty:l.qty,oldRate:l.rate,oldAmt:l.our,nQty:c.bQty,nRate:c.bRate,nAmt:c.bAmt,delta:c.change,
           itemId:l.itemId,received:bill.received});
       }else if(c.change!==0){
-        adj.push({date:bill.date,name:'Reconciliation adj — '+l.name+' ('+fmtD(bill.date)+')',amount:c.change});
+        // every adjusted line of a bill rolls into ONE ledger entry for that bill
+        const g=(adjBy[l.billKey]||={billKey:l.billKey,date:bill.date,hist:bill.hist,ref:bill.ref,amount:0,lines:[]});
+        g.amount=r2(g.amount+c.change);
+        g.lines.push({name:l.name,amount:c.change,was:l.our,becomes:c.bAmt});
       }
     });
+    const adj=Object.values(adjBy).filter(g=>g.amount!==0).map(g=>({...g,name:'Reconciliation adjustment — '+(g.hist?'pre-ERP bill':'bill')+' of '+fmtD(g.date)}));
+    // A payment that differs is adjusted with a simple ledger entry — the payment
+    // itself and the cash / bank books are never touched.
     editedPays.forEach(p=>{
       const c=payCalcs[p.key];
-      if(!p.hist&&c.res!=='adjust'&&c.bAmt>0)payFixes.push({id:p.key,txnId:p.txnId,date:p.date,desc:p.desc,oldAmt:p.amount,newAmt:c.bAmt,delta:c.balDelta});
-      else if(c.balDelta!==0)payAdjs.push({date:p.date,name:'Reconciliation adj — payment '+fmtD(p.date)+' ('+p.desc+')',amount:c.balDelta});
+      if(c.balDelta!==0)payAdjs.push({date:p.date,name:'Reconciliation adjustment — payment of '+fmtD(p.date)+' ('+p.desc+')',amount:c.balDelta,
+        lines:[{name:'Payment of '+fmtD(p.date)+': recorded '+fmt(p.amount)+' → '+fmt(c.bAmt),amount:c.balDelta}]});
     });
     const miss=missedRows.map(m=>({...m,sQty:num(m.qty),sRate:num(m.rate),date:entryDate(m),qty:bkQty(m),rate:bkRate(m),amount:missedBk(m),sellerAmt:missedAmt(m)})).filter(m=>m.qty!==0);
     const ext=extraRows.map(e=>({...e,date:entryDate(e),signed:extraBk(e),sellerSigned:extraSigned(e)})).filter(e=>e.signed!==0);
-    return{fix,adj,payFixes,payAdjs,miss,ext,count:fix.length+adj.length+payFixes.length+payAdjs.length+miss.length+ext.length};
+    return{fix,adj,payFixes:[],payAdjs,miss,ext,count:fix.length+adj.length+payAdjs.length+miss.length+ext.length};
   })();
 
   const validate=()=>{
@@ -4606,13 +4644,75 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
 
   const summaryObj=()=>({ourClosing:closingBalance,ourAdjusted,sellerClosing:sc,sellerCalc,difference:diff,stillDifferent:remaining,openingDiff:openDiff,unexplained,settleBasis,settleAmt});
 
+  // A self-contained snapshot of this reconciliation — every bill line with the
+  // recorded / seller / my-books figures and its outcome, the running balances,
+  // the breakdown by cause and the entries it posts — so it can be reopened
+  // later as a report (see ReconReportModal), long after it's been posted.
+  const buildReport=(status)=>{
+    const rows=[];
+    const adjFor=k=>plan.adj.find(g=>g.billKey===k);
+    const addedRow=(label,kind,date,sel,bk,gap,bal)=>({k:'added',label,kind,date,sel,bk,gap,bal});
+    walk.items.forEach(it=>{
+      if(it.t==='bill'){
+        const b=it.b;
+        rows.push({k:'bill',date:b.date,ref:b.ref,hist:!!b.hist,note:(noteMap[b.key]||'').trim()});
+        b.lines.forEach(l=>{
+          const c=calcs[l.key];
+          let outcome,tone;
+          if(c.edited&&c.change!==0){outcome=(l.fixable&&c.res!=='adjust')?'Corrected in the bill':'Adjusted by an entry';tone='amber';}
+          else if(c.status==='match'){outcome=c.orig!==0?'Corrected on my books':'Matches';tone=c.orig!==0?'amber':'green';}
+          else if(c.status==='mismatch'){outcome='Still different — to discuss';tone='red';}
+          else{outcome='Not checked';tone='gray';}
+          if(c.status==='mismatch'&&c.edited&&c.change!==0){outcome+=' · still differs';tone='red';}
+          const item=l.type==='item';
+          rows.push({k:'line',name:l.name,oname:l.oname||'',item,
+            rec:{q:item?l.qty:null,r:item?l.rate:null,a:l.our},
+            sel:{q:item?c.sQty:null,r:item?c.sRate:null,a:c.sAmt},
+            bk:{q:item?c.bQty:null,r:item?c.bRate:null,a:c.bAmt},
+            outcome,tone,gap:c.delta,note:(c.note||'').trim(),flag:!!c.flag,wasCorrected:!!c.wasCorrected&&c.orig!==0,ref:c.ref,bal:walk.B[l.key]});
+        });
+        missed.filter(m=>m.billKey===b.key&&(m.name||m.qty||m.rate)).forEach(m=>rows.push({...addedRow(m.name,'missed',b.date,{q:num(m.qty),r:num(m.rate),a:missedAmt(m)},{q:bkQty(m),r:bkRate(m),a:missedBk(m)},missedGap(m),walk.B['m'+m.id])}));
+        extras.filter(e=>e.billKey===b.key&&(e.label||e.amount)).forEach(e=>rows.push(addedRow(e.label,e.kind||'charge',b.date,{a:extraSigned(e)},{a:extraBk(e)},extraGap(e),walk.B['x'+e.id])));
+        rows.push({k:'billTotal',rec:r2(b.lines.reduce((t,l)=>t+l.our,0)),bk:walk.B['T'+b.key]?r2(b.lines.reduce((t,l)=>t+calcs[l.key].bAmt,0)+missed.filter(m=>m.billKey===b.key).reduce((t,m)=>t+missedBk(m),0)+extras.filter(e=>e.billKey===b.key).reduce((t,e)=>t+extraBk(e),0)):0,
+          sel:r2(b.lines.reduce((t,l)=>t+calcs[l.key].sAmt,0)+missed.filter(m=>m.billKey===b.key).reduce((t,m)=>t+missedAmt(m),0)+extras.filter(e=>e.billKey===b.key).reduce((t,e)=>t+extraSigned(e),0)),bal:walk.B['T'+b.key]});
+        const g=adjFor(b.key);
+        if(g)rows.push({k:'adj',amount:g.amount,lines:g.lines,hist:!!b.hist});
+      }else if(it.t==='pay'){
+        const pp=it.p,pc=payCalcs[pp.key];
+        let outcome,tone;
+        if(pc.edited&&pc.balDelta!==0){outcome='Adjusted by an entry (cash/bank untouched)';tone='amber';}
+        else if(pc.mismatch){outcome='Still different — to discuss';tone='red';}
+        else if(pc.checked){outcome=pc.orig!==0?'Corrected on my books':'Matches';tone=pc.orig!==0?'amber':'green';}
+        else{outcome='Not checked';tone='gray';}
+        rows.push({k:'pay',date:pp.date,desc:pp.desc,hist:!!pp.hist,rec:pp.amount,sel:pc.sAmt,bk:pc.bAmt,gap:pc.delta,outcome,tone,note:(noteMap['p'+pp.key]||'').trim(),bal:walk.B['p'+pp.key]});
+      }else if(it.t==='freeM'){
+        const m=it.m;
+        if(m.name||m.qty||m.rate)rows.push(addedRow(m.name,'missed',m.date,{q:num(m.qty),r:num(m.rate),a:missedAmt(m)},{q:bkQty(m),r:bkRate(m),a:missedBk(m)},missedGap(m),walk.B['m'+m.id]));
+      }else{
+        const e=it.e;
+        if(e.label||e.amount||e.bAmount)rows.push(addedRow(e.label,e.kind||'charge',e.date,{a:extraSigned(e)},{a:extraBk(e)},extraGap(e),walk.B['x'+e.id]));
+      }
+    });
+    const breakdown=brkRows.map(x=>({...x}));
+    if(sc!=null&&unexplained!==0)breakdown.push({label:'Not captured above — their statement still differs',found:0,corrected:0,open:unexplained,statement:true});
+    return{v:1,at:new Date().toISOString(),status,party:{id:party.id,name:party.name},period:{from:from||'',to:to||''},
+      seller:{closing:sc,opening:so},
+      balances:{openingRecorded:openingBalance,ourRecorded:closingBalance,ourAdjusted,sellerFigures:sellerCalc,statement:sc,difference:shownDiff,differenceBasis:sc!=null?'statement':'figures',unexplained,settleAmt,settleBasis},
+      breakdown,breakdownTotal:{...brkTot},rows,
+      entries:[...plan.adj,...plan.payAdjs].map(a=>({kind:'adjustment',date:a.date,name:a.name,amount:a.amount,lines:a.lines||[]}))
+        .concat(plan.miss.map(m=>({kind:'missed item',date:m.date,name:m.name+' · '+m.qty+' × ₹'+m.rate,amount:m.amount,lines:[]})))
+        .concat(plan.ext.map(e=>({kind:e.kind==='writeoff'?'write-off':e.kind==='opening'?'opening balance':'charge / credit',date:e.date,name:e.label,amount:e.signed,lines:[]}))),
+      fixes:plan.fix.map(f=>({date:f.date,name:f.name,was:f.type==='item'?f.oldQty+' × ₹'+f.oldRate+' = '+fmt(f.oldAmt):fmt(f.oldAmt),becomes:f.type==='item'?f.nQty+' × ₹'+f.nRate+' = '+fmt(f.nAmt):fmt(f.nAmt),delta:f.delta})),
+      notes:notes.trim(),counts:{toDiscuss:discussLines.length+discussPays.length+addedAll,corrected:correctedCount,unresolved:mismTotal,changes:plan.count}};
+  };
+
   const finalize=(nowIso,posted)=>{
     // Remember what corrected lines/payments were before, so they stay in the
     // "to discuss" list when this reconciliation is reopened.
     const lines2={...payload.lines},payWas2={...payWas};
     plan.fix.forEach(f=>{lines2[f.key]={...(lines2[f.key]||{}),was:(lines2[f.key]&&lines2[f.key].was!=null)?lines2[f.key].was:f.oldAmt};});
     plan.payFixes.forEach(f=>{if(payWas2[f.id]==null)payWas2[f.id]=f.oldAmt;});
-    const rec={...payload,lines:lines2,payWas:payWas2,status:'posted',postedAt:nowIso,summary:summaryObj(),posted};
+    const rec={...payload,lines:lines2,payWas:payWas2,status:'posted',postedAt:nowIso,summary:summaryObj(),posted,report:buildReport('posted')};
     const had=state.supplierReconciliations.some(r=>r.id===draftId);
     state.supplierReconciliations=had?state.supplierReconciliations.map(r=>r.id===draftId?{...r,...rec}:r):[rec,...state.supplierReconciliations];
   };
@@ -4683,14 +4783,14 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
     // A ledger-only entry (no catalogue item, no stock) carrying one signed
     // amount, so it shows in the supplier ledger with its reason.
     // sellerAmt = what the SELLER has for this entry (0 for my own adjustments / write-offs) — remembered so it still shows as a difference next time
-    const mkLedgerEntry=(date,name,amount,source,sellerAmt)=>({id:newPurId(),date,bookedDate:date,receivedDate:date,status:'received',expectedDate:null,
+    const mkLedgerEntry=(date,name,amount,source,sellerAmt,detail)=>({id:newPurId(),date,bookedDate:date,receivedDate:date,status:'received',expectedDate:null,
       partyId:party.id,partyName:party.name,
       items:[{itemId:'',itemName:name,customerName:name,supplierName:name,qty:1,rate:amount,amount,peti:1,freightPerPeti:0,freightAmount:0,...(sellerAmt!=null&&sellerAmt!==amount?{reconSeller:{qty:1,rate:sellerAmt}}:{})}],
-      total:amount,bilty:'',extraCharges:[],extraChargesTotal:0,totalPetis:0,freightAmount:0,source,reconId:draftId,createdAt:nowIso});
+      total:amount,bilty:'',extraCharges:[],extraChargesTotal:0,totalPetis:0,freightAmount:0,source,reconId:draftId,createdAt:nowIso,...(detail?{reconDetail:detail}:{})});
 
     // Differences kept as separate adjustment entries instead of editing the original.
-    plan.adj.forEach(a=>{if(a.amount)created.push(mkLedgerEntry(a.date,a.name,a.amount,'reconciliation-adjustment',0));});
-    plan.payAdjs.forEach(a=>{if(a.amount)created.push(mkLedgerEntry(a.date,a.name,a.amount,'reconciliation-adjustment',0));});
+    plan.adj.forEach(a=>{if(a.amount)created.push(mkLedgerEntry(a.date,a.name,a.amount,'reconciliation-adjustment',0,a.lines));});
+    plan.payAdjs.forEach(a=>{if(a.amount)created.push(mkLedgerEntry(a.date,a.name,a.amount,'reconciliation-adjustment',0,a.lines));});
     // Charges / credits / payments added (my-books figure).
     plan.ext.forEach(e=>{
       if(!e.signed)return;
@@ -4725,7 +4825,7 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
     save.supplierReconciliations();
     toast('Reconciliation posted ✓ '+plan.count+' change'+(plan.count===1?'':'s')+' applied to your books');
     setPosting(false);
-    onClose();
+    onClose({reportRecId:draftId});
   };
 
   // ── Undo the last post ─────────────────────────────────────────────────────
@@ -4744,7 +4844,7 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
     finalize(new Date().toISOString(),{fixed:0,adjusted:0,paymentsFixed:0,paymentsAdjusted:0,missed:0,extras:0});
     save.supplierReconciliations();
     toast('Reconciliation saved ✓');
-    onClose();
+    onClose({reportRecId:draftId});
   };
 
   // ── Note to seller (WhatsApp) ──────────────────────────────────────────────
@@ -5039,8 +5139,9 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
         {plan.payFixes.map((f,i)=><div key={i}>{rowL(fmtD(f.date)+' · '+f.desc+' · '+fmt(f.oldAmt)+' → '+fmt(f.newAmt),sgn(f.delta),dcol(f.delta))}</div>)}
       </div>}
       {(plan.adj.length+plan.payAdjs.length)>0&&<div style={{marginBottom:14}}>
-        {secT('Post as separate adjustment entries ('+(plan.adj.length+plan.payAdjs.length)+') — originals stay untouched')}
-        {[...plan.adj,...plan.payAdjs].map((a,i)=><div key={i}>{rowL(a.name,sgn(a.amount),dcol(a.amount))}</div>)}
+        {secT('Adjustment entries ('+(plan.adj.length+plan.payAdjs.length)+') — one per bill; payments get a simple entry, cash & bank books untouched; originals stay as they are')}
+        {[...plan.adj,...plan.payAdjs].map((a,i)=><div key={i}>{rowL(a.name,sgn(a.amount),dcol(a.amount))}
+          {a.lines&&a.lines.length>0&&<div style={{fontSize:11,color:C.sub,padding:'2px 0 4px 14px'}}>{a.lines.map((x,j)=><div key={j}>{x.name}: <b style={{color:dcol(x.amount)}}>{sgn(x.amount)}</b></div>)}</div>}</div>)}
       </div>}
       {plan.miss.length>0&&<div style={{marginBottom:14}}>
         {secT('Missed items added to my books as new purchases ('+plan.miss.length+')')}
@@ -5065,7 +5166,7 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
   }
 
   // ═════════════════════════════ WORKING STEP ════════════════════════════════
-  const diffColor=diff==null?C.muted:diff===0?C.green:C.red;
+  const diffColor=shownDiff===0?C.green:C.red;
   const shown=walk.items.filter(showItem);
   const openGap=r2((so!=null?so:openingBalance)-openingBalance);
   const undoModal=undoPlan?<Modal title={'Undo the reconciliation posted '+fmtD((lastPosted.postedAt||'').slice(0,10))} onClose={()=>setUndoPlan(null)} width={720}>
@@ -5090,7 +5191,7 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
       <Btn onClick={doUndo} variant="danger" disabled={undoPlan.problems.length>0||undoPlan.nothing}>↶ Undo that post</Btn>
     </div>
   </Modal>:null;
-  return <><Modal title={'Reconcile with '+party.name} onClose={onClose} width={1240}>
+  return <><Modal title={'Reconcile with '+party.name} onClose={onClose} width={1240} full={full}>
     <TC/>
     <div style={{padding:'7px 12px',borderRadius:8,background:C.greenSoft||'#EAF7EE',color:C.green,fontSize:12,fontWeight:600,marginBottom:8}}>
       🔒 Nothing in your books changes while you work here. Everything is a draft until you press <b>Review & post</b>.
@@ -5121,14 +5222,15 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
         <div style={{fontSize:18,fontWeight:800,color:C.txt}}>{balTxt(sellerCalc)}</div>
         <div style={{fontSize:10,color:unexplained?C.red:C.muted}}>{unexplained==null?'enter their closing balance to compare':unexplained===0?'✓ matches their statement':'statement differs by '+sgn(unexplained)+' — something is still missing'}</div></div>
       <div style={{padding:'8px 12px',borderRadius:8,border:`1.5px solid ${diffColor}`,background:'#fff'}}>
-        <div style={{fontSize:10,fontWeight:700,color:C.sub,textTransform:'uppercase'}}>Difference (seller − mine)</div>
-        <div style={{fontSize:18,fontWeight:800,color:diffColor}}>{diff==null?'—':diff===0?'✓ Reconciled':sgn(diff)}</div>
-        <div style={{fontSize:10,color:C.muted}}>{mismTotal} unresolved mismatch{mismTotal===1?'':'es'}</div></div>
+        <div style={{fontSize:10,fontWeight:700,color:C.sub,textTransform:'uppercase'}}>{sc!=null?'Difference (their statement − mine)':'Difference (seller\'s figures − mine)'}</div>
+        <div style={{fontSize:18,fontWeight:800,color:diffColor}}>{shownDiff===0?'✓ Reconciled':sgn(shownDiff)}</div>
+        <div style={{fontSize:10,color:C.muted}}>{mismTotal} unresolved mismatch{mismTotal===1?'':'es'}{sc==null?' · enter their closing balance to compare with their statement':''}</div></div>
     </div>
 
     <div style={{display:'flex',gap:6,flexWrap:'wrap',alignItems:'center',marginBottom:8}}>
       {[['all','All'],['attention','Unresolved mismatches'],['discuss','To discuss ('+(discussLines.length+discussPays.length+addedAll)+')'],['edited','My edits'],['todo','Not fully checked']].map(([k,l])=>
         <button key={k} onClick={()=>setFilter(k)} style={{padding:'3px 10px',borderRadius:14,border:`1px solid ${filter===k?C.blue:C.bdr}`,background:filter===k?C.blueSoft:'#fff',color:filter===k?C.blue:C.sub,fontSize:11,fontWeight:600,cursor:'pointer',fontFamily:'inherit'}}>{l}</button>)}
+      {miniBtn(full?'🗗 Exit full screen':'⛶ Full screen',()=>setFull(f=>!f),C.sub)}
       <Btn onClick={markAllBills} size="sm" variant="secondary">✓ All bills match</Btn>
       {mismTotal>0&&<Btn onClick={acceptAll} size="sm" variant="secondary">Take all seller figures</Btn>}
       <span style={{flex:1}}/>
@@ -5142,7 +5244,7 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
     </div>
 
     <div style={{border:`1px solid ${C.bdr}`,borderRadius:10,overflow:'hidden',marginBottom:14,background:C.surf}}>
-      <div style={{overflowX:'auto',maxHeight:mobile?undefined:'58vh',overflowY:'auto'}}>
+      <div style={{overflowX:'auto',maxHeight:mobile?undefined:(full?'calc(100vh - 420px)':'58vh'),overflowY:'auto'}}>
       <table style={{width:'100%',borderCollapse:'collapse',minWidth:1180}}>
         <thead style={{position:'sticky',top:0,zIndex:2}}>
           <tr>
@@ -5226,10 +5328,7 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
                       {(pc.edited||pc.orig!==0||pc.flag)&&!pc.mismatch&&miniBtn(pc.flag?'💬 Flagged to discuss':'💬 Flag to discuss',()=>setFlags(x=>({...x,['p'+p.key]:!x['p'+p.key]})),pc.flag?C.amber:C.sub)}
                       {pc.edited&&<div style={{display:'flex',alignItems:'center',gap:5,flexWrap:'wrap'}}>
                         {miniBtn('↺ Undo my edit',()=>revertPay(p),C.sub)}
-                        {(!p.hist&&pc.bAmt>0)
-                          ?<select value={pc.res==='adjust'?'adjust':''} onChange={e=>setPayRes(x=>({...x,[p.key]:e.target.value}))} style={selSt} title="How this change is posted">
-                            <option value="">Edit this payment</option><option value="adjust">Separate adjustment</option></select>
-                          :<span style={{fontSize:10,color:C.muted}}>posts as adjustment</span>}
+                        <span style={{fontSize:10,color:C.muted}}>posts as a simple adjustment entry — cash/bank untouched</span>
                       </div>}
                     </div>
                   </td>
@@ -5271,25 +5370,33 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
               ['± Charges / credits / payments added (my figure)',extrasBkTot===0?'₹0':sgn(extrasBkTot),C.txt,false],
               ['= My total outstanding after changes',balTxt(ourAdjusted),C.blue,true],
               ["Seller's closing balance (statement)",sc==null?'— enter above —':balTxt(sc),C.txt,true],
-              ['Difference (seller − mine)',diff==null?'—':diff===0?'₹0  ✓ reconciled':sgn(diff),diffColor,true],
+              ['Difference ('+(sc!=null?'their statement':'seller\'s figures')+' − mine)',shownDiff===0?'₹0  ✓ reconciled':sgn(shownDiff),diffColor,true],
             ].map(([l,v,c,b],i)=><tr key={i} style={{borderTop:b?`1px solid ${C.bdr}`:'none'}}>
               <td style={{padding:'3px 0',fontSize:12,color:C.sub,fontWeight:b?700:400}}>{l}</td>
               <td style={{padding:'3px 0',fontSize:13,textAlign:'right',color:c,fontWeight:b?800:600,fontVariantNumeric:'tabular-nums'}}>{v}</td></tr>)}
           </tbody></table>
-          {diff!=null&&diff!==0&&<div style={{margin:'10px 0 0',padding:'8px 12px',borderRadius:8,background:'#F9FAFB',border:`1px solid ${C.bdr}`}}>
-            <div style={{fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',marginBottom:4}}>What the difference is made of</div>
-            {[
-              ['Lines where the seller still differs',remLines],
-              ['Payments where the seller still differs',remPay],
-              ['Added entries where the amounts differ',remAdded],
-              ['Opening balance difference',openDiff],
-              ["Write-offs I've put in on my side",r2(-woTot)],
-              ["Not captured above — their statement still differs",unexplained],
-            ].map(([l,v],i)=><div key={i} style={{display:'flex',justifyContent:'space-between',fontSize:12,padding:'2px 0',color:i===5&&v!==0?C.red:C.txt,fontWeight:i===5?700:400}}>
-              <span>{l}</span><span style={{fontVariantNumeric:'tabular-nums'}}>{v===0?'₹0':sgn(v)}</span></div>)}
-            {(diff!=null?diff:remaining)!==0&&<div style={{marginTop:8}}>{miniBtn('✂ Write off the '+fmt(Math.abs(diff!=null?diff:remaining))+' difference on my side',()=>addWriteoff(diff!=null?diff:remaining),C.sub)}
-              <div style={{fontSize:10,color:C.muted,marginTop:3}}>Adds a books-only entry that moves my balance to the seller's. Staged like everything else — nothing posts until Review & post.</div></div>}
+          {brkRows.length>0&&<div style={{margin:'12px 0 0',padding:'8px 10px',borderRadius:8,background:'#F9FAFB',border:`1px solid ${C.bdr}`,overflowX:'auto'}}>
+            <div style={{fontSize:11,fontWeight:700,color:C.sub,textTransform:'uppercase',marginBottom:4}}>Where the difference comes from (+ = I owe more)</div>
+            <table style={{width:'100%',borderCollapse:'collapse',minWidth:420}}>
+              <thead><tr>{['Source',"Seller vs my original record",'I corrected on my books','Still different'].map((hd,i)=><th key={i} style={{...th(i?'right':'left'),fontSize:9,background:'transparent'}}>{hd}</th>)}</tr></thead>
+              <tbody>
+                {brkRows.map((x,i)=><tr key={i} style={{borderTop:`1px solid ${C.bdr}`}}>
+                  <td style={td('left')}>{x.label}</td>
+                  <td style={{...td(),color:dcol(x.found)}}>{x.found===0?'—':sgn(x.found)}</td>
+                  <td style={{...td(),color:dcol(x.corrected)}}>{x.corrected===0?'—':sgn(x.corrected)}</td>
+                  <td style={{...td(),fontWeight:700,color:x.open===0?C.muted:dcol(x.open)}}>{x.open===0?'—':sgn(x.open)}</td></tr>)}
+                {sc!=null&&unexplained!==0&&<tr style={{borderTop:`1px solid ${C.bdr}`}}>
+                  <td style={{...td('left'),color:C.red}}>Not captured above — their statement still differs</td><td style={td()}>—</td><td style={td()}>—</td>
+                  <td style={{...td(),fontWeight:700,color:C.red}}>{sgn(unexplained)}</td></tr>}
+                <tr style={{borderTop:`2px solid ${C.txt}`}}>
+                  <td style={{...td('left'),fontWeight:800}}>Total</td>
+                  <td style={{...td(),fontWeight:800,color:dcol(brkTot.found)}}>{brkTot.found===0?'₹0':sgn(brkTot.found)}</td>
+                  <td style={{...td(),fontWeight:800,color:dcol(brkTot.corrected)}}>{brkTot.corrected===0?'₹0':sgn(brkTot.corrected)}</td>
+                  <td style={{...td(),fontWeight:800,color:shownDiff===0?C.green:C.red}}>{shownDiff===0?'₹0':sgn(shownDiff)}</td></tr>
+              </tbody></table>
           </div>}
+          {shownDiff!==0&&<div style={{marginTop:8}}>{miniBtn('✂ Write off the '+fmt(Math.abs(shownDiff))+' difference on my side',()=>addWriteoff(shownDiff),C.sub)}
+            <div style={{fontSize:10,color:C.muted,marginTop:3}}>Adds a books-only entry that moves my balance to the seller's. Staged like everything else — nothing posts until Review & post.</div></div>}
         </div>
         <div>
           <div style={{padding:'12px 14px',borderRadius:10,background:C.blueSoft,border:`1px solid ${C.blue}`}}>
@@ -5314,6 +5421,7 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
     <div style={{display:'flex',gap:8,justifyContent:'space-between',flexWrap:'wrap',position:'sticky',bottom:0,background:'#fff',padding:'10px 0 2px',borderTop:`1px solid ${C.bdr}`}}>
       <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
         <Btn onClick={sendNote} variant="secondary" icon="📲">Note to seller</Btn>
+        <Btn onClick={()=>setShowReport(true)} variant="secondary" icon="📄">Report</Btn>
         <Btn onClick={clearAll} variant="ghost">Start over</Btn>
       </div>
       <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
@@ -5322,7 +5430,162 @@ function SupplierReconcileModal({party,from,to,openingBalance,closingBalance,onC
         <Btn onClick={goReview} variant="success">Review & post →</Btn>
       </div>
     </div>
-  </Modal>{undoModal}</>;
+  </Modal>{undoModal}{showReport&&<ReconReportModal report={buildReport('draft')} onClose={()=>setShowReport(false)}/>}</>;
+}
+
+// ── Reconciliation report ─────────────────────────────────────────────────────
+// A saved reconciliation (posted, undone or draft-in-progress) shown as a report.
+// Newer records carry a full snapshot (rec.report); older ones fall back to what
+// the books themselves record about the post.
+function reconFallbackReport(rec){
+  const r2=n=>Math.round((Number(n)||0)*100)/100;
+  const sm=rec.summary||{};
+  const entries=state.purchases.filter(p=>p.reconId===rec.id).map(p=>({kind:(p.source||'').replace('reconciliation-','')||'entry',date:p.date,
+    name:(p.items&&p.items[0]&&p.items[0].supplierName)||'entry',amount:r2(p.total),lines:p.reconDetail||[]}));
+  const fixes=[];
+  state.purchases.forEach(p=>(p.reconFixes||[]).filter(f=>f.reconId===rec.id).forEach(f=>f.changes.forEach(c=>fixes.push({date:p.date,name:c.name,
+    was:c.oldQty!=null?(c.oldQty+' × ₹'+c.oldRate+' = '+fmt(c.oldAmt)):fmt(c.oldAmt),becomes:c.newQty!=null?(c.newQty+' × ₹'+c.newRate+' = '+fmt(c.newAmt)):fmt(c.newAmt),delta:r2((c.newAmt||0)-(c.oldAmt||0))}))));
+  return{v:0,at:rec.postedAt||rec.updatedAt,status:rec.status,party:{id:rec.partyId,name:rec.partyName},period:{from:rec.from||'',to:rec.to||''},
+    balances:{ourRecorded:sm.ourClosing,ourAdjusted:sm.ourAdjusted,sellerFigures:sm.sellerCalc,statement:sm.sellerClosing,difference:sm.difference!=null?sm.difference:sm.stillDifferent,differenceBasis:sm.sellerClosing!=null?'statement':'figures',settleAmt:sm.settleAmt},
+    breakdown:[],rows:[],entries,fixes,notes:rec.notes||'',counts:{},legacy:true};
+}
+
+function ReconReportModal({report,onClose}){
+  const mobile=useIsMobile();
+  const[full,setFull]=useState(false);
+  const ref=useRef(null);
+  const sgn=n=>(n>0?'+ ':n<0?'− ':'')+fmt(Math.abs(n));
+  const dcol=n=>n>0?C.red:n<0?C.green:C.muted;
+  const bl=report.balances||{};
+  const balTxt=n=>n==null?'—':fmt(Math.abs(n))+(n<0?' (advance)':'');
+  const th=(al='right')=>({padding:'5px 6px',fontSize:10,fontWeight:700,color:C.sub,textTransform:'uppercase',textAlign:al,borderBottom:`1px solid ${C.bdr}`,background:'#F6F8FA',whiteSpace:'nowrap'});
+  const td=(al='right',x)=>({padding:'3px 6px',fontSize:11,textAlign:al,fontVariantNumeric:'tabular-nums',borderBottom:'1px solid #E5E7EB',whiteSpace:al==='left'?'normal':'nowrap',...x});
+  const tone=t=>t==='red'?C.red:t==='green'?C.green:t==='amber'?C.amber:C.muted;
+  const f=v=>v==null?'—':fmt(v);
+  const rq=v=>v==null?'—':String(v);
+  const statusTxt=report.status==='posted'?'Posted to books':report.status==='undone'?'Post undone':report.status==='draft'?'Draft (not posted)':report.status;
+  const print=()=>{
+    const w=window.open('','_blank');
+    if(!w)return;
+    w.document.write('<html><head><title>Reconciliation — '+String(report.party.name).replace(/</g,'&lt;')+'</title><style>body{font-family:Arial,sans-serif;font-size:11px;padding:14px;color:#111}table{border-collapse:collapse;width:100%;margin-bottom:10px}h2,h3{margin:8px 0 4px}@page{size:landscape;margin:10mm}</style></head><body>'+ref.current.innerHTML+'</body></html>');
+    w.document.close();w.focus();setTimeout(()=>w.print(),300);
+  };
+  const card=(label,val,sub,color)=><div style={{padding:'8px 12px',borderRadius:8,border:`1px solid ${C.bdr}`,background:C.surf}}>
+    <div style={{fontSize:10,fontWeight:700,color:C.sub,textTransform:'uppercase'}}>{label}</div>
+    <div style={{fontSize:17,fontWeight:800,color:color||C.txt}}>{val}</div>
+    {sub&&<div style={{fontSize:10,color:C.muted}}>{sub}</div>}</div>;
+  const balC=b=>b?<><td style={td('right',{fontWeight:700})}>{f(b.our)}</td><td style={td('right',{fontWeight:700,borderLeft:`2px solid ${C.blue}`})}>{f(b.sel)}</td><td style={td('right',{color:dcol(b.sel-b.our)})}>{b.sel-b.our===0?'—':sgn(Math.round((b.sel-b.our)*100)/100)}</td></>:<><td style={td()}></td><td style={td()}></td><td style={td()}></td></>;
+  return <Modal title={'Reconciliation report — '+report.party.name} onClose={onClose} width={1240} full={full}>
+    <div style={{display:'flex',gap:8,justifyContent:'flex-end',marginBottom:10,flexWrap:'wrap'}}>
+      <Btn onClick={()=>setFull(x=>!x)} variant="secondary" size="sm">{full?'🗗 Exit full screen':'⛶ Full screen'}</Btn>
+      <Btn onClick={print} variant="secondary" size="sm" icon="🖨">Print / PDF</Btn>
+    </div>
+    <div ref={ref}>
+      <h2 style={{margin:'0 0 2px',fontSize:16}}>Supplier reconciliation — {report.party.name}</h2>
+      <div style={{fontSize:12,color:C.sub,marginBottom:10}}>
+        Period {report.period.from?fmtD(report.period.from):'beginning'} → {report.period.to?fmtD(report.period.to):'today'} · <b>{statusTxt}</b>{report.at?' · '+fmtD(String(report.at).slice(0,10)):''}
+        {report.legacy&&<div style={{color:C.amber,marginTop:2}}>This reconciliation was saved before full reports were kept, so only what it recorded in your books is shown.</div>}
+      </div>
+      <div style={{display:'grid',gridTemplateColumns:mobile?'1fr 1fr':'repeat(5,1fr)',gap:8,marginBottom:12}}>
+        {card('My recorded closing',balTxt(bl.ourRecorded))}
+        {card('My balance after changes',balTxt(bl.ourAdjusted),bl.ourRecorded!=null&&bl.ourAdjusted!=null?(bl.ourAdjusted-bl.ourRecorded===0?'no change':sgn(Math.round((bl.ourAdjusted-bl.ourRecorded)*100)/100)+' vs recorded'):'',C.blue)}
+        {card("Seller's figures add up to",balTxt(bl.sellerFigures))}
+        {card("Seller's statement",bl.statement==null?'not entered':balTxt(bl.statement))}
+        {card(bl.differenceBasis==='statement'?'Difference (statement − mine)':'Difference (seller figures − mine)',bl.difference==null?'—':bl.difference===0?'✓ Reconciled':sgn(bl.difference),report.counts&&report.counts.unresolved!=null?report.counts.unresolved+' unresolved mismatch(es)':'',bl.difference===0?C.green:C.red)}
+      </div>
+
+      {(report.breakdown||[]).length>0&&<div style={{marginBottom:14}}>
+        <h3 style={{fontSize:13}}>Where the difference came from (+ = I owe more)</h3>
+        <table style={{width:'100%',borderCollapse:'collapse',maxWidth:760}}>
+          <thead><tr><th style={th('left')}>Source</th><th style={th()}>Seller vs my original record</th><th style={th()}>Corrected on my books</th><th style={th()}>Still different</th></tr></thead>
+          <tbody>
+            {report.breakdown.map((x,i)=><tr key={i}><td style={td('left')}>{x.label}</td>
+              <td style={td('right',{color:dcol(x.found)})}>{x.found===0?'—':sgn(x.found)}</td>
+              <td style={td('right',{color:dcol(x.corrected)})}>{x.corrected===0?'—':sgn(x.corrected)}</td>
+              <td style={td('right',{fontWeight:700,color:x.open===0?C.muted:dcol(x.open)})}>{x.open===0?'—':sgn(x.open)}</td></tr>)}
+            {report.breakdownTotal&&<tr><td style={td('left',{fontWeight:800})}>Total</td>
+              <td style={td('right',{fontWeight:800})}>{sgn(report.breakdownTotal.found)}</td><td style={td('right',{fontWeight:800})}>{sgn(report.breakdownTotal.corrected)}</td><td style={td('right',{fontWeight:800})}>{sgn(report.breakdownTotal.open)}</td></tr>}
+          </tbody></table></div>}
+
+      {((report.entries||[]).length>0||(report.fixes||[]).length>0)&&<div style={{marginBottom:14}}>
+        <h3 style={{fontSize:13}}>What was changed in the books</h3>
+        {(report.fixes||[]).length>0&&<table style={{width:'100%',borderCollapse:'collapse',marginBottom:8}}>
+          <thead><tr><th style={th('left')}>Bill</th><th style={th('left')}>Line corrected</th><th style={th()}>Was</th><th style={th()}>Became</th><th style={th()}>Balance Δ</th></tr></thead>
+          <tbody>{report.fixes.map((x,i)=><tr key={i}><td style={td('left')}>{fmtD(x.date)}</td><td style={td('left')}>{x.name}</td><td style={td()}>{x.was}</td><td style={td('right',{fontWeight:700})}>{x.becomes}</td><td style={td('right',{color:dcol(x.delta)})}>{sgn(x.delta)}</td></tr>)}</tbody></table>}
+        {(report.entries||[]).length>0&&<table style={{width:'100%',borderCollapse:'collapse'}}>
+          <thead><tr><th style={th('left')}>Date</th><th style={th('left')}>Entry added to the ledger</th><th style={th('left')}>Type</th><th style={th()}>Amount</th></tr></thead>
+          <tbody>{report.entries.map((x,i)=><Fragment key={i}><tr><td style={td('left')}>{fmtD(x.date)}</td><td style={td('left',{fontWeight:600})}>{x.name}</td><td style={td('left',{color:C.sub})}>{x.kind}</td><td style={td('right',{fontWeight:700,color:dcol(x.amount)})}>{sgn(x.amount)}</td></tr>
+            {(x.lines||[]).map((l,j)=><tr key={j}><td style={td()}></td><td colSpan={2} style={td('left',{color:C.sub,paddingLeft:18,fontSize:10})}>{l.name}</td><td style={td('right',{color:dcol(l.amount),fontSize:10})}>{sgn(l.amount)}</td></tr>)}</Fragment>)}</tbody></table>}
+      </div>}
+
+      {(report.rows||[]).length>0&&<div style={{marginBottom:14,overflowX:'auto'}}>
+        <h3 style={{fontSize:13}}>Ledger — my books vs the seller's</h3>
+        <table style={{width:'100%',borderCollapse:'collapse',minWidth:1180}}>
+          <thead>
+            <tr><th style={th('left')} colSpan={2}></th><th style={{...th(),textAlign:'center'}} colSpan={3}>As I had recorded</th><th style={{...th(),textAlign:'center',borderLeft:`2px solid ${C.blue}`}} colSpan={3}>Seller's</th><th style={{...th(),textAlign:'center'}} colSpan={2}>My books after</th><th style={{...th(),textAlign:'center'}} colSpan={3}>Running balance</th></tr>
+            <tr><th style={th('left')}>Date</th><th style={th('left')}>Particulars (supplier's names)</th><th style={th()}>Qty</th><th style={th()}>Rate</th><th style={th()}>Amount</th>
+              <th style={{...th(),borderLeft:`2px solid ${C.blue}`}}>Qty</th><th style={th()}>Rate</th><th style={th()}>Amount</th><th style={th('left')}>Outcome</th><th style={th()}>Amount</th><th style={th()}>Mine</th><th style={{...th(),borderLeft:`2px solid ${C.blue}`}}>Seller's</th><th style={th()}>Gap</th></tr>
+          </thead>
+          <tbody>
+            {report.rows.map((r,i)=>{
+              if(r.k==='bill')return <tr key={i} style={{background:'#EEF6FF'}}><td colSpan={13} style={td('left',{fontWeight:800})}>🧾 {fmtD(r.date)} · {r.ref}{r.hist?' · pre-ERP':''}{r.note&&<span style={{fontWeight:500,color:C.amber}}> — 📝 {r.note}</span>}</td></tr>;
+              if(r.k==='line')return <Fragment key={i}><tr style={{background:r.tone==='red'?'#FFF8F8':r.tone==='amber'?'#FFFDF5':'transparent'}}>
+                <td style={td()}></td><td style={td('left')}>{r.name}{r.oname&&r.oname.trim().toLowerCase()!==String(r.name).trim().toLowerCase()&&<div style={{fontSize:9,color:C.muted}}>my name: {r.oname}</div>}</td>
+                <td style={td()}>{rq(r.rec.q)}</td><td style={td()}>{r.rec.r==null?'—':'₹'+r.rec.r}</td><td style={td()}>{f(r.rec.a)}</td>
+                <td style={td('right',{borderLeft:`2px solid ${C.blue}`})}>{rq(r.sel.q)}</td><td style={td()}>{r.sel.r==null?'—':'₹'+r.sel.r}</td><td style={td()}>{f(r.sel.a)}</td>
+                <td style={td('left',{color:tone(r.tone),fontWeight:600})}>{r.outcome}{r.wasCorrected&&<div style={{fontSize:9,fontWeight:400}}>was {fmt(r.ref)} before correction</div>}{r.flag&&<div style={{fontSize:9}}>💬 flagged</div>}</td>
+                <td style={td('right',{fontWeight:600})}>{f(r.bk.a)}{r.item&&(r.bk.q!==r.rec.q||r.bk.r!==r.rec.r)&&<div style={{fontSize:9,color:C.muted}}>{r.bk.q} × ₹{r.bk.r}</div>}</td>
+                {balC(r.bal)}</tr>
+                {r.note&&<tr><td></td><td colSpan={12} style={td('left',{color:C.amber,fontSize:10})}>📝 {r.note}</td></tr>}</Fragment>;
+              if(r.k==='added')return <tr key={i} style={{background:'#F3F9FF'}}><td style={td('left')}>{r.date?fmtD(r.date):''}</td>
+                <td style={td('left')}><b>➕ {r.kind==='missed'?'Missed item':r.kind==='writeoff'?'Write-off':r.kind==='opening'?'Opening balance':r.kind==='payment'?'Payment':'Charge / credit'}:</b> {r.label}</td>
+                <td style={td()}>—</td><td style={td()}>—</td><td style={td()}>—</td>
+                <td style={td('right',{borderLeft:`2px solid ${C.blue}`})}>{rq(r.sel.q)}</td><td style={td()}>{r.sel.r==null?'—':'₹'+r.sel.r}</td><td style={td()}>{r.kind==='writeoff'?'—':f(r.sel.a)}</td>
+                <td style={td('left',{color:r.kind==='writeoff'?C.sub:r.gap!==0?C.red:C.green})}>{r.kind==='writeoff'?'Written off (my books only)':r.gap!==0?'Differs by '+sgn(r.gap):'Added — both sides agree'}</td>
+                <td style={td('right',{fontWeight:600})}>{f(r.bk.a)}</td>{balC(r.bal)}</tr>;
+              if(r.k==='billTotal')return <tr key={i} style={{background:'#F6F8FA'}}><td style={td()}></td><td style={td('left',{fontWeight:700,color:C.sub})}>Bill total</td>
+                <td style={td()}></td><td style={td()}></td><td style={td('right',{fontWeight:800})}>{f(r.rec)}</td>
+                <td colSpan={2} style={td('right',{borderLeft:`2px solid ${C.blue}`})}></td><td style={td('right',{fontWeight:800})}>{f(r.sel)}</td><td style={td()}></td><td style={td('right',{fontWeight:800})}>{f(r.bk)}</td>{balC(r.bal)}</tr>;
+              if(r.k==='adj')return <tr key={i} style={{background:'#FFFDF5'}}><td style={td()}></td><td colSpan={12} style={td('left',{color:C.amber,fontWeight:600})}>↳ One adjustment entry for this bill: {sgn(r.amount)}{(r.lines||[]).length>0&&<span style={{fontWeight:400,color:C.sub}}> ({r.lines.map(l=>l.name+' '+sgn(l.amount)).join(', ')})</span>}</td></tr>;
+              if(r.k==='pay')return <Fragment key={i}><tr style={{background:r.tone==='red'?'#FFF8F8':'#F6FFF6',borderTop:`1px solid ${C.bdr}`}}><td style={td('left',{fontWeight:700})}>💸 {fmtD(r.date)}</td><td style={td('left')}>{r.desc}{r.hist&&' · pre-ERP'}</td>
+                <td style={td()}>—</td><td style={td()}>—</td><td style={td()}>− {f(r.rec)}</td>
+                <td style={td('right',{borderLeft:`2px solid ${C.blue}`})}>—</td><td style={td()}>—</td><td style={td()}>− {f(r.sel)}</td>
+                <td style={td('left',{color:tone(r.tone),fontWeight:600})}>{r.outcome}</td><td style={td('right',{fontWeight:600})}>− {f(r.bk)}</td>{balC(r.bal)}</tr>
+                {r.note&&<tr><td></td><td colSpan={12} style={td('left',{color:C.amber,fontSize:10})}>📝 {r.note}</td></tr>}</Fragment>;
+              return null;
+            })}
+          </tbody></table></div>}
+
+      {report.notes&&<div style={{marginBottom:10}}><h3 style={{fontSize:13}}>Notes</h3><div style={{fontSize:12,whiteSpace:'pre-wrap'}}>{report.notes}</div></div>}
+      <div style={{fontSize:11,color:C.sub}}>
+        {bl.settleAmt!=null&&<>Settlement ({bl.settleBasis==='seller'?"on the seller's balance":'on my adjusted balance'}): <b>{bl.settleAmt>0?'pay '+report.party.name+' '+fmt(bl.settleAmt):bl.settleAmt<0?report.party.name+' owes you '+fmt(Math.abs(bl.settleAmt)):'fully settled'}</b></>}
+      </div>
+    </div>
+  </Modal>;
+}
+
+// All reconciliations for one supplier — drafts, posted and undone — each
+// reopenable as a report (or resumable, for a draft).
+function ReconHistoryModal({party,onClose,onResume,onView}){
+  const recs=state.supplierReconciliations.filter(r=>r.partyId===party.id).slice().sort((a,b)=>String(b.postedAt||b.updatedAt||b.createdAt||'').localeCompare(String(a.postedAt||a.updatedAt||a.createdAt||'')));
+  const sgn=n=>(n>0?'+ ':n<0?'− ':'')+fmt(Math.abs(n));
+  return <Modal title={'Reconciliations — '+party.name} onClose={onClose} width={760}>
+    {recs.length===0&&<div style={{padding:20,textAlign:'center',color:C.sub,fontSize:13}}>No reconciliations for this supplier yet. Press ⚖ Reconcile to start one.</div>}
+    {recs.map(r=>{
+      const sm=r.summary||{},rp=r.report;
+      const diffV=rp?rp.balances.difference:(sm.difference!=null?sm.difference:sm.stillDifferent);
+      const when=(r.postedAt||r.updatedAt||r.createdAt||'').slice(0,10);
+      return <div key={r.id} style={{display:'flex',alignItems:'center',gap:10,padding:'10px 4px',borderBottom:`1px solid ${C.bdr}`,flexWrap:'wrap'}}>
+        <Badge v={r.status==='posted'?'Posted':r.status==='undone'?'Undone':'Draft'} color={r.status==='posted'?'green':r.status==='undone'?'gray':'amber'}/>
+        <div style={{flex:1,minWidth:200}}>
+          <div style={{fontSize:13,fontWeight:700,color:C.txt}}>{r.from?fmtD(r.from):'Beginning'} → {r.to?fmtD(r.to):'Today'}</div>
+          <div style={{fontSize:11,color:C.sub}}>{when?fmtD(when):''}{r.posted?' · '+((r.posted.fixed||0)+(r.posted.adjusted||0)+(r.posted.paymentsFixed||0)+(r.posted.paymentsAdjusted||0)+(r.posted.missed||0)+(r.posted.extras||0))+' change(s) posted':''}{diffV!=null?' · difference '+(diffV===0?'none ✓':sgn(diffV)):''}</div>
+        </div>
+        {r.status==='draft'
+          ?<Btn onClick={onResume} size="sm" variant="primary">Continue</Btn>
+          :<Btn onClick={()=>onView(r)} size="sm" variant="secondary" icon="📄">View report</Btn>}
+      </div>;})}
+  </Modal>;
 }
 
 function PartyLedger({party,onClose}){
@@ -5345,6 +5608,9 @@ function PartyLedger({party,onClose}){
   // instead of cramming per-sale profit/interest figures onto this ledger.
   const[showProfit,setShowProfit]=useState(false);
   const[reconWin,setReconWin]=useState(null);
+  const[reconHist,setReconHist]=useState(false);
+  const[reconReport,setReconReport]=useState(null);
+  const openReconcile=()=>{const w=buildExportWindow();setReconWin({openingBalance:w.openingBalance,closingBalance:w.closingBalance,from:exFrom,to:exTo});};
   const[exFrom,setExFrom]=useState('');
   const[exTo,setExTo]=useState(today());
   const{toast,TC}=useToast();
@@ -5822,7 +6088,9 @@ function PartyLedger({party,onClose}){
     {viewPurchase&&<PurchaseViewModal purchase={viewPurchase} onClose={()=>setViewPurchase(null)}/>}
     {showRepairModal&&<RepairExpenseModal party={party} onClose={()=>setShowRepairModal(false)} onSaved={()=>setShowRepairModal(false)}/>}
     {showProfit&&<PartySaleProfitModal party={party} onClose={()=>setShowProfit(false)}/>}
-    {reconWin&&<SupplierReconcileModal party={party} from={reconWin.from} to={reconWin.to} openingBalance={reconWin.openingBalance} closingBalance={reconWin.closingBalance} onClose={()=>setReconWin(null)}/>}
+    {reconWin&&<SupplierReconcileModal party={party} from={reconWin.from} to={reconWin.to} openingBalance={reconWin.openingBalance} closingBalance={reconWin.closingBalance} onClose={r=>{setReconWin(null);if(r&&r.reportRecId){const rec=state.supplierReconciliations.find(x=>x.id===r.reportRecId);if(rec)setReconReport(rec.report||reconFallbackReport(rec));}}}/>}
+    {reconHist&&<ReconHistoryModal party={party} onClose={()=>setReconHist(false)} onResume={()=>{setReconHist(false);openReconcile();}} onView={rec=>{setReconReport(rec.report||reconFallbackReport(rec));}}/>}
+    {reconReport&&<ReconReportModal report={reconReport} onClose={()=>setReconReport(null)}/>}
     {/* 'both'-type parties never reach this component (see the early return
         above) — the Customer/Supplier toggle that used to live here is gone. */}
     <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}}>
@@ -5855,7 +6123,8 @@ function PartyLedger({party,onClose}){
       <div style={{display:'flex',gap:8,width:mobile?'100%':'auto'}}>
         <Btn onClick={exportLedgerExcel} variant="secondary" size="sm" icon="⬇">Excel</Btn>
         <Btn onClick={exportLedgerPDF} variant="secondary" size="sm" icon="⬇">PDF</Btn>
-        {isSupplier&&<Btn onClick={()=>{const w=buildExportWindow();setReconWin({openingBalance:w.openingBalance,closingBalance:w.closingBalance,from:exFrom,to:exTo});}} variant="primary" size="sm" icon="⚖">Reconcile</Btn>}
+        {isSupplier&&<Btn onClick={openReconcile} variant="primary" size="sm" icon="⚖">Reconcile</Btn>}
+        {isSupplier&&<Btn onClick={()=>setReconHist(true)} variant="secondary" size="sm" icon="📄">Reconciliation reports</Btn>}
       </div>
     </div>
 
